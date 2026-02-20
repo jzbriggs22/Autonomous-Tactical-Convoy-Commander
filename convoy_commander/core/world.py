@@ -1,0 +1,264 @@
+"""World model: obstacles, roads (graph), no-go zones, landmarks."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import networkx as nx
+import numpy as np
+
+from convoy_commander.core.config import WorldConfig
+
+
+@dataclass
+class Obstacle:
+    """Circular obstacle."""
+
+    x: float
+    y: float
+    radius: float
+
+    def contains(self, px: float, py: float) -> bool:
+        dx = px - self.x
+        dy = py - self.y
+        return dx * dx + dy * dy < self.radius * self.radius
+
+
+@dataclass
+class NoGoZone:
+    """Circular no-go zone (larger, softer penalty)."""
+
+    x: float
+    y: float
+    radius: float
+
+    def contains(self, px: float, py: float) -> bool:
+        dx = px - self.x
+        dy = py - self.y
+        return dx * dx + dy * dy < self.radius * self.radius
+
+
+@dataclass
+class Landmark:
+    """Known landmark for position fixing."""
+
+    x: float
+    y: float
+    detection_range: float = 50.0
+
+
+class World:
+    """2D continuous world with obstacles, road graph, no-go zones, and landmarks."""
+
+    def __init__(self, config: WorldConfig, rng: np.random.Generator) -> None:
+        self.config = config
+        self.width = config.width
+        self.height = config.height
+        self.obstacles: list[Obstacle] = []
+        self.nogo_zones: list[NoGoZone] = []
+        self.landmarks: list[Landmark] = []
+        self.road_graph: nx.Graph = nx.Graph()
+
+        self._generate(rng)
+
+    def _generate(self, rng: np.random.Generator) -> None:
+        """Generate world features deterministically."""
+        # Road graph: regular grid with some edges removed and weighted
+        n = self.config.road_graph_density
+        spacing_x = self.width / (n + 1)
+        spacing_y = self.height / (n + 1)
+
+        for i in range(n):
+            for j in range(n):
+                node_id = i * n + j
+                x = spacing_x * (i + 1)
+                y = spacing_y * (j + 1)
+                self.road_graph.add_node(node_id, pos=(x, y))
+
+        # Add edges (4-connected grid + some diagonals)
+        for i in range(n):
+            for j in range(n):
+                node_id = i * n + j
+                pos = self.road_graph.nodes[node_id]["pos"]
+                # Right neighbor
+                if i + 1 < n:
+                    neighbor = (i + 1) * n + j
+                    npos = self.road_graph.nodes[neighbor]["pos"]
+                    dist = math.hypot(npos[0] - pos[0], npos[1] - pos[1])
+                    weight = dist * (1.0 + 0.3 * rng.random())
+                    self.road_graph.add_edge(node_id, neighbor, weight=weight)
+                # Up neighbor
+                if j + 1 < n:
+                    neighbor = i * n + (j + 1)
+                    npos = self.road_graph.nodes[neighbor]["pos"]
+                    dist = math.hypot(npos[0] - pos[0], npos[1] - pos[1])
+                    weight = dist * (1.0 + 0.3 * rng.random())
+                    self.road_graph.add_edge(node_id, neighbor, weight=weight)
+                # Diagonal (add some)
+                if i + 1 < n and j + 1 < n and rng.random() < 0.3:
+                    neighbor = (i + 1) * n + (j + 1)
+                    npos = self.road_graph.nodes[neighbor]["pos"]
+                    dist = math.hypot(npos[0] - pos[0], npos[1] - pos[1])
+                    weight = dist * (1.0 + 0.3 * rng.random())
+                    self.road_graph.add_edge(node_id, neighbor, weight=weight)
+
+        # Remove some random edges to make it more interesting
+        edges = list(self.road_graph.edges())
+        for e in edges:
+            if rng.random() < 0.1:
+                self.road_graph.remove_edge(*e)
+                # Re-add if graph becomes disconnected
+                if not nx.is_connected(self.road_graph):
+                    pos_a = self.road_graph.nodes[e[0]]["pos"]
+                    pos_b = self.road_graph.nodes[e[1]]["pos"]
+                    dist = math.hypot(pos_b[0] - pos_a[0], pos_b[1] - pos_a[1])
+                    self.road_graph.add_edge(e[0], e[1], weight=dist)
+
+        # Generate no-go zones (avoid center corridor)
+        for _ in range(self.config.nogo_zone_count):
+            for _attempt in range(50):
+                r = rng.uniform(*self.config.nogo_zone_radius_range)
+                x = rng.uniform(r, self.width - r)
+                y = rng.uniform(r, self.height - r)
+                # Keep away from start/end corridors
+                if x > 150 and x < self.width - 150:
+                    self.nogo_zones.append(NoGoZone(x=x, y=y, radius=r))
+                    break
+
+        # Generate obstacles (avoid no-go zones to prevent overlap)
+        for _ in range(self.config.obstacle_count):
+            for _attempt in range(50):
+                r = rng.uniform(*self.config.obstacle_radius_range)
+                x = rng.uniform(r, self.width - r)
+                y = rng.uniform(r, self.height - r)
+                # Don't place on top of no-go zones
+                ok = True
+                for nz in self.nogo_zones:
+                    if math.hypot(x - nz.x, y - nz.y) < r + nz.radius:
+                        ok = False
+                        break
+                # Keep clear of spawn area
+                if x < 100 and y < 200:
+                    ok = False
+                if ok:
+                    self.obstacles.append(Obstacle(x=x, y=y, radius=r))
+                    break
+
+        # Remove road graph edges that pass through obstacles or no-go zones
+        edges_to_remove: list[tuple[int, int]] = []
+        for u, v in self.road_graph.edges():
+            pos_u = np.array(self.road_graph.nodes[u]["pos"])
+            pos_v = np.array(self.road_graph.nodes[v]["pos"])
+            blocked = False
+            for obs in self.obstacles:
+                if self._segment_intersects_circle(
+                    pos_u, pos_v, np.array([obs.x, obs.y]), obs.radius
+                ):
+                    blocked = True
+                    break
+            if not blocked:
+                for nz in self.nogo_zones:
+                    if self._segment_intersects_circle(
+                        pos_u, pos_v, np.array([nz.x, nz.y]), nz.radius
+                    ):
+                        blocked = True
+                        break
+            if blocked:
+                edges_to_remove.append((u, v))
+
+        for e in edges_to_remove:
+            self.road_graph.remove_edge(*e)
+
+        # Ensure connectivity after removal
+        if not nx.is_connected(self.road_graph):
+            components = list(nx.connected_components(self.road_graph))
+            # Connect each component to the largest one
+            largest = max(components, key=len)
+            for comp in components:
+                if comp is largest:
+                    continue
+                # Find closest pair of nodes between comp and largest
+                best_dist = float("inf")
+                best_pair = (list(comp)[0], list(largest)[0])
+                for a in comp:
+                    pa = np.array(self.road_graph.nodes[a]["pos"])
+                    for b in largest:
+                        pb = np.array(self.road_graph.nodes[b]["pos"])
+                        d = float(np.linalg.norm(pa - pb))
+                        if d < best_dist:
+                            best_dist = d
+                            best_pair = (a, b)
+                self.road_graph.add_edge(best_pair[0], best_pair[1], weight=best_dist * 1.5)
+
+        # Generate landmarks
+        for _ in range(self.config.landmark_count):
+            x = rng.uniform(50, self.width - 50)
+            y = rng.uniform(50, self.height - 50)
+            self.landmarks.append(Landmark(x=x, y=y))
+
+    @staticmethod
+    def _segment_intersects_circle(
+        p1: np.ndarray, p2: np.ndarray, center: np.ndarray, radius: float
+    ) -> bool:
+        """Check if line segment p1->p2 intersects circle."""
+        d = p2 - p1
+        f = p1 - center
+        a = float(np.dot(d, d))
+        b = 2.0 * float(np.dot(f, d))
+        c = float(np.dot(f, f)) - radius * radius
+
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0:
+            return False
+
+        discriminant = math.sqrt(discriminant)
+        t1 = (-b - discriminant) / (2.0 * a)
+        t2 = (-b + discriminant) / (2.0 * a)
+
+        return (0 <= t1 <= 1) or (0 <= t2 <= 1) or (t1 < 0 and t2 > 1)
+
+    def is_blocked(self, x: float, y: float) -> bool:
+        """Check if a position is inside an obstacle."""
+        for obs in self.obstacles:
+            if obs.contains(x, y):
+                return True
+        return False
+
+    def is_nogo(self, x: float, y: float) -> bool:
+        """Check if a position is in a no-go zone."""
+        for nz in self.nogo_zones:
+            if nz.contains(x, y):
+                return True
+        return False
+
+    def in_bounds(self, x: float, y: float) -> bool:
+        return 0 <= x <= self.width and 0 <= y <= self.height
+
+    def nearest_road_node(self, x: float, y: float) -> int:
+        """Find nearest road graph node to position."""
+        best_node = 0
+        best_dist = float("inf")
+        for node_id, data in self.road_graph.nodes(data=True):
+            pos = data["pos"]
+            dist = math.hypot(pos[0] - x, pos[1] - y)
+            if dist < best_dist:
+                best_dist = dist
+                best_node = node_id
+        return best_node
+
+    def get_node_pos(self, node_id: int) -> tuple[float, float]:
+        """Get position of a road graph node."""
+        return self.road_graph.nodes[node_id]["pos"]
+
+    def add_obstacle(self, x: float, y: float, radius: float) -> None:
+        """Add an obstacle at runtime (for dynamic scenarios)."""
+        self.obstacles.append(Obstacle(x=x, y=y, radius=radius))
+
+    def landmarks_in_range(self, x: float, y: float) -> list[Landmark]:
+        """Return landmarks within detection range of position."""
+        result: list[Landmark] = []
+        for lm in self.landmarks:
+            if math.hypot(lm.x - x, lm.y - y) <= lm.detection_range:
+                result.append(lm)
+        return result
