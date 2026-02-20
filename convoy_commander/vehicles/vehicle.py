@@ -1,8 +1,18 @@
-"""Vehicle agent with dynamics, fuel, and estimator."""
+"""Vehicle agent with dynamics, fuel, and estimator.
+
+SAFETY-CRITICAL ASSUMPTIONS:
+  A1. A vehicle in BREAKDOWN status executes no commands and remains stationary.
+      No further state transitions are possible from BREAKDOWN.
+  A2. Fuel depletion is treated identically to mechanical breakdown
+      (fail-safe: stop and remain stopped).
+  A3. Safe mode is the *only* correct response to high uncertainty or
+      prolonged comms loss.  The sim runner is responsible for triggering
+      safe mode; the vehicle itself cannot override a safe-mode entry.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 
 import numpy as np
@@ -68,6 +78,7 @@ class Vehicle:
         self.leader_id: int | None = None
         self.safe_mode_timer: float = 0.0
         self.last_comms_time: float = 0.0
+        self._comms_was_lost: bool = False  # edge-detect for logging
 
         # Planning
         self.waypoints: list[tuple[float, float]] = []
@@ -78,13 +89,18 @@ class Vehicle:
         self.total_distance: float = 0.0
         self.near_miss_count: int = 0
         self.collision_count: int = 0
+        self.total_fuel_consumed: float = 0.0
 
     def step(self, command: VehicleCommand, dt: float) -> None:
-        """Advance vehicle by one timestep."""
+        """Advance vehicle by one timestep.
+
+        Preconditions: dt > 0, status != BREAKDOWN (no-op if it is).
+        """
         if self.status == VehicleStatus.BREAKDOWN:
             return
         if self.fuel.is_empty:
             self.status = VehicleStatus.BREAKDOWN
+            self.state.speed = 0.0
             return
 
         prev_pos = self.state.position().copy()
@@ -101,7 +117,8 @@ class Vehicle:
         )
 
         # Consume fuel
-        self.fuel.consume(self.state.speed, dt)
+        consumed = self.fuel.consume(self.state.speed, dt)
+        self.total_fuel_consumed += consumed
 
         # Track distance
         new_pos = self.state.position()
@@ -115,13 +132,15 @@ class Vehicle:
         self.est_history.append((self.estimator.state.x, self.estimator.state.y))
 
     def set_breakdown(self) -> None:
-        """Force vehicle into breakdown state."""
+        """Force vehicle into breakdown state.  Irreversible."""
         self.status = VehicleStatus.BREAKDOWN
         self.state.speed = 0.0
+        self.is_leader = False
 
     def enter_safe_mode(self) -> None:
         """Enter safe mode (reduce speed, increase separation)."""
-        self.status = VehicleStatus.SAFE_MODE
+        if self.status == VehicleStatus.ACTIVE:
+            self.status = VehicleStatus.SAFE_MODE
 
     def exit_safe_mode(self) -> None:
         """Exit safe mode back to active."""

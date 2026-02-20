@@ -1,14 +1,31 @@
-"""Position estimator with dead-reckoning, drift model, and occasional fixes."""
+"""Position estimator with dead-reckoning, drift model, and occasional fixes.
+
+SAFETY-CRITICAL ASSUMPTIONS:
+  A1. Drift is modelled as additive Gaussian noise; real IMU errors are
+      non-Gaussian (heavy-tailed, correlated).  The simulator therefore
+      *underestimates* true worst-case drift.
+  A2. The complementary filter is a single-gain approximation to a Kalman
+      filter.  It does not maintain a full covariance matrix.
+  A3. ``uncertainty`` is a scalar 1-sigma proxy, not a full error ellipse.
+      It is *optimistic* in the cross-track direction.
+  A4. Fixes are applied with the true (ground-truth) position plus noise.
+      In a real system the landmark detection itself can fail or be spoofed;
+      this model does not capture that.
+"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 from convoy_commander.core.config import EstimatorConfig
 from convoy_commander.core.physics import KinematicState
+
+
+# Maximum plausible uncertainty before we cap (prevents float overflow in long runs)
+_MAX_UNCERTAINTY_CAP: float = 1e6
 
 
 @dataclass
@@ -21,6 +38,7 @@ class EstimatorState:
     uncertainty: float = 0.0  # 1-sigma position uncertainty (m)
     bias_x: float = 0.0  # accumulated drift bias
     bias_y: float = 0.0
+    total_fixes_applied: int = 0  # audit counter
 
     def position(self) -> np.ndarray:
         return np.array([self.x, self.y])
@@ -38,6 +56,7 @@ class PositionEstimator:
         self.config = config
         self.rng = rng
         self.state = EstimatorState()
+        self._prev_uncertainty_high = False  # for edge-detect logging
 
     def initialize(self, true_state: KinematicState) -> None:
         """Initialize estimator at known position."""
@@ -47,9 +66,19 @@ class PositionEstimator:
         self.state.uncertainty = 0.5  # small initial uncertainty
         self.state.bias_x = 0.0
         self.state.bias_y = 0.0
+        self.state.total_fixes_applied = 0
 
     def propagate(self, speed: float, heading: float, dt: float) -> None:
-        """Dead-reckoning propagation with drift."""
+        """Dead-reckoning propagation with drift.
+
+        Preconditions: dt > 0, speed >= 0.
+        Postcondition: uncertainty >= 0 (capped at _MAX_UNCERTAINTY_CAP).
+        """
+        if dt <= 0:
+            return
+        if speed < 0:
+            speed = 0.0  # Defensive
+
         # Bias random walk
         self.state.bias_x += self.rng.normal(0, self.config.drift_bias_rate * dt)
         self.state.bias_y += self.rng.normal(0, self.config.drift_bias_rate * dt)
@@ -67,34 +96,50 @@ class PositionEstimator:
 
         # Grow uncertainty
         self.state.uncertainty += self.config.drift_rate * math.sqrt(dt) + abs(speed) * 0.001 * dt
+        # Cap to prevent overflow
+        self.state.uncertainty = min(self.state.uncertainty, _MAX_UNCERTAINTY_CAP)
 
-    def apply_landmark_fix(self, true_x: float, true_y: float) -> None:
-        """Apply a landmark fix (noisy absolute measurement)."""
+    def apply_landmark_fix(self, true_x: float, true_y: float) -> float:
+        """Apply a landmark fix (noisy absolute measurement).
+
+        Returns the innovation magnitude (pre-update residual), which can be
+        used for anomaly detection.
+        """
         noise_x = self.rng.normal(0, self.config.landmark_fix_std)
         noise_y = self.rng.normal(0, self.config.landmark_fix_std)
         measured_x = true_x + noise_x
         measured_y = true_y + noise_y
 
-        # Simple complementary filter: blend toward measurement
-        # Weight depends on current uncertainty vs measurement noise
+        # Innovation (pre-update residual)
+        innovation = math.hypot(measured_x - self.state.x, measured_y - self.state.y)
+
+        # Complementary filter gain
         meas_var = self.config.landmark_fix_std ** 2
         est_var = self.state.uncertainty ** 2
         gain = est_var / (est_var + meas_var) if (est_var + meas_var) > 0 else 0.5
 
         self.state.x += gain * (measured_x - self.state.x)
         self.state.y += gain * (measured_y - self.state.y)
-        self.state.uncertainty = math.sqrt((1 - gain) * est_var)
+        self.state.uncertainty = math.sqrt(max(0.0, (1 - gain) * est_var))
 
         # Partially correct bias
         self.state.bias_x *= (1 - gain * 0.5)
         self.state.bias_y *= (1 - gain * 0.5)
 
-    def apply_gps_fix(self, true_x: float, true_y: float) -> None:
-        """Apply a GPS fix (less noisy than landmark)."""
+        self.state.total_fixes_applied += 1
+        return innovation
+
+    def apply_gps_fix(self, true_x: float, true_y: float) -> float:
+        """Apply a GPS fix (less noisy than landmark).
+
+        Returns the innovation magnitude.
+        """
         noise_x = self.rng.normal(0, self.config.gps_fix_std)
         noise_y = self.rng.normal(0, self.config.gps_fix_std)
         measured_x = true_x + noise_x
         measured_y = true_y + noise_y
+
+        innovation = math.hypot(measured_x - self.state.x, measured_y - self.state.y)
 
         meas_var = self.config.gps_fix_std ** 2
         est_var = self.state.uncertainty ** 2
@@ -102,13 +147,30 @@ class PositionEstimator:
 
         self.state.x += gain * (measured_x - self.state.x)
         self.state.y += gain * (measured_y - self.state.y)
-        self.state.uncertainty = math.sqrt((1 - gain) * est_var)
+        self.state.uncertainty = math.sqrt(max(0.0, (1 - gain) * est_var))
 
         # Reset bias on GPS
         self.state.bias_x *= (1 - gain * 0.8)
         self.state.bias_y *= (1 - gain * 0.8)
 
+        self.state.total_fixes_applied += 1
+        return innovation
+
     @property
     def is_uncertain(self) -> bool:
         """Check if uncertainty exceeds safe threshold."""
         return self.state.uncertainty > self.config.uncertainty_safe_threshold
+
+    def uncertainty_just_exceeded(self) -> bool:
+        """Edge-detect: returns True once when uncertainty first crosses threshold."""
+        currently_high = self.is_uncertain
+        result = currently_high and not self._prev_uncertainty_high
+        self._prev_uncertainty_high = currently_high
+        return result
+
+    def uncertainty_just_recovered(self) -> bool:
+        """Edge-detect: returns True once when uncertainty drops back below threshold."""
+        currently_high = self.is_uncertain
+        result = not currently_high and self._prev_uncertainty_high
+        self._prev_uncertainty_high = currently_high
+        return result

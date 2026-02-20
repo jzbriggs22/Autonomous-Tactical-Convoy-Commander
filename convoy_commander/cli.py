@@ -71,6 +71,13 @@ def _cmd_run(args: argparse.Namespace) -> None:
     print(f"GPS: {'available' if config.gps_available else 'denied'}")
     print(f"Packet loss: {config.comms.packet_loss:.0%}")
     print(f"Latency: {config.comms.latency_mean_ms:.0f}ms")
+
+    # Print safety warnings
+    warnings = config.safety_warnings()
+    if warnings:
+        print(f"\n  SAFETY WARNINGS ({len(warnings)}):")
+        for w in warnings:
+            print(f"    - {w}")
     print()
 
     runner = SimRunner(config)
@@ -93,9 +100,10 @@ def _cmd_run(args: argparse.Namespace) -> None:
         output_dir = Path("runs") / f"{config.scenario}_{timestamp}"
 
     report_path = generate_report(result, output_dir)
-    print(f"\n  Report: {report_path}")
-    print(f"  Plots:  {output_dir / 'plots'}/")
-    print(f"  Data:   {output_dir / 'metrics.json'}")
+    print(f"\n  Report:    {report_path}")
+    print(f"  Plots:     {output_dir / 'plots'}/")
+    print(f"  Data:      {output_dir / 'metrics.json'}")
+    print(f"  Audit log: {output_dir / 'event_log.jsonl'}")
 
     # Print summary
     metrics = result.collector.compute_final(
@@ -115,6 +123,17 @@ def _cmd_run(args: argparse.Namespace) -> None:
     print(f"  Collisions: {metrics.collision_count}")
     print(f"  Comms delivery: {metrics.comms_delivery_ratio:.1%}")
     print(f"  Avg pos error: {metrics.avg_position_error:.2f}m")
+
+    # Print safety event summary
+    by_sev = result.event_log.count_by_severity()
+    crit = by_sev.get("CRITICAL", 0)
+    warn = by_sev.get("WARNING", 0)
+    print(f"\n=== Safety Audit ===")
+    print(f"  Total events: {len(result.event_log)}")
+    print(f"  CRITICAL: {crit}")
+    print(f"  WARNING:  {warn}")
+    if crit > 0:
+        print(f"  ** {crit} CRITICAL event(s) — see {output_dir / 'event_log.jsonl'}")
 
 
 def _cmd_report(args: argparse.Namespace) -> None:

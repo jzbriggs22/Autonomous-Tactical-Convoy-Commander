@@ -1,13 +1,20 @@
-"""Scenario definitions."""
+"""Scenario definitions.
+
+Each scenario returns a ``SimConfig`` with parameters chosen for that
+operational context.  All defaults in ``SimConfig`` are conservative;
+scenarios override only what is necessary for the test case.
+"""
 
 from __future__ import annotations
+
+from typing import Callable
 
 from convoy_commander.core.config import SimConfig
 
 
 def get_scenario(name: str, **overrides: object) -> SimConfig:
     """Get a scenario configuration by name."""
-    builders: dict[str, callable] = {
+    builders: dict[str, Callable[..., SimConfig]] = {
         "baseline": _baseline,
         "gps_denied": _gps_denied,
         "comms_degraded": _comms_degraded,
@@ -38,10 +45,7 @@ def _apply_overrides(config: SimConfig, **overrides: object) -> SimConfig:
 
 def _baseline(**overrides: object) -> SimConfig:
     """Baseline: GPS available, low loss."""
-    config = SimConfig(
-        gps_available=True,
-        comms=SimConfig.model_fields["comms"].default_factory(),  # type: ignore[union-attr]
-    )
+    config = SimConfig()
     config.comms.packet_loss = 0.02
     config.comms.latency_mean_ms = 30.0
     return _apply_overrides(config, **overrides)
@@ -60,9 +64,7 @@ def _gps_denied(**overrides: object) -> SimConfig:
 
 def _comms_degraded(**overrides: object) -> SimConfig:
     """Comms degraded: high loss + latency."""
-    config = SimConfig(
-        gps_available=True,
-    )
+    config = SimConfig()
     config.comms.packet_loss = 0.3
     config.comms.latency_mean_ms = 200.0
     config.comms.latency_std_ms = 80.0
@@ -72,17 +74,11 @@ def _comms_degraded(**overrides: object) -> SimConfig:
 
 def _leader_failure(**overrides: object) -> SimConfig:
     """Leader fails at t=120s."""
-    config = SimConfig(
-        gps_available=True,
-        duration=300.0,
-    )
+    config = SimConfig(duration=300.0)
     return _apply_overrides(config, **overrides)
 
 
 def _obstacle_pop(**overrides: object) -> SimConfig:
     """New obstacle appears at t=90s forcing reroute."""
-    config = SimConfig(
-        gps_available=True,
-        duration=300.0,
-    )
+    config = SimConfig(duration=300.0)
     return _apply_overrides(config, **overrides)

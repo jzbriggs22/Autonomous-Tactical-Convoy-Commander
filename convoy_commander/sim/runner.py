@@ -1,11 +1,19 @@
-"""Main simulation runner."""
+"""Main simulation runner.
+
+SAFETY-CRITICAL DESIGN:
+  - Every safety-relevant state transition is logged to the EventLog.
+  - The sim loop enforces hard invariants *after* each step (boundary
+    clamping, speed capping, collision detection).  If an invariant is
+    violated the event is logged and corrective action is taken
+    (e.g., emergency stop).
+  - The runner never silently swallows errors: unexpected states are
+    logged at CRITICAL severity so they surface in the audit report.
+"""
 
 from __future__ import annotations
 
 import math
-import time as wall_time
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
@@ -23,6 +31,7 @@ from convoy_commander.coordination.formation import (
 )
 from convoy_commander.coordination.leader_election import LeaderElection
 from convoy_commander.core.config import SimConfig
+from convoy_commander.core.event_log import EventKind, EventLog, Severity
 from convoy_commander.core.world import World
 from convoy_commander.metrics.collector import MetricsCollector
 from convoy_commander.planning.global_planner import plan_route
@@ -39,6 +48,7 @@ class SimResult:
     world: World
     collector: MetricsCollector
     comms: CommsNetwork
+    event_log: EventLog
 
 
 class SimRunner:
@@ -50,6 +60,22 @@ class SimRunner:
         self.world = World(config.world, self.rng)
         self.comms = CommsNetwork(config.comms, self.rng)
         self.collector = MetricsCollector()
+        self.event_log = EventLog()
+
+        # --- Log simulation start with full config ---
+        self.event_log.log(
+            0.0, EventKind.SIM_START, Severity.INFO,
+            message=f"Simulation starting: scenario={config.scenario} seed={config.seed} "
+                    f"vehicles={config.num_vehicles} duration={config.duration}s",
+            scenario=config.scenario, seed=config.seed, num_vehicles=config.num_vehicles,
+        )
+
+        # --- Log config validation warnings ---
+        for warning in config.safety_warnings():
+            self.event_log.log(
+                0.0, EventKind.CONFIG_WARNING, Severity.WARNING,
+                message=warning,
+            )
 
         # Create vehicles in a staggered formation near bottom-left
         self.vehicles: list[Vehicle] = []
@@ -67,6 +93,11 @@ class SimRunner:
                 start_heading=0.3,  # roughly northeast
             )
             self.vehicles.append(v)
+            self.event_log.log(
+                0.0, EventKind.VEHICLE_SPAWNED, Severity.INFO, vehicle_id=i,
+                message=f"Vehicle {i} spawned at ({start_x:.1f}, {start_y:.1f})",
+                x=start_x, y=start_y,
+            )
 
         # Leader election per vehicle
         self.elections: dict[int, LeaderElection] = {}
@@ -81,6 +112,10 @@ class SimRunner:
         for v in self.vehicles:
             v.leader_id = 0
             self.elections[v.id].last_heartbeat_time = 0.0
+        self.event_log.log(
+            0.0, EventKind.LEADER_ELECTED, Severity.INFO, vehicle_id=0,
+            message="Vehicle 0 designated as initial leader",
+        )
 
         # Convoy destination: upper-right area
         self.destination = (
@@ -95,6 +130,11 @@ class SimRunner:
         # Scenario event flags
         self._leader_failed = False
         self._obstacle_popped = False
+
+        # Per-vehicle comms-lost tracking for edge-detect logging
+        self._comms_lost_flags: dict[int, bool] = {v.id: False for v in self.vehicles}
+        # Per-vehicle fuel-low tracking
+        self._fuel_low_logged: set[int] = set()
 
     def _plan_all_routes(self) -> None:
         """Plan global routes for all vehicles."""
@@ -114,7 +154,6 @@ class SimRunner:
         """Run the full simulation."""
         dt = self.config.dt
         total_steps = int(self.config.duration / dt)
-        current_time = 0.0
         broadcast_timer = 0.0
 
         for step in range(total_steps):
@@ -184,21 +223,30 @@ class SimRunner:
 
                 v.step(cmd, dt)
 
-                # Boundary enforcement
-                v.state.x = max(0, min(self.world.width, v.state.x))
-                v.state.y = max(0, min(self.world.height, v.state.y))
+                # === Safety envelope enforcement (post-step) ===
+                self._enforce_safety_envelope(v, current_time)
 
                 # Check waypoint advance
                 self._advance_waypoint(v)
 
                 # Check arrival
                 if v.has_reached_destination():
-                    v.status = VehicleStatus.ARRIVED
-                    v.state.speed = 0.0
-                    self.collector.record_arrival(v.id, current_time)
+                    if v.status != VehicleStatus.ARRIVED:
+                        v.status = VehicleStatus.ARRIVED
+                        v.state.speed = 0.0
+                        self.collector.record_arrival(v.id, current_time)
+                        self.event_log.log(
+                            current_time, EventKind.VEHICLE_ARRIVED, Severity.INFO,
+                            vehicle_id=v.id,
+                            message=f"Vehicle {v.id} arrived at destination",
+                            x=v.state.x, y=v.state.y,
+                        )
+
+            # === Fuel monitoring ===
+            self._check_fuel(current_time)
 
             # === Collision and near-miss detection ===
-            self._detect_collisions()
+            self._detect_collisions(current_time)
 
             # === Record metrics ===
             self.collector.record_step(current_time, self.vehicles)
@@ -216,13 +264,95 @@ class SimRunner:
             ):
                 break
 
+        # --- Log simulation end ---
+        final_time = min(total_steps * dt, self.config.duration)
+        arrived = sum(1 for v in self.vehicles if v.has_reached_destination())
+        self.event_log.log(
+            final_time, EventKind.SIM_END, Severity.INFO,
+            message=f"Simulation ended: {arrived}/{len(self.vehicles)} arrived",
+            arrived=arrived, total=len(self.vehicles),
+        )
+
         return SimResult(
             config=self.config,
             vehicles=self.vehicles,
             world=self.world,
             collector=self.collector,
             comms=self.comms,
+            event_log=self.event_log,
         )
+
+    # ------------------------------------------------------------------
+    # Safety envelope enforcement
+    # ------------------------------------------------------------------
+
+    def _enforce_safety_envelope(self, v: Vehicle, t: float) -> None:
+        """Post-step invariant checks and corrective actions."""
+        # Boundary clamping
+        clamped = False
+        if v.state.x < 0:
+            v.state.x = 0.0
+            clamped = True
+        elif v.state.x > self.world.width:
+            v.state.x = self.world.width
+            clamped = True
+        if v.state.y < 0:
+            v.state.y = 0.0
+            clamped = True
+        elif v.state.y > self.world.height:
+            v.state.y = self.world.height
+            clamped = True
+        if clamped:
+            v.state.speed = 0.0  # Emergency stop on boundary
+            self.event_log.log(
+                t, EventKind.BOUNDARY_VIOLATION, Severity.WARNING, vehicle_id=v.id,
+                message=f"Vehicle {v.id} clamped to world boundary, emergency stop",
+                x=v.state.x, y=v.state.y,
+            )
+
+        # Speed limit enforcement (belt-and-braces)
+        hard_max = v.vcfg.max_speed * 1.01  # 1% tolerance for float rounding
+        if v.state.speed > hard_max:
+            self.event_log.log(
+                t, EventKind.SPEED_LIMIT_EXCEEDED, Severity.WARNING, vehicle_id=v.id,
+                message=f"Vehicle {v.id} speed {v.state.speed:.2f} exceeds max {v.vcfg.max_speed:.2f}",
+                speed=v.state.speed, max_speed=v.vcfg.max_speed,
+            )
+            v.state.speed = v.vcfg.max_speed
+
+        # Obstacle collision check (vehicle inside obstacle -> emergency stop)
+        if self.world.is_blocked(v.state.x, v.state.y):
+            v.state.speed = 0.0
+            self.event_log.log(
+                t, EventKind.INVARIANT_VIOLATION, Severity.CRITICAL, vehicle_id=v.id,
+                message=f"Vehicle {v.id} inside obstacle at ({v.state.x:.1f}, {v.state.y:.1f}), "
+                        "emergency stop",
+                x=v.state.x, y=v.state.y,
+            )
+
+    def _check_fuel(self, t: float) -> None:
+        """Monitor fuel levels and log warnings."""
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+            if v.fuel.is_empty:
+                v.status = VehicleStatus.BREAKDOWN
+                v.state.speed = 0.0
+                self.event_log.log(
+                    t, EventKind.VEHICLE_FUEL_EMPTY, Severity.CRITICAL, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} fuel exhausted — forced breakdown",
+                )
+            elif v.fuel.is_low and v.id not in self._fuel_low_logged:
+                self._fuel_low_logged.add(v.id)
+                self.event_log.log(
+                    t, EventKind.VEHICLE_FUEL_LOW, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} fuel below 20% ({v.fuel.fraction:.0%})",
+                    fuel_fraction=v.fuel.fraction,
+                )
+
+    # ------------------------------------------------------------------
+    # Scenario events
+    # ------------------------------------------------------------------
 
     def _handle_scenario_events(self, t: float) -> None:
         """Trigger scenario-specific events."""
@@ -232,7 +362,15 @@ class SimRunner:
             self._leader_failed = True
             leader = self._get_leader()
             if leader:
+                self.event_log.log(
+                    t, EventKind.SCENARIO_EVENT, Severity.WARNING, vehicle_id=leader.id,
+                    message=f"SCENARIO: Leader vehicle {leader.id} forced breakdown at t={t:.1f}s",
+                )
                 leader.set_breakdown()
+                self.event_log.log(
+                    t, EventKind.LEADER_LOST, Severity.WARNING,
+                    message=f"Leader {leader.id} lost — triggering re-election",
+                )
                 # Force election restart on all
                 for v in self.vehicles:
                     if v.is_operational:
@@ -241,12 +379,23 @@ class SimRunner:
 
         if scenario == "obstacle_pop" and not self._obstacle_popped and t >= 90.0:
             self._obstacle_popped = True
-            # Add obstacle in the middle of the likely path
             mid_x = self.world.width * 0.5
             mid_y = self.world.height * 0.5
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message=f"SCENARIO: New obstacle at ({mid_x:.0f}, {mid_y:.0f}) radius 35m",
+                x=mid_x, y=mid_y, radius=35.0,
+            )
             self.world.add_obstacle(mid_x, mid_y, 35.0)
-            # Replan routes
             self._plan_all_routes()
+            self.event_log.log(
+                t, EventKind.ROUTE_REPLAN, Severity.INFO,
+                message="All routes replanned after obstacle insertion",
+            )
+
+    # ------------------------------------------------------------------
+    # Position fixes
+    # ------------------------------------------------------------------
 
     def _apply_position_fixes(self, t: float) -> None:
         """Apply GPS or landmark fixes to vehicles."""
@@ -266,6 +415,10 @@ class SimRunner:
             for lm in nearby:
                 v.estimator.apply_landmark_fix(v.state.x, v.state.y)
 
+    # ------------------------------------------------------------------
+    # Comms processing
+    # ------------------------------------------------------------------
+
     def _process_messages(self, t: float) -> None:
         """Process incoming messages for all vehicles."""
         for v in self.vehicles:
@@ -274,20 +427,28 @@ class SimRunner:
             inbox = self.comms.get_inbox(v.id)
             for msg in inbox:
                 v.last_comms_time = t
+
+                # Edge-detect comms restored
+                if self._comms_lost_flags.get(v.id, False):
+                    self._comms_lost_flags[v.id] = False
+                    self.event_log.log(
+                        t, EventKind.COMMS_RESTORED, Severity.INFO, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} comms restored",
+                    )
+
                 if msg.msg_type == MessageType.LEADER_HEARTBEAT:
                     self.elections[v.id].on_heartbeat(msg, t)
                 elif msg.msg_type == MessageType.LEADER_ELECTION:
                     self.elections[v.id].on_election_message(msg, t)
                 elif msg.msg_type == MessageType.HAZARD:
-                    # Could trigger replanning here
                     pass
                 elif msg.msg_type == MessageType.STATE_BROADCAST:
-                    # Update known positions of other vehicles (implicit via comms)
                     pass
 
     def _run_elections(self, t: float) -> None:
         """Run leader election logic for all vehicles."""
         positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles if v.is_operational}
+        prev_leaders = {v.id for v in self.vehicles if v.is_leader}
         for v in self.vehicles:
             if not v.is_operational:
                 continue
@@ -295,6 +456,15 @@ class SimRunner:
             sender_pos = (v.state.x, v.state.y)
             for msg in msgs:
                 self.comms.send_broadcast(msg, sender_pos, positions, t)
+
+        # Detect new leader
+        for v in self.vehicles:
+            if v.is_leader and v.id not in prev_leaders:
+                self.event_log.log(
+                    t, EventKind.LEADER_ELECTED, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} elected as new leader",
+                )
+                self.collector.leader_elections += 1
 
     def _broadcast_states(self, t: float) -> None:
         """Broadcast vehicle states."""
@@ -316,27 +486,60 @@ class SimRunner:
             sender_pos = (v.state.x, v.state.y)
             self.comms.send_broadcast(msg, sender_pos, positions, t)
 
+    # ------------------------------------------------------------------
+    # Safe mode logic
+    # ------------------------------------------------------------------
+
     def _check_safe_mode(self, t: float) -> None:
-        """Enter/exit safe mode based on conditions."""
+        """Enter/exit safe mode based on safety conditions.
+
+        Conservative policy: enter on *any* trigger, exit only when
+        *all* conditions clear.
+        """
+        comms_timeout = self.config.coordination.comms_lost_timeout
+
         for v in self.vehicles:
             if not v.is_operational:
                 continue
 
-            should_safe = False
+            reasons: list[str] = []
 
             # High position uncertainty
             if v.estimator.is_uncertain:
-                should_safe = True
+                reasons.append(
+                    f"uncertainty={v.estimator.state.uncertainty:.1f}m > "
+                    f"threshold={self.config.estimator.uncertainty_safe_threshold:.1f}m"
+                )
 
             # Comms lost for too long
-            if t - v.last_comms_time > self.config.coordination.comms_lost_timeout and t > 5.0:
-                should_safe = True
+            comms_gap = t - v.last_comms_time
+            if comms_gap > comms_timeout and t > 5.0:
+                reasons.append(f"comms_lost={comms_gap:.1f}s > timeout={comms_timeout:.1f}s")
+                # Edge-detect comms lost
+                if not self._comms_lost_flags.get(v.id, False):
+                    self._comms_lost_flags[v.id] = True
+                    self.event_log.log(
+                        t, EventKind.COMMS_LOST, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} comms lost for {comms_gap:.1f}s",
+                    )
 
-            if should_safe and v.status == VehicleStatus.ACTIVE:
+            if reasons and v.status == VehicleStatus.ACTIVE:
                 v.enter_safe_mode()
                 self.collector.safe_mode_activations += 1
-            elif not should_safe and v.status == VehicleStatus.SAFE_MODE:
+                self.event_log.log(
+                    t, EventKind.SAFE_MODE_ENTER, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} entering safe mode: {'; '.join(reasons)}",
+                )
+            elif not reasons and v.status == VehicleStatus.SAFE_MODE:
                 v.exit_safe_mode()
+                self.event_log.log(
+                    t, EventKind.SAFE_MODE_EXIT, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} exiting safe mode — all conditions clear",
+                )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _get_leader(self) -> Vehicle | None:
         """Get current leader vehicle."""
@@ -351,10 +554,8 @@ class SimRunner:
             if v.assigned_destination:
                 return v.assigned_destination
             return None
-
         if v.current_waypoint_idx < len(v.waypoints):
             return v.waypoints[v.current_waypoint_idx]
-
         return v.assigned_destination
 
     def _advance_waypoint(self, v: Vehicle) -> None:
@@ -366,7 +567,7 @@ class SimRunner:
         if dist < 15.0:
             v.current_waypoint_idx += 1
 
-    def _detect_collisions(self) -> None:
+    def _detect_collisions(self, t: float) -> None:
         """Detect collisions and near misses between vehicles."""
         collision_r = self.config.coordination.collision_radius
         min_sep = self.config.coordination.min_separation
@@ -380,6 +581,18 @@ class SimRunner:
                 if dist < collision_r:
                     a.collision_count += 1
                     b.collision_count += 1
+                    self.event_log.log(
+                        t, EventKind.COLLISION, Severity.CRITICAL,
+                        message=f"COLLISION between V{a.id} and V{b.id} "
+                                f"(dist={dist:.2f}m < {collision_r:.1f}m)",
+                        vehicle_a=a.id, vehicle_b=b.id, distance=dist,
+                    )
                 elif dist < min_sep:
                     a.near_miss_count += 1
                     b.near_miss_count += 1
+                    self.event_log.log(
+                        t, EventKind.NEAR_MISS, Severity.WARNING,
+                        message=f"Near miss V{a.id}–V{b.id} "
+                                f"(dist={dist:.2f}m < min_sep={min_sep:.1f}m)",
+                        vehicle_a=a.id, vehicle_b=b.id, distance=dist,
+                    )
