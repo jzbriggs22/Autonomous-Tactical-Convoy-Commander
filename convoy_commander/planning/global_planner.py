@@ -1,19 +1,46 @@
-"""Global planner: A* on road graph."""
+"""Global planner: multi-objective A* on road graph.
+
+The planner supports three objectives via ``PlanningObjective``:
+  - w_time: weight on travel distance (proxy for time)
+  - w_fuel: weight on fuel consumption (proportional to distance)
+  - w_risk: weight on per-edge risk score (proximity to obstacles / no-go zones)
+
+The composite edge cost is:
+    (w_time + w_fuel) * base_weight + w_risk * edge_risk * dist
+
+Setting all weights equal to the defaults (1.0, 0.3, 0.5) biases the planner
+toward shorter, less risky routes over raw time minimisation.
+"""
 
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import networkx as nx
-import numpy as np
 
 from convoy_commander.core.world import World
 
+if TYPE_CHECKING:
+    from convoy_commander.core.config import PlanningObjective
+
 
 def plan_route(
-    world: World, start_x: float, start_y: float, goal_x: float, goal_y: float
+    world: World,
+    start_x: float,
+    start_y: float,
+    goal_x: float,
+    goal_y: float,
+    objective: PlanningObjective | None = None,
 ) -> list[tuple[float, float]]:
     """Plan a route from start to goal using A* on the road graph.
+
+    Args:
+        world: The world model containing the road graph.
+        start_x, start_y: Start position (m).
+        goal_x, goal_y: Goal position (m).
+        objective: Multi-objective weights.  None uses pure distance (w_time=1,
+                   w_fuel=0, w_risk=0), preserving backward compatibility.
 
     Returns list of (x, y) waypoints including start and goal.
     """
@@ -26,13 +53,18 @@ def plan_route(
     if start_node == goal_node:
         return [(start_x, start_y), (goal_x, goal_y)]
 
+    if objective is None:
+        weight_fn = "weight"
+    else:
+        weight_fn = _make_weight_fn(world, objective)
+
     try:
         path_nodes = nx.astar_path(
             world.road_graph,
             start_node,
             goal_node,
             heuristic=lambda a, b: _heuristic(world, a, b),
-            weight="weight",
+            weight=weight_fn,
         )
     except nx.NetworkXNoPath:
         # Fallback: direct path
@@ -46,6 +78,21 @@ def plan_route(
     waypoints.append((goal_x, goal_y))
 
     return waypoints
+
+
+def _make_weight_fn(world: World, obj: PlanningObjective):
+    """Return a weight function that combines distance, fuel, and risk."""
+
+    def weight(u: int, v: int, data: dict) -> float:
+        base_w = float(data.get("weight", 1.0))
+        # Approximate distance from base_weight (base_weight ≈ dist * random_factor)
+        pos_u = world.get_node_pos(u)
+        pos_v = world.get_node_pos(v)
+        dist = math.hypot(pos_u[0] - pos_v[0], pos_u[1] - pos_v[1])
+        risk = float(data.get("risk", 0.0))
+        return (obj.w_time + obj.w_fuel) * base_w + obj.w_risk * risk * dist
+
+    return weight
 
 
 def _heuristic(world: World, node_a: int, node_b: int) -> float:

@@ -48,6 +48,27 @@ class Landmark:
     detection_range: float = 50.0
 
 
+@dataclass
+class SpoofRegion:
+    """GPS spoofing zone: shifts the apparent GPS position by a fixed offset.
+
+    Vehicles inside this region receive GPS measurements biased by
+    (offset_x, offset_y) metres.  The innovation gate in the estimator
+    detects and rejects anomalously large fixes.
+    """
+
+    x: float
+    y: float
+    radius: float
+    offset_x: float  # Spoof bias: added to true_x before passing to estimator
+    offset_y: float  # Spoof bias: added to true_y before passing to estimator
+
+    def contains(self, px: float, py: float) -> bool:
+        dx = px - self.x
+        dy = py - self.y
+        return dx * dx + dy * dy < self.radius * self.radius
+
+
 class World:
     """2D continuous world with obstacles, road graph, no-go zones, and landmarks."""
 
@@ -58,6 +79,7 @@ class World:
         self.obstacles: list[Obstacle] = []
         self.nogo_zones: list[NoGoZone] = []
         self.landmarks: list[Landmark] = []
+        self.spoof_regions: list[SpoofRegion] = []
         self.road_graph: nx.Graph = nx.Graph()
 
         self._generate(rng)
@@ -197,6 +219,25 @@ class World:
             y = rng.uniform(50, self.height - 50)
             self.landmarks.append(Landmark(x=x, y=y))
 
+        # Annotate edges with risk score [0,1] based on proximity to hazards
+        self._annotate_edge_risk()
+
+        # Generate GPS spoofing regions (placed mid-route to be encountered)
+        for _ in range(self.config.spoof_region_count):
+            spoof_r = 80.0
+            x = rng.uniform(self.width * 0.3, self.width * 0.7)
+            y = rng.uniform(self.height * 0.3, self.height * 0.7)
+            # Random offset within the configured max
+            angle = rng.uniform(0, 2 * math.pi)
+            magnitude = rng.uniform(
+                self.config.spoof_offset_max * 0.5, self.config.spoof_offset_max
+            )
+            offset_x = magnitude * math.cos(angle)
+            offset_y = magnitude * math.sin(angle)
+            self.spoof_regions.append(
+                SpoofRegion(x=x, y=y, radius=spoof_r, offset_x=offset_x, offset_y=offset_y)
+            )
+
     @staticmethod
     def _segment_intersects_circle(
         p1: np.ndarray, p2: np.ndarray, center: np.ndarray, radius: float
@@ -217,6 +258,30 @@ class World:
         t2 = (-b + discriminant) / (2.0 * a)
 
         return (0 <= t1 <= 1) or (0 <= t2 <= 1) or (t1 < 0 and t2 > 1)
+
+    def _annotate_edge_risk(self) -> None:
+        """Annotate road graph edges with a risk score in [0, 1].
+
+        Risk is inversely proportional to clearance from obstacles and no-go
+        zones.  This attribute is used by the multi-objective global planner.
+        """
+        max_influence = 60.0  # m — beyond this, risk contribution is 0
+        for u, v in self.road_graph.edges():
+            pos_u = np.array(self.road_graph.nodes[u]["pos"])
+            pos_v = np.array(self.road_graph.nodes[v]["pos"])
+            mid = (pos_u + pos_v) * 0.5
+
+            risk = 0.0
+            for obs in self.obstacles:
+                d = math.hypot(mid[0] - obs.x, mid[1] - obs.y) - obs.radius
+                if d < max_influence:
+                    risk = max(risk, 1.0 - max(d, 0.0) / max_influence)
+            for nz in self.nogo_zones:
+                d = math.hypot(mid[0] - nz.x, mid[1] - nz.y) - nz.radius
+                if d < max_influence:
+                    risk = max(risk, 0.5 * (1.0 - max(d, 0.0) / max_influence))
+
+            self.road_graph[u][v]["risk"] = min(1.0, risk)
 
     def is_blocked(self, x: float, y: float) -> bool:
         """Check if a position is inside an obstacle."""
@@ -254,6 +319,17 @@ class World:
     def add_obstacle(self, x: float, y: float, radius: float) -> None:
         """Add an obstacle at runtime (for dynamic scenarios)."""
         self.obstacles.append(Obstacle(x=x, y=y, radius=radius))
+
+    def get_spoof_offset(self, x: float, y: float) -> tuple[float, float] | None:
+        """Return GPS spoof offset (ox, oy) if position is inside a spoof region.
+
+        Returns None if the position is not spoofed.  If multiple regions
+        overlap, returns the first match (deterministic by generation order).
+        """
+        for region in self.spoof_regions:
+            if region.contains(x, y):
+                return (region.offset_x, region.offset_y)
+        return None
 
     def landmarks_in_range(self, x: float, y: float) -> list[Landmark]:
         """Return landmarks within detection range of position."""

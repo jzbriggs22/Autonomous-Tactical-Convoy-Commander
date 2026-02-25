@@ -20,6 +20,10 @@ def get_scenario(name: str, **overrides: object) -> SimConfig:
         "comms_degraded": _comms_degraded,
         "leader_failure": _leader_failure,
         "obstacle_pop": _obstacle_pop,
+        # Phase 2 scenarios
+        "gps_spoofed": _gps_spoofed,
+        "silent_running": _silent_running,
+        "comms_blackout": _comms_blackout,
     }
     if name not in builders:
         raise ValueError(f"Unknown scenario: {name}. Available: {list(builders.keys())}")
@@ -81,4 +85,48 @@ def _leader_failure(**overrides: object) -> SimConfig:
 def _obstacle_pop(**overrides: object) -> SimConfig:
     """New obstacle appears at t=90s forcing reroute."""
     config = SimConfig(duration=300.0)
+    return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 scenarios
+# ---------------------------------------------------------------------------
+
+
+def _gps_spoofed(**overrides: object) -> SimConfig:
+    """GPS spoofing attack: spoof regions along the convoy route.
+
+    The world generates 3 GPS spoofing zones with up to 60m offset.
+    Innovation gating (5-sigma) is enabled to detect and reject spoofed fixes.
+    """
+    config = SimConfig(gps_available=True)
+    config.world.spoof_region_count = 3
+    config.world.spoof_offset_max = 60.0
+    config.estimator.innovation_gate_sigma = 5.0
+    return _apply_overrides(config, **overrides)
+
+
+def _silent_running(**overrides: object) -> SimConfig:
+    """Silent running: all vehicles suppress broadcasts to reduce RF signature.
+
+    The broadcast interval is increased 5x compared to baseline.
+    Comms loss timeout is extended proportionally so vehicles don't enter
+    safe mode immediately due to the longer broadcast interval.
+    """
+    config = SimConfig()
+    config.comms.packet_loss = 0.05
+    config.comms.broadcast_interval = 5.0          # 5x longer broadcast interval
+    config.coordination.comms_lost_timeout = 30.0  # Allow for longer silence
+    return _apply_overrides(config, **overrides)
+
+
+def _comms_blackout(**overrides: object) -> SimConfig:
+    """Communications blackout zone: a large region in the convoy path where
+    comms are degraded by 20x loss multiplier.
+
+    The blackout region is added to the CommsNetwork in the SimRunner
+    initialiser when ``scenario == "comms_blackout"``.
+    """
+    config = SimConfig(duration=300.0)
+    config.comms.packet_loss = 0.05
     return _apply_overrides(config, **overrides)

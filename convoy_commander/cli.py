@@ -18,7 +18,11 @@ def main() -> None:
 
     # run command
     run_parser = subparsers.add_parser("run", help="Run a simulation scenario")
-    run_parser.add_argument("--scenario", default="baseline", help="Scenario name")
+    run_parser.add_argument(
+        "--scenario", default="baseline",
+        help="Scenario name: baseline|gps_denied|comms_degraded|leader_failure|"
+             "obstacle_pop|gps_spoofed|silent_running|comms_blackout",
+    )
     run_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     run_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
     run_parser.add_argument("--loss", type=float, default=None, help="Packet loss rate")

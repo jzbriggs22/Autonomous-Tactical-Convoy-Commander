@@ -99,11 +99,17 @@ class PositionEstimator:
         # Cap to prevent overflow
         self.state.uncertainty = min(self.state.uncertainty, _MAX_UNCERTAINTY_CAP)
 
-    def apply_landmark_fix(self, true_x: float, true_y: float) -> float:
+    def apply_landmark_fix(self, true_x: float, true_y: float) -> tuple[float, bool]:
         """Apply a landmark fix (noisy absolute measurement).
 
-        Returns the innovation magnitude (pre-update residual), which can be
-        used for anomaly detection.
+        Returns (innovation, accepted):
+          - innovation: pre-update residual magnitude (m)
+          - accepted: True if the fix passed the innovation gate
+
+        Innovation gating (SAFETY):  if ``innovation_gate_sigma > 0``, fixes
+        whose innovation exceeds gate_sigma * max(uncertainty, landmark_fix_std)
+        are rejected without updating the estimate.  This prevents a spoofed
+        or faulty landmark from pulling the estimate to a wrong location.
         """
         noise_x = self.rng.normal(0, self.config.landmark_fix_std)
         noise_y = self.rng.normal(0, self.config.landmark_fix_std)
@@ -112,6 +118,14 @@ class PositionEstimator:
 
         # Innovation (pre-update residual)
         innovation = math.hypot(measured_x - self.state.x, measured_y - self.state.y)
+
+        # Innovation gate
+        if self.config.innovation_gate_sigma > 0:
+            gate = self.config.innovation_gate_sigma * max(
+                self.state.uncertainty, self.config.landmark_fix_std
+            )
+            if innovation > gate:
+                return innovation, False  # Rejected — anomalous fix
 
         # Complementary filter gain
         meas_var = self.config.landmark_fix_std ** 2
@@ -127,12 +141,16 @@ class PositionEstimator:
         self.state.bias_y *= (1 - gain * 0.5)
 
         self.state.total_fixes_applied += 1
-        return innovation
+        return innovation, True
 
-    def apply_gps_fix(self, true_x: float, true_y: float) -> float:
+    def apply_gps_fix(self, true_x: float, true_y: float) -> tuple[float, bool]:
         """Apply a GPS fix (less noisy than landmark).
 
-        Returns the innovation magnitude.
+        Returns (innovation, accepted).
+
+        Innovation gating (SAFETY): rejects fixes whose innovation exceeds
+        gate_sigma * max(uncertainty, gps_fix_std).  This is the primary
+        defence against GPS spoofing attacks.
         """
         noise_x = self.rng.normal(0, self.config.gps_fix_std)
         noise_y = self.rng.normal(0, self.config.gps_fix_std)
@@ -140,6 +158,14 @@ class PositionEstimator:
         measured_y = true_y + noise_y
 
         innovation = math.hypot(measured_x - self.state.x, measured_y - self.state.y)
+
+        # Innovation gate
+        if self.config.innovation_gate_sigma > 0:
+            gate = self.config.innovation_gate_sigma * max(
+                self.state.uncertainty, self.config.gps_fix_std
+            )
+            if innovation > gate:
+                return innovation, False  # Rejected — spoofed or faulty fix
 
         meas_var = self.config.gps_fix_std ** 2
         est_var = self.state.uncertainty ** 2
@@ -154,7 +180,7 @@ class PositionEstimator:
         self.state.bias_y *= (1 - gain * 0.8)
 
         self.state.total_fixes_applied += 1
-        return innovation
+        return innovation, True
 
     @property
     def is_uncertain(self) -> bool:

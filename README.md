@@ -18,9 +18,155 @@ python -m convoy_commander run --scenario baseline --seed 42
 # Run GPS-denied scenario with 8 vehicles
 python -m convoy_commander run --scenario gps_denied --seed 42 --vehicles 8
 
-# Run unit tests (62 tests including 30 safety-specific)
+# Run unit tests (100 tests including 30 safety-specific + 38 Phase 2 tests)
 python -m pytest -q
 ```
+
+## Running the Simulator
+
+### Local Installation
+
+#### Minimum System Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Python | 3.11 | 3.12+ |
+| CPU | 2 cores, 2 GHz | 4+ cores, 3 GHz |
+| RAM | 2 GB available | 4 GB available |
+| Disk | 500 MB free | 2 GB free (for run archives) |
+| OS | Linux, macOS, Windows (WSL2) | Linux or macOS |
+
+A single 300-second simulation with 8 vehicles completes in approximately 30–60 seconds on a modern
+laptop.  Batch runs of all 8 scenarios take 4–8 minutes.
+
+#### Install Steps
+
+```bash
+# 1. Clone
+git clone https://github.com/jzbriggs22/Autonomous-Tactical-Convoy-Commander.git
+cd Autonomous-Tactical-Convoy-Commander
+
+# 2. Create virtual environment (Python 3.11+)
+python3.11 -m venv .venv
+source .venv/bin/activate          # Linux / macOS
+# .venv\Scripts\activate           # Windows PowerShell
+
+# 3. Install package + dev dependencies
+pip install -e ".[dev]"
+
+# 4. Verify installation
+python -m convoy_commander --help
+python -m pytest -q --tb=short     # 100 tests should pass
+```
+
+#### Run All Scenarios Locally
+
+```bash
+# Baseline
+python -m convoy_commander run --scenario baseline --seed 42 --vehicles 8
+
+# GPS-denied with aggressive drift
+python -m convoy_commander run --scenario gps_denied --seed 42 --vehicles 8
+
+# Degraded comms (30% loss, 200ms latency)
+python -m convoy_commander run --scenario comms_degraded --seed 42 --vehicles 8
+
+# Leader failure at t=120s
+python -m convoy_commander run --scenario leader_failure --seed 42 --vehicles 8
+
+# Dynamic obstacle insertion at t=90s
+python -m convoy_commander run --scenario obstacle_pop --seed 42 --vehicles 8
+
+# GPS spoofing attack (Phase 2)
+python -m convoy_commander run --scenario gps_spoofed --seed 42 --vehicles 8
+
+# Silent running / reduced RF emissions (Phase 2)
+python -m convoy_commander run --scenario silent_running --seed 42 --vehicles 8
+
+# Communications blackout zone (Phase 2)
+python -m convoy_commander run --scenario comms_blackout --seed 42 --vehicles 8
+```
+
+Each run writes output to `runs/<scenario>_<timestamp>/`.
+
+---
+
+### AWS Deployment
+
+AWS is recommended if you need:
+- **Batch parameter sweeps** across many seeds / vehicle counts simultaneously.
+- **Long duration simulations** (> 30 minutes wall-clock) that would tie up a laptop.
+- **Reproducible cloud archive** of run artifacts (S3 or EBS).
+
+The simulator itself is CPU-bound and single-threaded (one Python process per run).
+No GPU is required.
+
+#### Recommended Instance Types
+
+| Use Case | Instance | vCPU | RAM | On-Demand Cost (us-east-1) |
+|----------|----------|------|-----|---------------------------|
+| Single scenario testing | `t3.medium` | 2 | 4 GB | ~$0.04/hr |
+| Single full run (300 s sim) | `m5.large` | 2 | 8 GB | ~$0.10/hr |
+| Parallel batch (8 scenarios) | `c5.2xlarge` | 8 | 16 GB | ~$0.34/hr |
+| Large-fleet sweeps (N=32+) | `c5.4xlarge` | 16 | 32 GB | ~$0.68/hr |
+
+For quick exploratory runs a `t3.medium` Spot instance costs < $0.01.
+
+#### AWS Setup (Ubuntu 22.04 / Amazon Linux 2023)
+
+```bash
+# 1. Launch instance (e.g., Amazon Linux 2023 AMI, t3.medium, 20 GB EBS)
+# 2. SSH in and install Python 3.11
+sudo dnf install -y python3.11 python3.11-pip git   # Amazon Linux 2023
+# or: sudo apt install -y python3.11 python3.11-venv git  # Ubuntu 22.04
+
+# 3. Clone repo
+git clone https://github.com/jzbriggs22/Autonomous-Tactical-Convoy-Commander.git
+cd Autonomous-Tactical-Convoy-Commander
+
+# 4. Install
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# 5. Run (inside a tmux or screen session for long runs)
+tmux new -s convoy
+python -m convoy_commander run --scenario baseline --seed 42 --vehicles 8 \
+    --output /tmp/runs/baseline_42
+# Detach: Ctrl+B, D
+
+# 6. Copy results to S3
+aws s3 cp /tmp/runs/ s3://my-bucket/convoy-runs/ --recursive
+```
+
+#### Parallel Batch on c5.2xlarge (8 scenarios × 1 seed)
+
+```bash
+# Install GNU parallel
+sudo dnf install -y parallel          # Amazon Linux
+# or: sudo apt install -y parallel    # Ubuntu
+
+scenarios=(baseline gps_denied comms_degraded leader_failure obstacle_pop \
+           gps_spoofed silent_running comms_blackout)
+
+parallel -j 8 python -m convoy_commander run \
+    --scenario {} --seed 42 --vehicles 8 \
+    --output /tmp/runs/{}_42 ::: "${scenarios[@]}"
+```
+
+Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 8 scenarios in parallel.
+
+#### Storage Estimates
+
+| Artefact | Per-run Size |
+|----------|-------------|
+| `report.md` | ~15 KB |
+| `metrics.json` | ~2 KB |
+| `time_series.jsonl` | ~5–20 MB (300 s, 8 vehicles) |
+| `event_log.jsonl` | ~100–500 KB |
+| `plots/` (4 PNGs) | ~2–4 MB |
+| **Total per run** | **~8–25 MB** |
+
+---
 
 ## CLI Reference
 
@@ -99,6 +245,9 @@ Limitations** section. Key assumptions:
 | `comms_degraded` | 30% packet loss, 200ms latency, reduced comms range |
 | `leader_failure` | Leader vehicle breaks down at t=120s, triggers re-election |
 | `obstacle_pop` | Large obstacle appears at t=90s, forces global replanning |
+| `gps_spoofed` | 3 GPS spoofing zones with up to 60m offset; innovation gate defends |
+| `silent_running` | 5× longer broadcast interval; extended comms timeout |
+| `comms_blackout` | 120m-radius blackout zone (20× loss) on convoy path |
 
 ## Models and Assumptions
 
@@ -174,36 +323,46 @@ Then register it in the `builders` dict inside `get_scenario()`.
 
 ```
 convoy_commander/
-  core/           World model, physics, config (pydantic), event log
-  vehicles/       Vehicle dynamics, fuel, position estimator
-  comms/          Network model (range, loss, latency), message types
-  planning/       Global planner (A* on road graph), local planner (potential field)
-  coordination/   Formation control, leader election, waypoint allocation
-  sim/            Simulation runner loop, scenario definitions
+  core/           World model (obstacles, road graph, spoof regions), physics,
+                  config (pydantic with safety validators), event log
+  vehicles/       Vehicle dynamics, fuel, position estimator (with innovation gate),
+                  CommsMode enum
+  comms/          Network model (range, loss, latency, blackout regions), messages
+  planning/       Global planner (multi-objective A* on road graph),
+                  local planner (DWA-lite with potential-field fallback)
+  coordination/   Formation control, Bully leader election, waypoint allocation
+  supervisor/     Centralised supervisor agent (fleet-level anomaly detection)
+  sim/            Simulation runner loop, 8 scenario definitions
   metrics/        Per-step collection, final aggregation, JSON export
-  viz/            Matplotlib plots, markdown report generation
+  viz/            Matplotlib plots, markdown report with safety audit section
   cli.py          CLI entry point
-tests/            62 tests (physics, estimator, comms, planning, election, sim, safety)
+tests/            100 tests: physics, estimator, comms, planning, election,
+                  sim, safety (30), Phase 2 features (38)
 runs/             Output directory for simulation results
 ```
 
 ## Limitations and Next Steps
 
-**Current limitations:**
+**Phase 2 — Implemented:**
+- GPS spoofing model with false position fixes and innovation gating (5σ default)
+- DWA-lite local planner (replaces pure potential field; falls back to potential field)
+- Multi-objective route planning — weighted cost: time + fuel + per-edge risk
+- Behaviour switching: `CommsMode.SILENT` suppresses broadcasts (emissions control)
+- Communications blackout zone scenario (20× loss multiplier region)
+- Centralised supervisor agent: detects stuck vehicles, convoy splits, isolated nodes
+- Formation degraded logging when no operational leader exists
+
+**Remaining limitations:**
 - 2D only — no terrain elevation or 3D dynamics
-- Potential field local planner can get stuck in local minima in dense obstacle fields
+- DWA forward simulation uses point model (no swept volume)
 - Comms model is distance-based with no frequency / bandwidth modeling
-- No GPS spoofing model (only denial)
-- Leader election assumes all non-failed vehicles eventually hear each other
+- Leader election assumes all non-failed vehicles eventually hear each other (multi-hop not modelled)
 - Scalar uncertainty proxy is optimistic in cross-track direction
 - IMU drift model is Gaussian (real drift is heavier-tailed)
 - No persistent vehicle-to-vehicle state sharing (each vehicle only uses the latest broadcast)
 
-**Planned extensions:**
-- Multi-objective optimization (time vs fuel vs risk) with Pareto frontier
-- GPS spoofing model with false fixes and innovation gating in the estimator
-- Behavior switching: "silent running" (minimal comms) vs "chatty" mode
-- Optional centralized supervisor agent for comparison with decentralized approach
+**Future extensions:**
 - Terrain and elevation modeling
-- More sophisticated local planner (DWA or RRT)
-- Full covariance tracking in the estimator (replacing scalar uncertainty)
+- Full covariance tracking (EKF replacing scalar uncertainty)
+- Multi-hop mesh comms model
+- Pareto frontier visualisation for multi-objective trade-offs

@@ -29,6 +29,19 @@ class VehicleStatus(Enum):
     ARRIVED = auto()
 
 
+class CommsMode(Enum):
+    """Communications emission mode for behaviour switching.
+
+    NORMAL  — broadcast at the configured interval (default).
+    SILENT  — suppress all state broadcasts (stealth / emissions control).
+    CHATTY  — broadcast every step (maximum coordination fidelity).
+    """
+
+    NORMAL = "normal"
+    SILENT = "silent"
+    CHATTY = "chatty"
+
+
 @dataclass
 class VehicleCommand:
     """Control command for a vehicle."""
@@ -74,11 +87,13 @@ class Vehicle:
 
         # Status
         self.status = VehicleStatus.ACTIVE
+        self.comms_mode = CommsMode.NORMAL
         self.is_leader = False
         self.leader_id: int | None = None
         self.safe_mode_timer: float = 0.0
         self.last_comms_time: float = 0.0
         self._comms_was_lost: bool = False  # edge-detect for logging
+        self._in_blackout: bool = False  # edge-detect for blackout zone logging
 
         # Planning
         self.waypoints: list[tuple[float, float]] = []

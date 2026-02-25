@@ -53,13 +53,16 @@ class EventKind(Enum):
 
     # --- estimation ---
     ESTIMATOR_FIX_APPLIED = "estimator_fix_applied"
+    ESTIMATOR_FIX_REJECTED = "estimator_fix_rejected"
     ESTIMATOR_UNCERTAINTY_HIGH = "estimator_uncertainty_high"
     ESTIMATOR_UNCERTAINTY_RECOVERED = "estimator_uncertainty_recovered"
+    GPS_SPOOFED = "gps_spoofed"
 
     # --- coordination ---
     LEADER_ELECTED = "leader_elected"
     LEADER_LOST = "leader_lost"
     ELECTION_STARTED = "election_started"
+    FORMATION_DEGRADED = "formation_degraded"
 
     # --- collision / separation ---
     COLLISION = "collision"
@@ -69,11 +72,18 @@ class EventKind(Enum):
     # --- comms ---
     COMMS_LOST = "comms_lost"
     COMMS_RESTORED = "comms_restored"
+    COMMS_MODE_CHANGE = "comms_mode_change"
+    BLACKOUT_ENTERED = "blackout_entered"
+    BLACKOUT_EXITED = "blackout_exited"
 
     # --- planning ---
     ROUTE_PLANNED = "route_planned"
     ROUTE_REPLAN = "route_replan"
     OBSTACLE_DETECTED = "obstacle_detected"
+    PLANNER_FALLBACK = "planner_fallback"
+
+    # --- supervisor ---
+    SUPERVISOR_ACTION = "supervisor_action"
 
     # --- invariant ---
     INVARIANT_VIOLATION = "invariant_violation"

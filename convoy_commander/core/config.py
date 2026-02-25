@@ -64,6 +64,11 @@ class EstimatorConfig(BaseModel):
     uncertainty_safe_threshold: float = Field(
         default=15.0, gt=0, description="Position uncertainty threshold to trigger safe mode (m)"
     )
+    innovation_gate_sigma: float = Field(
+        default=5.0, ge=0,
+        description="Innovation gate multiplier: reject fix if innovation > gate_sigma * "
+                    "max(uncertainty, fix_std).  0 = disabled (accept all fixes).",
+    )
 
 
 class CommsConfig(BaseModel):
@@ -131,6 +136,8 @@ class WorldConfig(BaseModel):
         default=(30.0, 60.0), description="Min/max no-go zone radius m"
     )
     landmark_count: int = Field(default=8, ge=0, description="Number of landmarks for position fixes")
+    spoof_region_count: int = Field(default=0, ge=0, description="Number of GPS spoofing regions")
+    spoof_offset_max: float = Field(default=50.0, gt=0, description="Max GPS spoof offset magnitude m")
 
     @model_validator(mode="after")
     def _validate_radius_ranges(self) -> WorldConfig:
@@ -145,6 +152,22 @@ class WorldConfig(BaseModel):
                 f"SAFETY: nogo_zone_radius_range must satisfy 0 < lo <= hi, got ({lo}, {hi})"
             )
         return self
+
+
+class PlanningObjective(BaseModel):
+    """Weights for multi-objective route planning.
+
+    The composite edge cost is:
+        w_time * dist + w_fuel * dist + w_risk * edge_risk_score
+
+    where ``edge_risk_score`` is pre-annotated during world generation based
+    on proximity to obstacles and no-go zones (normalised to [0, 1]).
+    Setting a weight to 0 disables that objective.
+    """
+
+    w_time: float = Field(default=1.0, ge=0, description="Travel time / distance weight")
+    w_fuel: float = Field(default=0.3, ge=0, description="Fuel consumption weight")
+    w_risk: float = Field(default=0.5, ge=0, description="Route risk weight")
 
 
 class SimConfig(BaseModel):
@@ -172,7 +195,9 @@ class SimConfig(BaseModel):
     comms: CommsConfig = Field(default_factory=CommsConfig)
     coordination: CoordinationConfig = Field(default_factory=CoordinationConfig)
     world: WorldConfig = Field(default_factory=WorldConfig)
+    planning: PlanningObjective = Field(default_factory=PlanningObjective)
     scenario: str = Field(default="baseline", description="Scenario name")
+    use_supervisor: bool = Field(default=False, description="Enable centralised supervisor agent")
 
     @model_validator(mode="after")
     def _validate_timestep_safety(self) -> SimConfig:

@@ -36,7 +36,7 @@ from convoy_commander.core.world import World
 from convoy_commander.metrics.collector import MetricsCollector
 from convoy_commander.planning.global_planner import plan_route
 from convoy_commander.planning.local_planner import compute_command
-from convoy_commander.vehicles.vehicle import Vehicle, VehicleStatus
+from convoy_commander.vehicles.vehicle import CommsMode, Vehicle, VehicleStatus
 
 
 @dataclass
@@ -136,8 +136,26 @@ class SimRunner:
         # Per-vehicle fuel-low tracking
         self._fuel_low_logged: set[int] = set()
 
+        # Comms blackout scenario: add blackout region to the comms network
+        if config.scenario == "comms_blackout":
+            mid_x = config.world.width * 0.5
+            mid_y = config.world.height * 0.5
+            self.comms.add_blackout_region(mid_x, mid_y, radius=120.0, loss_mult=20.0)
+            self.event_log.log(
+                0.0, EventKind.SCENARIO_EVENT, Severity.INFO,
+                message=f"SCENARIO: Comms blackout zone at ({mid_x:.0f}, {mid_y:.0f}) radius=120m",
+                x=mid_x, y=mid_y, radius=120.0,
+            )
+
+        # Centralised supervisor (optional)
+        self._supervisor = None
+        if config.use_supervisor:
+            from convoy_commander.supervisor.supervisor import CentralSupervisor
+            self._supervisor = CentralSupervisor(config)
+
     def _plan_all_routes(self) -> None:
-        """Plan global routes for all vehicles."""
+        """Plan global routes for all vehicles using the configured planning objective."""
+        objective = self.config.planning
         for v in self.vehicles:
             if v.assigned_destination is not None and v.is_operational:
                 route = plan_route(
@@ -146,6 +164,7 @@ class SimRunner:
                     v.estimator.state.y,
                     v.assigned_destination[0],
                     v.assigned_destination[1],
+                    objective=objective,
                 )
                 v.waypoints = route
                 v.current_waypoint_idx = 0
@@ -187,9 +206,21 @@ class SimRunner:
             # === Check safe mode conditions ===
             self._check_safe_mode(current_time)
 
+            # === Centralised supervisor tick ===
+            if self._supervisor is not None:
+                self._run_supervisor(current_time)
+
             # === Planning and control ===
             leader = self._get_leader()
             operational_ids = [v.id for v in self.vehicles if v.is_operational]
+
+            # Log formation degraded if no leader
+            if leader is None and len(operational_ids) > 0:
+                if step % 100 == 0:  # Throttle: log every 10s
+                    self.event_log.log(
+                        current_time, EventKind.FORMATION_DEGRADED, Severity.WARNING,
+                        message="No operational leader; convoy formation degraded",
+                    )
 
             for v in self.vehicles:
                 if not v.is_operational:
@@ -398,22 +429,61 @@ class SimRunner:
     # ------------------------------------------------------------------
 
     def _apply_position_fixes(self, t: float) -> None:
-        """Apply GPS or landmark fixes to vehicles."""
+        """Apply GPS or landmark fixes to vehicles.
+
+        GPS fixes are potentially spoofed if the vehicle is inside a SpoofRegion.
+        The innovation gate in the estimator may reject anomalous fixes.
+        """
         for v in self.vehicles:
             if not v.is_operational:
                 continue
 
+            # Check for GPS spoofing at vehicle's true position
+            spoof_offset = self.world.get_spoof_offset(v.state.x, v.state.y)
+            if spoof_offset is not None:
+                self.event_log.log(
+                    t, EventKind.GPS_SPOOFED, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} in GPS spoof zone; offset=({spoof_offset[0]:.1f},"
+                            f"{spoof_offset[1]:.1f})m",
+                    offset_x=spoof_offset[0], offset_y=spoof_offset[1],
+                )
+
             # GPS fix
             if self.config.gps_available:
-                v.estimator.apply_gps_fix(v.state.x, v.state.y)
+                meas_x = v.state.x + (spoof_offset[0] if spoof_offset else 0.0)
+                meas_y = v.state.y + (spoof_offset[1] if spoof_offset else 0.0)
+                innovation, accepted = v.estimator.apply_gps_fix(meas_x, meas_y)
+                if not accepted:
+                    self.event_log.log(
+                        t, EventKind.ESTIMATOR_FIX_REJECTED, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} GPS fix rejected by innovation gate "
+                                f"(innovation={innovation:.1f}m)",
+                        innovation_m=innovation,
+                    )
             elif self.config.gps_intermittent_prob > 0:
                 if self.rng.random() < self.config.gps_intermittent_prob * self.config.dt:
-                    v.estimator.apply_gps_fix(v.state.x, v.state.y)
+                    meas_x = v.state.x + (spoof_offset[0] if spoof_offset else 0.0)
+                    meas_y = v.state.y + (spoof_offset[1] if spoof_offset else 0.0)
+                    innovation, accepted = v.estimator.apply_gps_fix(meas_x, meas_y)
+                    if not accepted:
+                        self.event_log.log(
+                            t, EventKind.ESTIMATOR_FIX_REJECTED, Severity.WARNING, vehicle_id=v.id,
+                            message=f"Vehicle {v.id} intermittent GPS fix rejected "
+                                    f"(innovation={innovation:.1f}m)",
+                            innovation_m=innovation,
+                        )
 
             # Landmark fixes
             nearby = self.world.landmarks_in_range(v.state.x, v.state.y)
             for lm in nearby:
-                v.estimator.apply_landmark_fix(v.state.x, v.state.y)
+                innovation, accepted = v.estimator.apply_landmark_fix(v.state.x, v.state.y)
+                if not accepted:
+                    self.event_log.log(
+                        t, EventKind.ESTIMATOR_FIX_REJECTED, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} landmark fix rejected by innovation gate "
+                                f"(innovation={innovation:.1f}m)",
+                        innovation_m=innovation,
+                    )
 
     # ------------------------------------------------------------------
     # Comms processing
@@ -467,10 +537,13 @@ class SimRunner:
                 self.collector.leader_elections += 1
 
     def _broadcast_states(self, t: float) -> None:
-        """Broadcast vehicle states."""
+        """Broadcast vehicle states, respecting each vehicle's CommsMode."""
         positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles if v.is_operational}
         for v in self.vehicles:
             if not v.is_operational:
+                continue
+            # SILENT mode: suppress all state broadcasts (stealth / emissions control)
+            if v.comms_mode == CommsMode.SILENT:
                 continue
             msg = make_state_broadcast(
                 sender_id=v.id,
@@ -536,6 +609,39 @@ class SimRunner:
                     t, EventKind.SAFE_MODE_EXIT, Severity.INFO, vehicle_id=v.id,
                     message=f"Vehicle {v.id} exiting safe mode — all conditions clear",
                 )
+
+    def _run_supervisor(self, t: float) -> None:
+        """Run the centralised supervisor and act on its advisories."""
+        if self._supervisor is None:
+            return
+        actions = self._supervisor.observe(self.vehicles, self.world, t)
+        for action in actions:
+            self.event_log.log(
+                t, EventKind.SUPERVISOR_ACTION, Severity.INFO,
+                vehicle_id=action.target_vehicle_id if action.target_vehicle_id >= 0 else None,
+                message=f"Supervisor {action.action_type}: {action.reason}",
+                action_type=action.action_type,
+                **action.details,
+            )
+            if action.action_type == "replan":
+                vid = action.target_vehicle_id
+                v_list = [v for v in self.vehicles if v.id == vid]
+                if v_list and v_list[0].is_operational:
+                    v = v_list[0]
+                    if v.assigned_destination:
+                        from convoy_commander.planning.global_planner import plan_route
+                        route = plan_route(
+                            self.world,
+                            v.state.x, v.state.y,
+                            v.assigned_destination[0], v.assigned_destination[1],
+                            objective=self.config.planning,
+                        )
+                        v.waypoints = route
+                        v.current_waypoint_idx = 0
+                        self.event_log.log(
+                            t, EventKind.ROUTE_REPLAN, Severity.INFO, vehicle_id=vid,
+                            message=f"Supervisor-triggered replan for V{vid}",
+                        )
 
     # ------------------------------------------------------------------
     # Helpers
