@@ -24,6 +24,8 @@ def get_scenario(name: str, **overrides: object) -> SimConfig:
         "gps_spoofed": _gps_spoofed,
         "silent_running": _silent_running,
         "comms_blackout": _comms_blackout,
+        # Phase 3 scenarios
+        "sensor_drift_spike": _sensor_drift_spike,
     }
     if name not in builders:
         raise ValueError(f"Unknown scenario: {name}. Available: {list(builders.keys())}")
@@ -129,4 +131,31 @@ def _comms_blackout(**overrides: object) -> SimConfig:
     """
     config = SimConfig(duration=300.0)
     config.comms.packet_loss = 0.05
+    return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 scenarios
+# ---------------------------------------------------------------------------
+
+
+def _sensor_drift_spike(**overrides: object) -> SimConfig:
+    """Sensor drift spike: a sudden IMU bias injection at t=60s.
+
+    Simulates a hardware shock event (e.g., road bump, vibration) that
+    corrupts the IMU state and causes a sudden positional drift jump.
+
+    GPS is unavailable so the spike's effect is not immediately corrected.
+    Landmark fixes will gradually pull the estimate back, but safe mode
+    should engage (uncertainty > threshold) immediately after the spike.
+
+    Runner injects an 8m magnitude spike to all operational vehicles'
+    estimators at t=60s via ``scenario == "sensor_drift_spike"``.
+    """
+    config = SimConfig(
+        gps_available=False,
+        duration=300.0,
+    )
+    config.estimator.drift_rate = 0.06       # slightly elevated baseline drift
+    config.estimator.drift_bias_rate = 0.003
     return _apply_overrides(config, **overrides)

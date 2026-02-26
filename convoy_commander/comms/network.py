@@ -36,11 +36,16 @@ class CommsNetwork:
         # Delivered message inbox per vehicle
         self.inboxes: dict[int, list[Message]] = defaultdict(list)
 
-        # Stats
+        # Aggregate stats
         self.total_sent: int = 0
         self.total_delivered: int = 0
         self.total_dropped: int = 0
         self.total_bytes_approx: int = 0
+
+        # Per-message-type stats (keyed by MessageType.name)
+        self.sent_by_type: dict[str, int] = {}
+        self.delivered_by_type: dict[str, int] = {}
+        self.dropped_by_type: dict[str, int] = {}
 
     def send_broadcast(
         self,
@@ -77,12 +82,15 @@ class CommsNetwork:
         """Attempt to send, applying range check, loss, and latency."""
         self.total_sent += 1
         self.total_bytes_approx += 64  # approximate message size
+        type_name = msg.msg_type.name
+        self.sent_by_type[type_name] = self.sent_by_type.get(type_name, 0) + 1
 
         dist = math.hypot(sender_pos[0] - recipient_pos[0], sender_pos[1] - recipient_pos[1])
 
         # Range check
         if dist > self.config.max_range:
             self.total_dropped += 1
+            self.dropped_by_type[type_name] = self.dropped_by_type.get(type_name, 0) + 1
             return
 
         # Distance-based loss increase
@@ -99,6 +107,7 @@ class CommsNetwork:
         # Apply packet loss
         if self.rng.random() < loss_prob:
             self.total_dropped += 1
+            self.dropped_by_type[type_name] = self.dropped_by_type.get(type_name, 0) + 1
             return
 
         # Compute latency
@@ -122,6 +131,8 @@ class CommsNetwork:
             if current_time >= delivery_time:
                 self.inboxes[recipient_id].append(msg)
                 self.total_delivered += 1
+                type_name = msg.msg_type.name
+                self.delivered_by_type[type_name] = self.delivered_by_type.get(type_name, 0) + 1
             else:
                 still_in_flight.append((msg, delivery_time, recipient_id))
         self._in_flight = still_in_flight
@@ -149,6 +160,22 @@ class CommsNetwork:
                     adj[a].append(b)
                     adj[b].append(a)
         return adj
+
+    def get_stats_by_type(self) -> dict[str, dict[str, int]]:
+        """Return per-message-type send/deliver/drop counts.
+
+        Returns a dict keyed by MessageType.name with nested keys
+        ``sent``, ``delivered``, ``dropped``.
+        """
+        all_types = set(self.sent_by_type) | set(self.delivered_by_type) | set(self.dropped_by_type)
+        return {
+            t: {
+                "sent": self.sent_by_type.get(t, 0),
+                "delivered": self.delivered_by_type.get(t, 0),
+                "dropped": self.dropped_by_type.get(t, 0),
+            }
+            for t in sorted(all_types)
+        }
 
     def add_blackout_region(self, x: float, y: float, radius: float, loss_mult: float = 5.0) -> None:
         self.blackout_regions.append(CommsBlackoutRegion(x, y, radius, loss_mult))

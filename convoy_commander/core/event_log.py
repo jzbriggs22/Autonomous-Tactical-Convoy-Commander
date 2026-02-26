@@ -57,6 +57,7 @@ class EventKind(Enum):
     ESTIMATOR_UNCERTAINTY_HIGH = "estimator_uncertainty_high"
     ESTIMATOR_UNCERTAINTY_RECOVERED = "estimator_uncertainty_recovered"
     GPS_SPOOFED = "gps_spoofed"
+    DRIFT_SPIKE = "drift_spike"
 
     # --- coordination ---
     LEADER_ELECTED = "leader_elected"

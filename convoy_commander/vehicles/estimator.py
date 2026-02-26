@@ -182,6 +182,23 @@ class PositionEstimator:
         self.state.total_fixes_applied += 1
         return innovation, True
 
+    def apply_drift_spike(self, magnitude: float) -> None:
+        """Inject a sudden IMU bias spike (models vibration, shock, or sensor corruption).
+
+        Adds a random-direction bias of ``magnitude`` m/s to the accumulated
+        drift bias and increases the uncertainty estimate proportionally.
+
+        SAFETY NOTE: This is a worst-case instantaneous jump; real sensor
+        faults may be gradual or oscillatory.
+        """
+        angle = self.rng.uniform(0, 2 * math.pi)
+        self.state.bias_x += magnitude * math.cos(angle)
+        self.state.bias_y += magnitude * math.sin(angle)
+        # Uncertainty jumps by 2× the spike magnitude (conservative)
+        self.state.uncertainty = min(
+            self.state.uncertainty + magnitude * 2.0, _MAX_UNCERTAINTY_CAP
+        )
+
     @property
     def is_uncertain(self) -> bool:
         """Check if uncertainty exceeds safe threshold."""

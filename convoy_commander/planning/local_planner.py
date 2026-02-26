@@ -150,6 +150,8 @@ def _min_clearance(
     for obs in world.obstacles:
         d = math.hypot(x - obs.x, y - obs.y) - obs.radius
         clr = min(clr, max(0.0, d))
+    for po in world.poly_obstacles:
+        clr = min(clr, po.clearance_from(x, y))
     for nz in world.nogo_zones:
         d = math.hypot(x - nz.x, y - nz.y) - nz.radius
         clr = min(clr, max(0.0, d * 0.5))  # No-go zones count as half clearance
@@ -187,6 +189,16 @@ def _potential_field_command(
             strength = (1.0 / clearance - 1.0 / obs_range) * 50.0
             repulse += (obs_vec / obs_dist) * strength
 
+    for po in world.poly_obstacles:
+        clr = po.clearance_from(pos[0], pos[1])
+        if 0 < clr < obs_range:
+            # Repulse away from poly obstacle center
+            po_vec = pos - np.array([po.x, po.y])
+            po_dist = float(np.linalg.norm(po_vec))
+            if po_dist > 1e-6:
+                strength = (1.0 / max(clr, 0.5) - 1.0 / obs_range) * 50.0
+                repulse += (po_vec / po_dist) * strength
+
     for nz in world.nogo_zones:
         nz_vec = pos - np.array([nz.x, nz.y])
         nz_dist = float(np.linalg.norm(nz_vec))
@@ -221,6 +233,10 @@ def _potential_field_command(
     obstacle_factor = 1.0
     for obs in world.obstacles:
         d = math.hypot(est.x - obs.x, est.y - obs.y) - obs.radius
+        if d < 20.0:
+            obstacle_factor = min(obstacle_factor, max(0.2, d / 20.0))
+    for po in world.poly_obstacles:
+        d = po.clearance_from(est.x, est.y)
         if d < 20.0:
             obstacle_factor = min(obstacle_factor, max(0.2, d / 20.0))
 

@@ -35,6 +35,7 @@ class SimMetrics:
     num_leader_elections: int = 0
     num_safe_mode_activations: int = 0
     sim_duration: float = 0.0
+    comms_by_type: dict = field(default_factory=dict)  # per-MessageType {sent, delivered, dropped}
 
 
 @dataclass
@@ -108,7 +109,13 @@ class MetricsCollector:
         self.time_stamps.append(time)
 
     def compute_final(
-        self, vehicles: list[Vehicle], comms_sent: int, comms_delivered: int, comms_dropped: int, duration: float
+        self,
+        vehicles: list[Vehicle],
+        comms_sent: int,
+        comms_delivered: int,
+        comms_dropped: int,
+        duration: float,
+        comms_by_type: dict | None = None,
     ) -> SimMetrics:
         """Compute final aggregate metrics."""
         m = SimMetrics()
@@ -155,6 +162,9 @@ class MetricsCollector:
         # Elections
         m.num_leader_elections = self.leader_elections
         m.num_safe_mode_activations = self.safe_mode_activations
+
+        # Per-type comms stats
+        m.comms_by_type = comms_by_type or {}
 
         return m
 

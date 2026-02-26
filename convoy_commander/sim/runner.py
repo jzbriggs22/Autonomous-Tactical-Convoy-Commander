@@ -130,6 +130,7 @@ class SimRunner:
         # Scenario event flags
         self._leader_failed = False
         self._obstacle_popped = False
+        self._drift_spike_applied = False
 
         # Per-vehicle comms-lost tracking for edge-detect logging
         self._comms_lost_flags: dict[int, bool] = {v.id: False for v in self.vehicles}
@@ -407,6 +408,26 @@ class SimRunner:
                     if v.is_operational:
                         self.elections[v.id].reset()
                 self.collector.leader_elections += 1
+
+        if scenario == "sensor_drift_spike" and not self._drift_spike_applied and t >= 60.0:
+            self._drift_spike_applied = True
+            spike_magnitude = 8.0
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message=f"SCENARIO: IMU drift spike injected (magnitude={spike_magnitude}m) "
+                        f"to all {sum(1 for v in self.vehicles if v.is_operational)} operational vehicles",
+                magnitude=spike_magnitude,
+            )
+            for v in self.vehicles:
+                if v.is_operational:
+                    v.estimator.apply_drift_spike(spike_magnitude)
+                    self.event_log.log(
+                        t, EventKind.DRIFT_SPIKE, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} drift spike: bias jump ≈ {spike_magnitude}m, "
+                                f"uncertainty now ≈ {v.estimator.state.uncertainty:.1f}m",
+                        magnitude=spike_magnitude,
+                        uncertainty_after=v.estimator.state.uncertainty,
+                    )
 
         if scenario == "obstacle_pop" and not self._obstacle_popped and t >= 90.0:
             self._obstacle_popped = True

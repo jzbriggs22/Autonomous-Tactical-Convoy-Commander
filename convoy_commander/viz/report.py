@@ -49,6 +49,7 @@ def generate_report(result: SimResult, output_dir: Path) -> Path:
         result.comms.total_delivered,
         result.comms.total_dropped,
         result.config.duration,
+        comms_by_type=result.comms.get_stats_by_type(),
     )
 
     # Save artifacts
@@ -107,6 +108,22 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
         f"| Safe Mode Activations | {m.num_safe_mode_activations} |",
         "",
     ]
+
+    # Per-message-type bandwidth table
+    if m.comms_by_type:
+        lines += [
+            "### Communications Bandwidth by Message Type",
+            "",
+            "| Message Type | Sent | Delivered | Dropped | Delivery % |",
+            "|--------------|------|-----------|---------|------------|",
+        ]
+        for mtype, stats in sorted(m.comms_by_type.items()):
+            s = stats.get("sent", 0)
+            d = stats.get("delivered", 0)
+            dr = stats.get("dropped", 0)
+            ratio = f"{d / s:.0%}" if s > 0 else "N/A"
+            lines.append(f"| {mtype} | {s} | {d} | {dr} | {ratio} |")
+        lines.append("")
 
     # --- Safety Audit ---
     lines += _build_safety_audit(elog, cfg)

@@ -138,6 +138,7 @@ class WorldConfig(BaseModel):
     landmark_count: int = Field(default=8, ge=0, description="Number of landmarks for position fixes")
     spoof_region_count: int = Field(default=0, ge=0, description="Number of GPS spoofing regions")
     spoof_offset_max: float = Field(default=50.0, gt=0, description="Max GPS spoof offset magnitude m")
+    poly_obstacle_count: int = Field(default=3, ge=0, description="Number of axis-aligned rectangle obstacles")
 
     @model_validator(mode="after")
     def _validate_radius_ranges(self) -> WorldConfig:

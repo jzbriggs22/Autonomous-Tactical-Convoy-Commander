@@ -49,6 +49,38 @@ class Landmark:
 
 
 @dataclass
+class PolyObstacle:
+    """Axis-aligned rectangular obstacle.
+
+    Uses half-extents (half_w, half_h) from the centre so the obstacle
+    spans [x-half_w, x+half_w] × [y-half_h, y+half_h].
+
+    SAFETY NOTE: Clearance is the minimum Euclidean distance from the
+    query point to the nearest rectangle edge, which is exact for
+    axis-aligned boxes (no swept-volume approximation).
+    """
+
+    x: float
+    y: float
+    half_w: float  # half-width  (total width  = 2 * half_w)
+    half_h: float  # half-height (total height = 2 * half_h)
+
+    def contains(self, px: float, py: float) -> bool:
+        return abs(px - self.x) < self.half_w and abs(py - self.y) < self.half_h
+
+    def clearance_from(self, px: float, py: float) -> float:
+        """Minimum distance from point to the nearest rectangle boundary."""
+        dx = max(abs(px - self.x) - self.half_w, 0.0)
+        dy = max(abs(py - self.y) - self.half_h, 0.0)
+        return math.hypot(dx, dy)
+
+    @property
+    def bounding_radius(self) -> float:
+        """Conservative bounding circle radius for quick rejection tests."""
+        return math.hypot(self.half_w, self.half_h)
+
+
+@dataclass
 class SpoofRegion:
     """GPS spoofing zone: shifts the apparent GPS position by a fixed offset.
 
@@ -77,6 +109,7 @@ class World:
         self.width = config.width
         self.height = config.height
         self.obstacles: list[Obstacle] = []
+        self.poly_obstacles: list[PolyObstacle] = []
         self.nogo_zones: list[NoGoZone] = []
         self.landmarks: list[Landmark] = []
         self.spoof_regions: list[SpoofRegion] = []
@@ -213,6 +246,40 @@ class World:
                             best_pair = (a, b)
                 self.road_graph.add_edge(best_pair[0], best_pair[1], weight=best_dist * 1.5)
 
+        # Generate axis-aligned rectangle obstacles
+        for _ in range(self.config.poly_obstacle_count):
+            for _attempt in range(50):
+                half_w = rng.uniform(8.0, 30.0)
+                half_h = rng.uniform(8.0, 20.0)
+                x = rng.uniform(half_w + 10, self.width - half_w - 10)
+                y = rng.uniform(half_h + 10, self.height - half_h - 10)
+                # Keep clear of spawn area and no-go zones
+                if x < 120 and y < 220:
+                    continue
+                ok = True
+                for nz in self.nogo_zones:
+                    if math.hypot(x - nz.x, y - nz.y) < math.hypot(half_w, half_h) + nz.radius:
+                        ok = False
+                        break
+                if ok:
+                    self.poly_obstacles.append(PolyObstacle(x=x, y=y, half_w=half_w, half_h=half_h))
+                    break
+
+        # Remove road graph edges blocked by poly obstacles
+        poly_blocked: list[tuple[int, int]] = []
+        for u, v in self.road_graph.edges():
+            pos_u = np.array(self.road_graph.nodes[u]["pos"])
+            pos_v = np.array(self.road_graph.nodes[v]["pos"])
+            for po in self.poly_obstacles:
+                if self._segment_intersects_rect(pos_u, pos_v, po.x, po.y, po.half_w, po.half_h):
+                    poly_blocked.append((u, v))
+                    break
+        for e in poly_blocked:
+            if self.road_graph.has_edge(*e):
+                self.road_graph.remove_edge(*e)
+                if not nx.is_connected(self.road_graph):
+                    self.road_graph.add_edge(e[0], e[1], weight=500.0, risk=0.9)
+
         # Generate landmarks
         for _ in range(self.config.landmark_count):
             x = rng.uniform(50, self.width - 50)
@@ -237,6 +304,38 @@ class World:
             self.spoof_regions.append(
                 SpoofRegion(x=x, y=y, radius=spoof_r, offset_x=offset_x, offset_y=offset_y)
             )
+
+    @staticmethod
+    def _segment_intersects_rect(
+        p1: np.ndarray, p2: np.ndarray, cx: float, cy: float, hw: float, hh: float
+    ) -> bool:
+        """Check if line segment p1->p2 intersects an axis-aligned rectangle.
+
+        Uses the slab (parametric clipping) method.  Endpoints inside the
+        rectangle also count as an intersection.
+        """
+        dx = float(p2[0] - p1[0])
+        dy = float(p2[1] - p1[1])
+        t_min, t_max = 0.0, 1.0
+
+        for axis_d, axis_p, center_c, half in [
+            (dx, float(p1[0]), cx, hw),
+            (dy, float(p1[1]), cy, hh),
+        ]:
+            if abs(axis_d) < 1e-9:
+                # Segment parallel to slab; check if outside
+                if abs(axis_p - center_c) > half:
+                    return False
+            else:
+                t1 = (center_c - half - axis_p) / axis_d
+                t2 = (center_c + half - axis_p) / axis_d
+                if t1 > t2:
+                    t1, t2 = t2, t1
+                t_min = max(t_min, t1)
+                t_max = min(t_max, t2)
+                if t_min > t_max:
+                    return False
+        return True
 
     @staticmethod
     def _segment_intersects_circle(
@@ -276,6 +375,10 @@ class World:
                 d = math.hypot(mid[0] - obs.x, mid[1] - obs.y) - obs.radius
                 if d < max_influence:
                     risk = max(risk, 1.0 - max(d, 0.0) / max_influence)
+            for po in self.poly_obstacles:
+                d = po.clearance_from(mid[0], mid[1])
+                if d < max_influence:
+                    risk = max(risk, 1.0 - d / max_influence)
             for nz in self.nogo_zones:
                 d = math.hypot(mid[0] - nz.x, mid[1] - nz.y) - nz.radius
                 if d < max_influence:
@@ -284,9 +387,12 @@ class World:
             self.road_graph[u][v]["risk"] = min(1.0, risk)
 
     def is_blocked(self, x: float, y: float) -> bool:
-        """Check if a position is inside an obstacle."""
+        """Check if a position is inside an obstacle (circular or rectangular)."""
         for obs in self.obstacles:
             if obs.contains(x, y):
+                return True
+        for po in self.poly_obstacles:
+            if po.contains(x, y):
                 return True
         return False
 

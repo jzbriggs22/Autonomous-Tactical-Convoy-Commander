@@ -18,7 +18,7 @@ python -m convoy_commander run --scenario baseline --seed 42
 # Run GPS-denied scenario with 8 vehicles
 python -m convoy_commander run --scenario gps_denied --seed 42 --vehicles 8
 
-# Run unit tests (100 tests including 30 safety-specific + 38 Phase 2 tests)
+# Run unit tests (133 tests: 30 safety-specific + 38 Phase 2 + 33 Phase 3)
 python -m pytest -q
 ```
 
@@ -56,7 +56,7 @@ pip install -e ".[dev]"
 
 # 4. Verify installation
 python -m convoy_commander --help
-python -m pytest -q --tb=short     # 100 tests should pass
+python -m pytest -q --tb=short     # 133 tests should pass
 ```
 
 #### Run All Scenarios Locally
@@ -85,6 +85,9 @@ python -m convoy_commander run --scenario silent_running --seed 42 --vehicles 8
 
 # Communications blackout zone (Phase 2)
 python -m convoy_commander run --scenario comms_blackout --seed 42 --vehicles 8
+
+# IMU drift spike at t=60s, GPS-denied (Phase 3)
+python -m convoy_commander run --scenario sensor_drift_spike --seed 42 --vehicles 8
 ```
 
 Each run writes output to `runs/<scenario>_<timestamp>/`.
@@ -248,6 +251,7 @@ Limitations** section. Key assumptions:
 | `gps_spoofed` | 3 GPS spoofing zones with up to 60m offset; innovation gate defends |
 | `silent_running` | 5× longer broadcast interval; extended comms timeout |
 | `comms_blackout` | 120m-radius blackout zone (20× loss) on convoy path |
+| `sensor_drift_spike` | Sudden IMU bias spike at t=60s (GPS denied); tests estimator recovery |
 
 ## Models and Assumptions
 
@@ -284,6 +288,7 @@ Limitations** section. Key assumptions:
 - 2D continuous space (default 1000m x 1000m) with:
   - Road graph (grid nodes with weighted edges)
   - Circular obstacles (blocks paths)
+  - Axis-aligned rectangle obstacles (exact clearance computation via slab method)
   - No-go zones (larger, avoidance penalty)
   - Landmarks (enable position fixes within detection range)
 
@@ -299,6 +304,7 @@ Limitations** section. Key assumptions:
 | Near misses | Pair-steps where separation < min_separation (10m) but > collision radius |
 | Collisions | Pair-steps where separation < collision radius (5m) |
 | Comms delivery ratio | Messages delivered / messages sent |
+| Comms by message type | Per-type sent/delivered/dropped breakdown (in report and metrics.json) |
 | Avg/max position error | Euclidean distance between true and estimated positions |
 | Leader elections | Number of election rounds triggered |
 | Safe mode activations | Number of times any vehicle entered safe mode |
@@ -336,8 +342,8 @@ convoy_commander/
   metrics/        Per-step collection, final aggregation, JSON export
   viz/            Matplotlib plots, markdown report with safety audit section
   cli.py          CLI entry point
-tests/            100 tests: physics, estimator, comms, planning, election,
-                  sim, safety (30), Phase 2 features (38)
+tests/            133 tests: physics, estimator, comms, planning, election,
+                  sim, safety (30), Phase 2 features (38), Phase 3 features (33)
 runs/             Output directory for simulation results
 ```
 
@@ -352,17 +358,25 @@ runs/             Output directory for simulation results
 - Centralised supervisor agent: detects stuck vehicles, convoy splits, isolated nodes
 - Formation degraded logging when no operational leader exists
 
+**Phase 3 — Implemented:**
+- **Axis-aligned rectangle obstacles** (`PolyObstacle`): exact clearance via slab method; integrated in local planner, global planner risk annotation, and collision detection
+- **Drift spike injection**: `apply_drift_spike(magnitude)` on `PositionEstimator`; `sensor_drift_spike` scenario injects 8m IMU bias jump at t=60s with safe-mode escalation
+- **Per-message-type bandwidth statistics**: `CommsNetwork.get_stats_by_type()` returns per-`MessageType` sent/delivered/dropped counts; exposed in `metrics.json` and the markdown report's new "Communications Bandwidth by Message Type" table
+- `DRIFT_SPIKE` event kind added to the structured audit trail
+
 **Remaining limitations:**
 - 2D only — no terrain elevation or 3D dynamics
 - DWA forward simulation uses point model (no swept volume)
 - Comms model is distance-based with no frequency / bandwidth modeling
 - Leader election assumes all non-failed vehicles eventually hear each other (multi-hop not modelled)
-- Scalar uncertainty proxy is optimistic in cross-track direction
+- Scalar uncertainty proxy is optimistic in cross-track direction (2×2 covariance / EKF not yet implemented)
 - IMU drift model is Gaussian (real drift is heavier-tailed)
 - No persistent vehicle-to-vehicle state sharing (each vehicle only uses the latest broadcast)
+- Task allocation uses distributed greedy (CBBA-lite auction not yet implemented)
 
 **Future extensions:**
 - Terrain and elevation modeling
 - Full covariance tracking (EKF replacing scalar uncertainty)
 - Multi-hop mesh comms model
+- CBBA-lite auction for task allocation
 - Pareto frontier visualisation for multi-objective trade-offs
