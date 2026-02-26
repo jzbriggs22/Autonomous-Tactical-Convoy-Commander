@@ -25,6 +25,7 @@ from convoy_commander.comms.messages import (
 )
 from convoy_commander.comms.network import CommsNetwork
 from convoy_commander.coordination.allocation import allocate_waypoints_greedy
+from convoy_commander.coordination.cbba import cbba_allocate, compute_formation_slots
 from convoy_commander.coordination.formation import (
     compute_formation_correction,
     get_formation_index,
@@ -148,11 +149,36 @@ class SimRunner:
                 x=mid_x, y=mid_y, radius=120.0,
             )
 
+        # CBBA-based formation slot assignments  {vehicle_id: slot_index}
+        self._cbba_slots: dict[int, int] = {}
+        self._cbba_realloc_timer: float = 0.0
+        _CBBA_REALLOC_INTERVAL = 10.0  # re-auction every 10s
+        self._cbba_interval = _CBBA_REALLOC_INTERVAL
+        if config.use_cbba:
+            self._run_cbba_allocation()
+
         # Centralised supervisor (optional)
         self._supervisor = None
         if config.use_supervisor:
             from convoy_commander.supervisor.supervisor import CentralSupervisor
             self._supervisor = CentralSupervisor(config)
+
+    def _run_cbba_allocation(self) -> None:
+        """Run CBBA-lite auction to assign formation slot indices."""
+        leader = self._get_leader()
+        operational = [v for v in self.vehicles if v.is_operational]
+        if not operational or leader is None:
+            return
+
+        slot_positions = compute_formation_slots(
+            leader.estimator.state.x,
+            leader.estimator.state.y,
+            leader.estimator.state.heading,
+            len(operational),
+            self.config.coordination.formation_spacing,
+        )
+
+        self._cbba_slots = cbba_allocate(operational, slot_positions)
 
     def _plan_all_routes(self) -> None:
         """Plan global routes for all vehicles using the configured planning objective."""
@@ -211,6 +237,13 @@ class SimRunner:
             if self._supervisor is not None:
                 self._run_supervisor(current_time)
 
+            # === CBBA re-allocation (periodic) ===
+            if self.config.use_cbba:
+                self._cbba_realloc_timer += dt
+                if self._cbba_realloc_timer >= self._cbba_interval:
+                    self._cbba_realloc_timer = 0.0
+                    self._run_cbba_allocation()
+
             # === Planning and control ===
             leader = self._get_leader()
             operational_ids = [v.id for v in self.vehicles if v.is_operational]
@@ -232,8 +265,11 @@ class SimRunner:
                 if target is None:
                     continue
 
-                # Formation correction
-                formation_idx = get_formation_index(v.id, leader.id if leader else None, operational_ids)
+                # Formation correction — use CBBA slot if available
+                if self.config.use_cbba and v.id in self._cbba_slots:
+                    formation_idx = self._cbba_slots[v.id]
+                else:
+                    formation_idx = get_formation_index(v.id, leader.id if leader else None, operational_ids)
                 if leader and not v.is_leader:
                     correction = compute_formation_correction(
                         v, leader,

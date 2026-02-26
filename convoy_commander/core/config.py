@@ -199,6 +199,7 @@ class SimConfig(BaseModel):
     planning: PlanningObjective = Field(default_factory=PlanningObjective)
     scenario: str = Field(default="baseline", description="Scenario name")
     use_supervisor: bool = Field(default=False, description="Enable centralised supervisor agent")
+    use_cbba: bool = Field(default=True, description="Use CBBA-lite for formation slot allocation")
 
     @model_validator(mode="after")
     def _validate_timestep_safety(self) -> SimConfig:

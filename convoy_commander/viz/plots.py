@@ -25,7 +25,7 @@ COLORS = [
 
 
 def plot_world(world: World, ax: plt.Axes) -> None:
-    """Draw obstacles, no-go zones, roads, landmarks on an axes."""
+    """Draw obstacles, no-go zones, poly obstacles, spoof regions, roads, landmarks."""
     # No-go zones
     for nz in world.nogo_zones:
         circle = mpatches.Circle(
@@ -33,12 +33,29 @@ def plot_world(world: World, ax: plt.Axes) -> None:
         )
         ax.add_patch(circle)
 
-    # Obstacles
+    # Circular obstacles
     for obs in world.obstacles:
         circle = mpatches.Circle(
             (obs.x, obs.y), obs.radius, alpha=0.5, color="gray", label="Obstacle"
         )
         ax.add_patch(circle)
+
+    # Poly (rectangular) obstacles
+    for po in world.poly_obstacles:
+        rect = mpatches.Rectangle(
+            (po.x - po.half_w, po.y - po.half_h),
+            po.half_w * 2, po.half_h * 2,
+            alpha=0.5, color="dimgray", label="Rect obstacle",
+        )
+        ax.add_patch(rect)
+
+    # GPS spoof regions (translucent magenta circles)
+    for sr in world.spoof_regions:
+        spoof_circle = mpatches.Circle(
+            (sr.x, sr.y), sr.radius, alpha=0.12, color="magenta",
+            linestyle="--", linewidth=1.0, fill=True, label="Spoof zone",
+        )
+        ax.add_patch(spoof_circle)
 
     # Road graph
     for u, v in world.road_graph.edges():

@@ -18,7 +18,7 @@ python -m convoy_commander run --scenario baseline --seed 42
 # Run GPS-denied scenario with 8 vehicles
 python -m convoy_commander run --scenario gps_denied --seed 42 --vehicles 8
 
-# Run unit tests (133 tests: 30 safety-specific + 38 Phase 2 + 33 Phase 3)
+# Run unit tests (166 tests: 30 safety + 38 Phase 2 + 33 Phase 3 + 33 Phase 4)
 python -m pytest -q
 ```
 
@@ -56,7 +56,7 @@ pip install -e ".[dev]"
 
 # 4. Verify installation
 python -m convoy_commander --help
-python -m pytest -q --tb=short     # 133 tests should pass
+python -m pytest -q --tb=short     # 166 tests should pass
 ```
 
 #### Run All Scenarios Locally
@@ -261,12 +261,15 @@ Limitations** section. Key assumptions:
 - Fuel model: idle consumption + speed-proportional consumption
 - Speed is non-negative; no reverse motion
 
-### Position Estimation
+### Position Estimation (2×2 Covariance EKF)
 - Dead-reckoning propagation with additive drift noise and a slow bias random walk
-- Occasional absolute fixes reduce uncertainty via a complementary filter (Kalman-like gain)
+- **2×2 position covariance matrix** tracks full error ellipse (along-track vs cross-track uncertainty)
+- Kalman-style measurement updates for GPS and landmark fixes (Joseph-form covariance update)
+- Scalar `uncertainty` retained as sqrt(trace(P)/2) for backward-compatible safe-mode logic
 - GPS fix (std 0.5m) available in baseline; landmark fixes (std 1.0m, range 50m) always available
 - When uncertainty exceeds threshold (default 15m), vehicle enters **safe mode**
 - Fix functions return innovation magnitude for anomaly detection
+- `cov_eigenvalues` property provides major/minor axis variances for error-ellipse visualization
 
 ### Communications
 - Ad-hoc network: adjacency determined by Euclidean distance vs max range (200m default)
@@ -277,7 +280,7 @@ Limitations** section. Key assumptions:
 ### Coordination
 - **Formation control**: consensus-based — each vehicle maintains spacing behind the leader with heading alignment from neighbor averaging
 - **Leader election**: Bully algorithm — priority = fuel fraction; heartbeat timeout triggers election; highest priority wins with ID tie-breaking
-- **Task allocation**: distributed greedy — all vehicles share the convoy destination; formation offsets handled by the formation controller
+- **Task allocation**: CBBA-lite auction (default) — consensus-based bundle algorithm assigns formation slot positions; re-auctioned every 10s; falls back to distributed greedy when `use_cbba=False`
 - **Safe mode policy**: conservative — enters on ANY single trigger (high uncertainty OR comms timeout), exits only when ALL conditions clear
 
 ### Planning
@@ -336,14 +339,15 @@ convoy_commander/
   comms/          Network model (range, loss, latency, blackout regions), messages
   planning/       Global planner (multi-objective A* on road graph),
                   local planner (DWA-lite with potential-field fallback)
-  coordination/   Formation control, Bully leader election, waypoint allocation
+  coordination/   Formation control, Bully leader election, CBBA-lite auction,
+                  waypoint allocation
   supervisor/     Centralised supervisor agent (fleet-level anomaly detection)
-  sim/            Simulation runner loop, 8 scenario definitions
+  sim/            Simulation runner loop, 9 scenario definitions
   metrics/        Per-step collection, final aggregation, JSON export
   viz/            Matplotlib plots, markdown report with safety audit section
   cli.py          CLI entry point
-tests/            133 tests: physics, estimator, comms, planning, election,
-                  sim, safety (30), Phase 2 features (38), Phase 3 features (33)
+tests/            166 tests: physics, estimator, comms, planning, election,
+                  sim, safety (30), Phase 2 (38), Phase 3 (33), Phase 4 (33)
 runs/             Output directory for simulation results
 ```
 
@@ -364,19 +368,23 @@ runs/             Output directory for simulation results
 - **Per-message-type bandwidth statistics**: `CommsNetwork.get_stats_by_type()` returns per-`MessageType` sent/delivered/dropped counts; exposed in `metrics.json` and the markdown report's new "Communications Bandwidth by Message Type" table
 - `DRIFT_SPIKE` event kind added to the structured audit trail
 
+**Phase 4 — Implemented:**
+- **2×2 Position Covariance (EKF upgrade)**: `EstimatorState.cov` is a 2×2 numpy array; propagation applies heading-dependent process noise Q; measurement updates use Joseph-form Kalman update preserving positive semi-definiteness; scalar `uncertainty` retained as sqrt(trace(P)/2) for backward compat; `cov_eigenvalues` property for error-ellipse visualisation
+- **CBBA-lite Auction**: `cbba_allocate()` in `coordination/cbba.py` runs a consensus-based bundle algorithm where vehicles bid on formation slot positions based on proximity + fuel bonus; winner-takes-all with ID tie-breaking; re-auctioned every 10s in the sim loop; enabled by default (`use_cbba=True`); falls back to greedy index-based allocation when disabled
+- **Enhanced Visualization**: `plot_world()` now renders rectangular obstacles (dimgray rectangles) and GPS spoof regions (translucent magenta circles) on all trajectory and comms graph plots
+
 **Remaining limitations:**
 - 2D only — no terrain elevation or 3D dynamics
 - DWA forward simulation uses point model (no swept volume)
 - Comms model is distance-based with no frequency / bandwidth modeling
 - Leader election assumes all non-failed vehicles eventually hear each other (multi-hop not modelled)
-- Scalar uncertainty proxy is optimistic in cross-track direction (2×2 covariance / EKF not yet implemented)
 - IMU drift model is Gaussian (real drift is heavier-tailed)
 - No persistent vehicle-to-vehicle state sharing (each vehicle only uses the latest broadcast)
-- Task allocation uses distributed greedy (CBBA-lite auction not yet implemented)
+- CBBA consensus is simulated centrally (not decentralised over the comms channel)
 
 **Future extensions:**
 - Terrain and elevation modeling
-- Full covariance tracking (EKF replacing scalar uncertainty)
 - Multi-hop mesh comms model
-- CBBA-lite auction for task allocation
 - Pareto frontier visualisation for multi-objective trade-offs
+- Error-ellipse overlay on trajectory plots (data available via `cov_eigenvalues`)
+- Decentralised CBBA consensus via actual message passing
