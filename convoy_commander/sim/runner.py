@@ -33,6 +33,7 @@ from convoy_commander.coordination.formation import (
 from convoy_commander.coordination.leader_election import LeaderElection
 from convoy_commander.core.config import SimConfig
 from convoy_commander.core.event_log import EventKind, EventLog, Severity
+from convoy_commander.core.spatial import SpatialHash
 from convoy_commander.core.world import World
 from convoy_commander.metrics.collector import MetricsCollector
 from convoy_commander.planning.global_planner import plan_route
@@ -134,6 +135,12 @@ class SimRunner:
         self._leader_failed = False
         self._obstacle_popped = False
         self._drift_spike_applied = False
+        self._platooning_brake_active = False
+        self._platooning_brake_done = False
+
+        # String stability tracking (Phase 6)
+        self._spacing_errors: dict[int, list[float]] = {}  # vehicle_id -> list of errors
+        self._string_stability_window: tuple[float, float] = (40.0, 60.0)
 
         # Per-vehicle comms-lost tracking for edge-detect logging
         self._comms_lost_flags: dict[int, bool] = {v.id: False for v in self.vehicles}
@@ -150,6 +157,10 @@ class SimRunner:
                 message=f"SCENARIO: Comms blackout zone at ({mid_x:.0f}, {mid_y:.0f}) radius=120m",
                 x=mid_x, y=mid_y, radius=120.0,
             )
+
+        # Spatial hash grids for O(N) neighbor queries (Phase 6)
+        self._collision_grid = SpatialHash(config.coordination.min_separation)
+        self._comms_grid = SpatialHash(max(config.comms.max_range / 3.0, 10.0))
 
         # CBBA-based formation slot assignments  {vehicle_id: slot_index}
         self._cbba_slots: dict[int, int] = {}
@@ -213,6 +224,9 @@ class SimRunner:
 
             # === Scenario events ===
             self._handle_scenario_events(current_time)
+
+            # === Rebuild spatial grids ===
+            self._rebuild_spatial_grids()
 
             # === Position fixes (GPS / landmarks) ===
             self._apply_position_fixes(current_time)
@@ -285,6 +299,11 @@ class SimRunner:
                 neighbors = [vv for vv in self.vehicles if vv.id != v.id]
                 cmd = compute_command(v, target, self.world, neighbors, dt)
 
+                # Platooning: force leader to brake during perturbation window
+                if (self._platooning_brake_active and v.is_leader
+                        and v.state.speed > 6.0):
+                    cmd.accel = -v.vcfg.max_decel * 0.5
+
                 # Clamp speed in safe mode
                 if v.status == VehicleStatus.SAFE_MODE:
                     max_safe = v.effective_max_speed
@@ -318,13 +337,16 @@ class SimRunner:
             # === Collision and near-miss detection ===
             self._detect_collisions(current_time)
 
+            # === String stability tracking (Phase 6) ===
+            self._track_spacing_errors(current_time)
+
             # === Record metrics ===
             self.collector.record_step(current_time, self.vehicles)
 
             # Record comms adjacency periodically
             if step % 50 == 0:
                 positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles}
-                adj = self.comms.get_adjacency(positions)
+                adj = self.comms.get_adjacency(positions, self._comms_grid)
                 self.collector.record_comms_adjacency(current_time, adj)
 
             # Check if all arrived
@@ -342,6 +364,9 @@ class SimRunner:
             message=f"Simulation ended: {arrived}/{len(self.vehicles)} arrived",
             arrived=arrived, total=len(self.vehicles),
         )
+
+        # Compute string stability metrics (Phase 6)
+        self._compute_string_stability()
 
         stamp = collect_stamp(self.config)
 
@@ -486,6 +511,22 @@ class SimRunner:
                 message="All routes replanned after obstacle insertion",
             )
 
+        # Platooning: leader speed perturbation at t=40s (brake to 6 m/s for 5s)
+        if scenario == "platooning":
+            if not self._platooning_brake_active and not self._platooning_brake_done and t >= 40.0:
+                self._platooning_brake_active = True
+                self.event_log.log(
+                    t, EventKind.SCENARIO_EVENT, Severity.INFO,
+                    message="SCENARIO: Leader braking to 6 m/s for string stability test",
+                )
+            if self._platooning_brake_active and t >= 45.0:
+                self._platooning_brake_active = False
+                self._platooning_brake_done = True
+                self.event_log.log(
+                    t, EventKind.SCENARIO_EVENT, Severity.INFO,
+                    message="SCENARIO: Leader brake released, returning to cruise speed",
+                )
+
     # ------------------------------------------------------------------
     # Position fixes
     # ------------------------------------------------------------------
@@ -587,7 +628,7 @@ class SimRunner:
             msgs = self.elections[v.id].check_and_elect(t)
             sender_pos = (v.state.x, v.state.y)
             for msg in msgs:
-                self.comms.send_broadcast(msg, sender_pos, positions, t)
+                self.comms.send_broadcast(msg, sender_pos, positions, t, self._comms_grid)
 
         # Detect new leader
         for v in self.vehicles:
@@ -619,7 +660,7 @@ class SimRunner:
                 fuel=v.fuel.fuel,
             )
             sender_pos = (v.state.x, v.state.y)
-            self.comms.send_broadcast(msg, sender_pos, positions, t)
+            self.comms.send_broadcast(msg, sender_pos, positions, t, self._comms_grid)
 
     # ------------------------------------------------------------------
     # Safe mode logic
@@ -735,32 +776,111 @@ class SimRunner:
         if dist < 15.0:
             v.current_waypoint_idx += 1
 
+    def _rebuild_spatial_grids(self) -> None:
+        """Rebuild spatial hash grids from current vehicle positions."""
+        self._collision_grid.clear()
+        self._comms_grid.clear()
+        for v in self.vehicles:
+            if v.is_operational:
+                self._collision_grid.insert(v.id, v.state.x, v.state.y)
+                self._comms_grid.insert(v.id, v.state.x, v.state.y)
+
     def _detect_collisions(self, t: float) -> None:
-        """Detect collisions and near misses between vehicles."""
+        """Detect collisions and near misses using spatial hash."""
         collision_r = self.config.coordination.collision_radius
         min_sep = self.config.coordination.min_separation
-        for i in range(len(self.vehicles)):
-            for j in range(i + 1, len(self.vehicles)):
-                a = self.vehicles[i]
-                b = self.vehicles[j]
-                if not a.is_operational or not b.is_operational:
+        # Include all vehicles for position lookup — the grid was built at step
+        # start and vehicles may have changed status mid-step
+        positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles}
+        checked: set[tuple[int, int]] = set()
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+            nearby = self._collision_grid.query_radius(
+                v.state.x, v.state.y, min_sep, positions,
+            )
+            for nid in nearby:
+                if nid == v.id:
                     continue
-                dist = a.state.distance_to(b.state)
+                pair = (min(v.id, nid), max(v.id, nid))
+                if pair in checked:
+                    continue
+                checked.add(pair)
+                other = self.vehicles[nid]
+                dist = v.state.distance_to(other.state)
                 if dist < collision_r:
-                    a.collision_count += 1
-                    b.collision_count += 1
+                    v.collision_count += 1
+                    other.collision_count += 1
                     self.event_log.log(
                         t, EventKind.COLLISION, Severity.CRITICAL,
-                        message=f"COLLISION between V{a.id} and V{b.id} "
+                        message=f"COLLISION between V{v.id} and V{other.id} "
                                 f"(dist={dist:.2f}m < {collision_r:.1f}m)",
-                        vehicle_a=a.id, vehicle_b=b.id, distance=dist,
+                        vehicle_a=v.id, vehicle_b=other.id, distance=dist,
                     )
                 elif dist < min_sep:
-                    a.near_miss_count += 1
-                    b.near_miss_count += 1
+                    v.near_miss_count += 1
+                    other.near_miss_count += 1
                     self.event_log.log(
                         t, EventKind.NEAR_MISS, Severity.WARNING,
-                        message=f"Near miss V{a.id}–V{b.id} "
+                        message=f"Near miss V{v.id}–V{other.id} "
                                 f"(dist={dist:.2f}m < min_sep={min_sep:.1f}m)",
-                        vehicle_a=a.id, vehicle_b=b.id, distance=dist,
+                        vehicle_a=v.id, vehicle_b=other.id, distance=dist,
                     )
+
+    def _track_spacing_errors(self, t: float) -> None:
+        """Track per-vehicle spacing errors for string stability computation."""
+        t_lo, t_hi = self._string_stability_window
+        if t < t_lo or t > t_hi:
+            return
+        leader = self._get_leader()
+        if leader is None:
+            return
+        coord = self.config.coordination
+        operational = sorted(
+            [v for v in self.vehicles if v.is_operational and not v.is_leader],
+            key=lambda v: v.id,
+        )
+        for v in operational:
+            if self.config.use_cbba and v.id in self._cbba_slots:
+                idx = self._cbba_slots[v.id]
+            else:
+                idx = get_formation_index(
+                    v.id, leader.id,
+                    [vv.id for vv in self.vehicles if vv.is_operational],
+                )
+            if idx <= 0:
+                continue
+            # Desired gap based on follower speed
+            desired_gap = coord.standoff_distance + coord.time_headway * v.state.speed
+            desired_dist = min(desired_gap * idx, coord.formation_spacing * idx)
+            actual_dist = v.state.distance_to(leader.state)
+            error = actual_dist - desired_dist
+            if v.id not in self._spacing_errors:
+                self._spacing_errors[v.id] = []
+            self._spacing_errors[v.id].append(error)
+
+    def _compute_string_stability(self) -> None:
+        """Compute RMS-based string stability ratio and store in collector."""
+        if not self._spacing_errors:
+            return
+        eps = 1e-6
+        sorted_ids = sorted(self._spacing_errors.keys())
+        rms_by_id: dict[int, float] = {}
+        for vid in sorted_ids:
+            errors = self._spacing_errors[vid]
+            if errors:
+                rms_by_id[vid] = math.sqrt(sum(e * e for e in errors) / len(errors))
+            else:
+                rms_by_id[vid] = 0.0
+
+        ratios: list[float] = []
+        for i in range(len(sorted_ids) - 1):
+            rms_front = rms_by_id[sorted_ids[i]]
+            rms_rear = rms_by_id[sorted_ids[i + 1]]
+            ratios.append(rms_rear / max(eps, rms_front))
+
+        if ratios:
+            self.collector.string_stability_max = max(ratios)
+            self.collector.string_stability_median = float(
+                sorted(ratios)[len(ratios) // 2]
+            )

@@ -12,6 +12,8 @@ SAFETY-CRITICAL ASSUMPTIONS:
 
 from __future__ import annotations
 
+import math
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -20,6 +22,24 @@ import numpy as np
 from convoy_commander.core.config import SimConfig
 from convoy_commander.core.physics import FuelState, KinematicState
 from convoy_commander.vehicles.estimator import PositionEstimator
+
+
+def _point_to_segment_dist(
+    px: float, py: float,
+    a: tuple[float, float], b: tuple[float, float],
+) -> float:
+    """Distance from point (px, py) to line segment a-b."""
+    ax, ay = a
+    bx, by = b
+    abx = bx - ax
+    aby = by - ay
+    ab_sq = abx * abx + aby * aby
+    if ab_sq < 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby) / ab_sq))
+    proj_x = ax + t * abx
+    proj_y = ay + t * aby
+    return math.hypot(px - proj_x, py - proj_y)
 
 
 class VehicleStatus(Enum):
@@ -100,6 +120,12 @@ class Vehicle:
         self.current_waypoint_idx: int = 0
         self.assigned_destination: tuple[float, float] | None = None
 
+        # Actuator lag (Phase 6): dead-time buffer + hold-last
+        self._actuator_lag = config.vehicle.actuator_lag
+        self._current_time: float = 0.0
+        self._command_buffer: deque[tuple[float, VehicleCommand]] = deque()
+        self._last_applied_cmd: VehicleCommand | None = None
+
         # Metrics
         self.total_distance: float = 0.0
         self.near_miss_count: int = 0
@@ -110,6 +136,10 @@ class Vehicle:
         """Advance vehicle by one timestep.
 
         Preconditions: dt > 0, status != BREAKDOWN (no-op if it is).
+
+        Actuator lag: commands are buffered and delayed by ``actuator_lag``
+        seconds.  Until a command matures, the last applied command is held
+        (hold-last policy, not coast-to-zero).
         """
         if self.status == VehicleStatus.BREAKDOWN:
             return
@@ -118,12 +148,36 @@ class Vehicle:
             self.state.speed = 0.0
             return
 
+        self._current_time += dt
+
+        # --- Actuator lag ---
+        if self._actuator_lag > 0:
+            # Push new command into buffer
+            self._command_buffer.append((self._current_time, command))
+            # Trim stale commands (older than lag + 0.5s safety margin)
+            max_age = self._actuator_lag + 0.5
+            while (self._command_buffer
+                   and self._current_time - self._command_buffer[0][0] > max_age):
+                self._command_buffer.popleft()
+            # Pop matured commands (age >= actuator_lag)
+            matured_cmd: VehicleCommand | None = None
+            while (self._command_buffer
+                   and self._current_time - self._command_buffer[0][0] >= self._actuator_lag):
+                _, matured_cmd = self._command_buffer.popleft()
+            if matured_cmd is not None:
+                self._last_applied_cmd = matured_cmd
+            # Use last applied command (hold-last); zero if nothing yet
+            applied = self._last_applied_cmd if self._last_applied_cmd is not None else VehicleCommand()
+        else:
+            # No lag: apply immediately
+            applied = command
+
         prev_pos = self.state.position().copy()
 
         # Apply kinematic step
         self.state.step(
-            accel=command.accel,
-            turn_rate=command.turn_rate,
+            accel=applied.accel,
+            turn_rate=applied.turn_rate,
             dt=dt,
             max_speed=self.vcfg.max_speed,
             max_accel=self.vcfg.max_accel,
@@ -180,6 +234,32 @@ class Vehicle:
     @property
     def is_operational(self) -> bool:
         return self.status in (VehicleStatus.ACTIVE, VehicleStatus.SAFE_MODE)
+
+    def route_corridor_distance(self, x: float, y: float) -> float:
+        """Min distance from (x, y) to the planned route polyline.
+
+        Only checks a window of ±3 segments around ``current_waypoint_idx``
+        so the query is O(1), not O(len(waypoints)).
+
+        Returns 0.0 if no route is available.
+        """
+        if not self.waypoints:
+            return 0.0
+        lo = max(0, self.current_waypoint_idx - 3)
+        hi = min(len(self.waypoints), self.current_waypoint_idx + 4)
+        min_d = float("inf")
+        for i in range(lo, hi - 1):
+            d = _point_to_segment_dist(x, y, self.waypoints[i], self.waypoints[i + 1])
+            if d < min_d:
+                min_d = d
+        # Also check distance to nearest waypoint directly
+        for i in range(lo, hi):
+            dx = x - self.waypoints[i][0]
+            dy = y - self.waypoints[i][1]
+            d = math.sqrt(dx * dx + dy * dy)
+            if d < min_d:
+                min_d = d
+        return min_d if min_d < float("inf") else 0.0
 
     def has_reached_destination(self, threshold: float = 15.0) -> bool:
         """Check if vehicle has reached its assigned destination."""

@@ -130,6 +130,23 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
         f"| Total Distance | {m.total_distance_traveled:.0f}m |",
         f"| Leader Elections | {m.num_leader_elections} |",
         f"| Safe Mode Activations | {m.num_safe_mode_activations} |",
+        f"| String Stability (max ratio) | {m.string_stability_max:.3f} |",
+        f"| String Stability (median ratio) | {m.string_stability_median:.3f} |",
+        "",
+    ]
+
+    # Realism metrics (Phase 6)
+    lines += [
+        "### Realism Metrics (Phase 6)",
+        "",
+        f"- **Time headway:** {cfg.coordination.time_headway:.1f}s "
+        f"(standoff={cfg.coordination.standoff_distance:.1f}m)",
+        f"- **Actuator lag:** {cfg.vehicle.actuator_lag:.2f}s",
+        f"- **Road corridor width:** {cfg.road_corridor_width:.1f}m",
+        f"- **IMU bias instability:** {cfg.estimator.bias_instability:.3f} m/s "
+        f"(τ={cfg.estimator.bias_correlation_time:.0f}s)",
+        f"- **Angle random walk:** {cfg.estimator.angle_random_walk:.4f} rad/√s",
+        f"- **Rate random walk:** {cfg.estimator.rate_random_walk:.4f} rad/s/√s",
         "",
     ]
 
@@ -190,14 +207,15 @@ def _build_performance_notes(result: SimResult) -> list[str]:
         "",
         f"- **Sim duration:** {cfg.duration}s at dt={cfg.dt}s = {steps:,} steps",
         f"- **Vehicles:** {n}",
-        f"- **Per-step complexity:** O(N^2) for collision detection, O(N) for planning/control",
+        f"- **Per-step complexity:** O(N*k) for collision detection (spatial hash), O(N) for planning/control",
         f"- **Total step-vehicle evaluations:** {steps * n:,}",
         "",
         "### Complexity Drivers",
-        "- Collision/near-miss detection: pairwise O(N^2) per step",
-        "- Comms broadcast: O(N^2) adjacency check per broadcast interval",
+        "- Collision/near-miss detection: O(N*k) via spatial hash (was O(N^2))",
+        "- Comms broadcast: O(k) per sender via spatial hash (was O(N))",
         "- A* route planning: O(E log V) on road graph; called once per vehicle + on replan",
         "- CBBA auction: O(N * S) per re-allocation (every 10s), S = number of slots",
+        "- Corridor adherence: O(1) per vehicle (windowed route polyline check)",
         "",
     ]
 

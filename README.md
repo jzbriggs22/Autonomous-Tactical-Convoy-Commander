@@ -14,7 +14,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module layout, trust boundaries, and 
 
 ```bash
 make install       # pip install -e ".[dev]"
-make test          # 186 tests
+make test          # 216 tests
 make evaluate      # 5 scenarios x 3 seeds -> eval_results/sweep_*/summary.md
 ```
 
@@ -36,7 +36,7 @@ python -m convoy_commander evaluate
 # View last run results
 python -m convoy_commander report --last
 
-# Run unit tests (186 tests)
+# Run unit tests (216 tests)
 python -m pytest -q
 ```
 
@@ -55,7 +55,7 @@ python -m pytest -q
 | OS | Linux, macOS, Windows (WSL2) | Linux or macOS |
 
 A single 300-second simulation with 8 vehicles completes in approximately 30–60 seconds on a modern
-laptop.  Batch runs of all 8 scenarios take 4–8 minutes.
+laptop.  Batch runs of all 10 scenarios take 4–8 minutes.
 
 #### Install Steps
 
@@ -74,7 +74,7 @@ pip install -e ".[dev]"
 
 # 4. Verify installation
 python -m convoy_commander --help
-python -m pytest -q --tb=short     # 186 tests should pass
+python -m pytest -q --tb=short     # 216 tests should pass
 ```
 
 #### Run All Scenarios Locally
@@ -128,7 +128,7 @@ No GPU is required.
 |----------|----------|------|-----|---------------------------|
 | Single scenario testing | `t3.medium` | 2 | 4 GB | ~$0.04/hr |
 | Single full run (300 s sim) | `m5.large` | 2 | 8 GB | ~$0.10/hr |
-| Parallel batch (8 scenarios) | `c5.2xlarge` | 8 | 16 GB | ~$0.34/hr |
+| Parallel batch (10 scenarios) | `c5.2xlarge` | 8 | 16 GB | ~$0.34/hr |
 | Large-fleet sweeps (N=32+) | `c5.4xlarge` | 16 | 32 GB | ~$0.68/hr |
 
 For quick exploratory runs a `t3.medium` Spot instance costs < $0.01.
@@ -159,7 +159,7 @@ python -m convoy_commander run --scenario baseline --seed 42 --vehicles 8 \
 aws s3 cp /tmp/runs/ s3://my-bucket/convoy-runs/ --recursive
 ```
 
-#### Parallel Batch on c5.2xlarge (8 scenarios × 1 seed)
+#### Parallel Batch on c5.2xlarge (10 scenarios × 1 seed)
 
 ```bash
 # Install GNU parallel
@@ -167,14 +167,14 @@ sudo dnf install -y parallel          # Amazon Linux
 # or: sudo apt install -y parallel    # Ubuntu
 
 scenarios=(baseline gps_denied comms_degraded leader_failure obstacle_pop \
-           gps_spoofed silent_running comms_blackout)
+           gps_spoofed silent_running comms_blackout sensor_drift_spike platooning)
 
 parallel -j 8 python -m convoy_commander run \
     --scenario {} --seed 42 --vehicles 8 \
     --output /tmp/runs/{}_42 ::: "${scenarios[@]}"
 ```
 
-Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 8 scenarios in parallel.
+Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 10 scenarios in parallel.
 
 #### Storage Estimates
 
@@ -196,7 +196,7 @@ python -m convoy_commander run --scenario <name> [options]
 
 Options:
   --scenario  Scenario name (baseline|gps_denied|comms_degraded|leader_failure|
-              obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike)
+              obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|platooning)
   --seed      Random seed (default: 42)
   --vehicles  Number of vehicles (default: 8)
   --loss      Packet loss rate 0-1 (overrides scenario default)
@@ -235,10 +235,10 @@ Each run produces:
 | Target | Description |
 |--------|-------------|
 | `make install` | Install package with dev dependencies |
-| `make test` | Run all 186 tests |
+| `make test` | Run all 216 tests |
 | `make demo` | Run baseline scenario (60s) |
 | `make evaluate` | Run evaluation harness (5 scenarios x 3 seeds) |
-| `make sweep` | Run all 9 scenarios sequentially (60s each) |
+| `make sweep` | Run all 10 scenarios sequentially (60s each) |
 | `make typecheck` | Run mypy type checker |
 | `make clean` | Remove caches |
 
@@ -301,6 +301,7 @@ Limitations** section. Key assumptions:
 | `silent_running` | 5× longer broadcast interval; extended comms timeout |
 | `comms_blackout` | 120m-radius blackout zone (20× loss) on convoy path |
 | `sensor_drift_spike` | Sudden IMU bias spike at t=60s (GPS denied); tests estimator recovery |
+| `platooning` | Actuator lag (0.2s), time headway (1.5s), corridor (25m), elevated IMU noise; leader brakes at t=40s for string stability |
 
 ## Models and Assumptions
 
@@ -393,15 +394,15 @@ convoy_commander/
   coordination/   Formation control, Bully leader election, CBBA-lite auction,
                   waypoint allocation
   supervisor/     Centralised supervisor agent (fleet-level anomaly detection)
-  sim/            Simulation runner loop, 9 scenario definitions
+  sim/            Simulation runner loop, 10 scenario definitions
   metrics/        Per-step collection, final aggregation, JSON export
   viz/            Matplotlib plots, markdown report with safety audit section
   evaluate.py     Batch evaluation harness (multi-scenario x multi-seed)
   stamp.py        Reproducibility metadata (git hash, python, platform)
   cli.py          CLI entry point (run, evaluate, report, test)
-tests/            186 tests: physics, estimator, comms, planning, election,
+tests/            216 tests: physics, estimator, comms, planning, election,
                   sim, safety (30), Phase 2 (38), Phase 3 (33), Phase 4 (33),
-                  Phase 5 (20)
+                  Phase 5 (20), Phase 6 (30)
 runs/             Output directory for simulation results
 ```
 
@@ -435,6 +436,15 @@ runs/             Output directory for simulation results
 - **GitHub Actions CI**: tests on Python 3.11 and 3.12 with pytest + mypy
 - **Makefile**: `make install`, `make test`, `make demo`, `make evaluate`, `make sweep`, `make typecheck`, `make clean`
 - **Architecture documentation**: [ARCHITECTURE.md](ARCHITECTURE.md) with module diagram, trust boundaries, data flow, and determinism guarantees
+
+**Phase 6 — Implemented:**
+- **Spatial hashing**: `SpatialHash` grid replaces O(N²) pairwise collision and comms checks with O(N*k); two grids (collision + comms) rebuilt each step
+- **Road-corridor adherence**: DWA scores 4th component (corridor penalty, weight 0.25); measured against planned route polyline with ±3 segment window (O(1) per query); hard reject at 1.5× corridor width
+- **Constant time headway**: `gap = standoff + time_headway × follower_speed`, capped at formation_spacing; replaces fixed-distance formation model
+- **String stability metric**: RMS-based ratio computed during disturbance window; `platooning` scenario injects leader brake at t=40s
+- **Actuator lag**: dead-time buffer with hold-last policy (not coast-to-zero); configurable 0–1s
+- **Gauss-Markov + ARW/RRW IMU noise**: first-order Gauss-Markov position bias (exact discrete: σ_drive = σ_ss√(1−decay²)), heading bias random walk, angle random walk; process noise Q includes heading-induced position uncertainty
+- **Platooning scenario**: combines actuator lag (0.2s), time headway (1.5s), corridor (25m), elevated IMU noise; leader speed perturbation for string stability test
 
 **Remaining limitations:**
 - 2D only — no terrain elevation or 3D dynamics

@@ -131,6 +131,36 @@ Every safety-relevant state transition is logged to the EventLog with:
 The log is written to `event_log.jsonl` and surfaced in the safety audit
 section of `report.md`.
 
+## Realism Model (Phase 6)
+
+### Spatial Hashing
+- `SpatialHash` (`core/spatial.py`) replaces O(N²) pairwise checks with O(N) insert + O(k) query
+- Two grids: collision grid (cell = min_separation), comms grid (cell = max_range/3)
+- Rebuilt each step; enables large fleet scaling
+
+### Constant Time Headway + String Stability
+- Formation gap: `standoff_distance + time_headway × follower_speed` (capped at formation_spacing)
+- String stability computed as RMS-based ratio: `RMS(error_{i+1}) / max(ε, RMS(error_i))`
+- Platooning scenario injects leader speed perturbation at t=40s for excitation
+
+### Road-Corridor Adherence
+- Measured against **planned route polyline**, not entire road network
+- O(1) per query: windowed ±3 segments around current waypoint
+- DWA 4th scoring component (0.25 weight); hard reject at 1.5× corridor width
+- Potential-field fallback attracts toward nearest route waypoint
+
+### Actuator Lag
+- Dead-time buffer: commands delayed by `actuator_lag` seconds (default 0.15s)
+- **Hold-last** policy: re-applies most recent matured command (not coast-to-zero)
+- Buffer trimmed by time window, not fixed count
+
+### Gauss-Markov + ARW/RRW IMU Noise Model
+- **Position bias**: 1st-order Gauss-Markov with exact discrete noise
+  `σ_drive = σ_ss × √(1 − exp(−2dt/τ))`; stationary variance = σ_ss²
+- **Heading bias (RRW)**: gyro bias drift as random walk `Δbias = N(0, rate_rw × √dt)`
+- **Heading noise (ARW)**: white noise `N(0, angle_rw × √dt)` on heading per step
+- Process noise Q includes heading-induced position uncertainty
+
 ## Determinism
 
 Given the same seed, the simulation produces bit-identical results:

@@ -19,10 +19,10 @@ def compute_formation_correction(
 ) -> tuple[float, float]:
     """Compute a correction vector for formation maintenance.
 
-    Uses a simple consensus-based approach:
-    - Each vehicle tries to maintain 'spacing' distance behind the leader
-      (or the vehicle ahead in the convoy order).
-    - Heading alignment: steer toward average neighbor heading.
+    Uses constant-time-headway (CTH) gap model (Phase 6):
+      gap = standoff_distance + time_headway * follower_speed
+    capped at ``spacing * formation_index`` so it doesn't exceed the
+    configured maximum formation spacing.
 
     Returns (dx, dy) correction to add to the waypoint-tracking force.
     """
@@ -34,8 +34,11 @@ def compute_formation_correction(
         leader_pos = np.array([leader.estimator.state.x, leader.estimator.state.y])
         leader_heading = leader.estimator.state.heading
 
-        # Offset behind leader based on formation index
-        offset_dist = spacing * formation_index
+        # Constant time headway gap (Phase 6)
+        coord = vehicle.config.coordination
+        follower_speed = vehicle.state.speed
+        desired_gap = coord.standoff_distance + coord.time_headway * follower_speed
+        offset_dist = min(desired_gap * formation_index, spacing * formation_index)
         desired_x = leader_pos[0] - offset_dist * math.cos(leader_heading)
         desired_y = leader_pos[1] - offset_dist * math.sin(leader_heading)
 

@@ -34,6 +34,8 @@ class VehicleConfig(BaseModel):
     fuel_capacity: float = Field(default=100.0, gt=0, description="Fuel units")
     fuel_rate_idle: float = Field(default=0.01, ge=0, description="Fuel/s at idle")
     fuel_rate_per_speed: float = Field(default=0.005, ge=0, description="Fuel/s per m/s speed")
+    # Actuator lag (Phase 6)
+    actuator_lag: float = Field(default=0.15, ge=0, le=1.0, description="Actuator dead time (s)")
 
     @model_validator(mode="after")
     def _validate_decel_exceeds_accel(self) -> VehicleConfig:
@@ -55,6 +57,13 @@ class EstimatorConfig(BaseModel):
         quantisation effects.
       - The complementary-filter gain is recomputed every fix, which is
         a simplification of a full EKF.
+
+    Gauss-Markov + ARW/RRW IMU noise model (Phase 6):
+      - bias_instability: velocity bias σ_ss for first-order Gauss-Markov (m/s).
+        Compact surrogate for integrated accelerometer bias.
+      - bias_correlation_time: Gauss-Markov time constant τ (s).
+      - angle_random_walk: heading white noise (rad/√s).
+      - rate_random_walk: gyro bias drift (rad/s/√s).
     """
 
     drift_rate: float = Field(default=0.05, ge=0, description="DR drift std m/s")
@@ -68,6 +77,23 @@ class EstimatorConfig(BaseModel):
         default=5.0, ge=0,
         description="Innovation gate multiplier: reject fix if innovation > gate_sigma * "
                     "max(uncertainty, fix_std).  0 = disabled (accept all fixes).",
+    )
+    # Gauss-Markov + ARW/RRW IMU noise parameters
+    bias_instability: float = Field(
+        default=0.01, ge=0,
+        description="Velocity bias Gauss-Markov stationary σ (m/s)",
+    )
+    bias_correlation_time: float = Field(
+        default=100.0, gt=0,
+        description="Gauss-Markov correlation time τ (s)",
+    )
+    angle_random_walk: float = Field(
+        default=0.005, ge=0,
+        description="Heading white noise (rad/√s)",
+    )
+    rate_random_walk: float = Field(
+        default=0.001, ge=0,
+        description="Gyro bias drift (rad/s/√s)",
     )
 
 
@@ -103,6 +129,9 @@ class CoordinationConfig(BaseModel):
     safe_mode_speed_factor: float = Field(default=0.3, gt=0, le=1.0, description="Speed factor in safe mode")
     safe_mode_spacing_factor: float = Field(default=2.5, ge=1.0, description="Spacing multiplier in safe mode")
     leader_heartbeat_timeout: float = Field(default=5.0, gt=0, description="Leader heartbeat timeout s")
+    # Constant time headway platooning (Phase 6)
+    time_headway: float = Field(default=1.2, gt=0, description="Time headway (s)")
+    standoff_distance: float = Field(default=8.0, ge=0, description="Min gap at zero speed (m)")
 
     @model_validator(mode="after")
     def _validate_separation_hierarchy(self) -> CoordinationConfig:
@@ -200,6 +229,8 @@ class SimConfig(BaseModel):
     scenario: str = Field(default="baseline", description="Scenario name")
     use_supervisor: bool = Field(default=False, description="Enable centralised supervisor agent")
     use_cbba: bool = Field(default=True, description="Use CBBA-lite for formation slot allocation")
+    # Road-corridor adherence (Phase 6)
+    road_corridor_width: float = Field(default=30.0, gt=0, description="Max distance from route polyline (m)")
 
     @model_validator(mode="after")
     def _validate_timestep_safety(self) -> SimConfig:

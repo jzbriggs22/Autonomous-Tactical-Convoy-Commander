@@ -16,9 +16,9 @@ typecheck:  ## Run mypy type checker
 demo:  ## Run baseline scenario (quick 60s demo)
 	python -m convoy_commander run --scenario baseline --seed 42 --duration 60
 
-sweep:  ## Run all 9 scenarios sequentially (seed=42, 60s each)
+sweep:  ## Run all 10 scenarios sequentially (seed=42, 60s each)
 	@for s in baseline gps_denied comms_degraded leader_failure obstacle_pop \
-		gps_spoofed silent_running comms_blackout sensor_drift_spike; do \
+		gps_spoofed silent_running comms_blackout sensor_drift_spike platooning; do \
 		echo "--- $$s ---"; \
 		python -m convoy_commander run --scenario $$s --seed 42 --duration 60; \
 	done

@@ -38,9 +38,10 @@ _DWA_N_SPEED = 7           # speed samples
 _DWA_N_OMEGA = 11          # turn-rate samples
 _DWA_HORIZON = 0.5         # forward simulation horizon (s)
 _DWA_SIM_STEPS = 5         # steps within horizon
-_DWA_ALPHA = 0.5           # heading score weight
-_DWA_BETA = 0.35           # clearance score weight
+_DWA_ALPHA = 0.4           # heading score weight
+_DWA_BETA = 0.2            # clearance score weight
 _DWA_GAMMA = 0.15          # velocity score weight
+_DWA_DELTA = 0.25          # corridor adherence weight (Phase 6)
 _DWA_MIN_CLEARANCE = 3.0   # m — trajectory is invalid if clearance drops below this
 _DWA_MIN_SCORE = 0.05      # minimum score to accept DWA result (else use fallback)
 
@@ -105,7 +106,7 @@ def compute_command(
             if not valid:
                 continue
 
-            # Score: heading, clearance, velocity
+            # Score: heading, clearance, velocity, corridor
             goal_angle = math.atan2(target[1] - sy, target[0] - sx)
             heading_err = abs(normalize_angle(goal_angle - sh))
             heading_score = 1.0 - heading_err / math.pi
@@ -115,10 +116,19 @@ def compute_command(
 
             velocity_score = v / max_speed if max_speed > 0 else 0.0
 
+            # Corridor adherence (Phase 6)
+            corridor_width = vehicle.config.road_corridor_width
+            corridor_dist = vehicle.route_corridor_distance(sx, sy)
+            # Hard reject: too far from corridor
+            if corridor_dist > corridor_width * 1.5 and vehicle.waypoints:
+                continue
+            corridor_score = max(0.0, 1.0 - corridor_dist / corridor_width) if vehicle.waypoints else 1.0
+
             score = (
                 _DWA_ALPHA * heading_score
                 + _DWA_BETA * clearance_score
                 + _DWA_GAMMA * velocity_score
+                + _DWA_DELTA * corridor_score
             )
 
             if score > best_score:
@@ -217,6 +227,27 @@ def _potential_field_command(
         if 0 < sep_dist < min_sep * 2:
             strength = (1.0 / max(sep_dist, 1.0) - 1.0 / (min_sep * 2)) * 100.0
             repulse += (sep_vec / sep_dist) * strength
+
+    # Corridor attraction: pull toward nearest point on planned route polyline
+    if vehicle.waypoints:
+        corridor_dist = vehicle.route_corridor_distance(pos[0], pos[1])
+        corridor_width = vehicle.config.road_corridor_width
+        if corridor_dist > corridor_width * 0.3:
+            # Find nearest waypoint as approximate corridor pull direction
+            best_wp = None
+            best_d = float("inf")
+            lo = max(0, vehicle.current_waypoint_idx - 3)
+            hi = min(len(vehicle.waypoints), vehicle.current_waypoint_idx + 4)
+            for i in range(lo, hi):
+                wp = vehicle.waypoints[i]
+                d = math.hypot(pos[0] - wp[0], pos[1] - wp[1])
+                if d < best_d:
+                    best_d = d
+                    best_wp = wp
+            if best_wp is not None and best_d > 1.0:
+                route_pull = np.array([best_wp[0] - pos[0], best_wp[1] - pos[1]])
+                route_pull = route_pull / best_d
+                repulse += route_pull * min(2.0, corridor_dist / corridor_width) * -30.0 * -1
 
     total_force = attract * 3.0 + repulse
     force_mag = float(np.linalg.norm(total_force))

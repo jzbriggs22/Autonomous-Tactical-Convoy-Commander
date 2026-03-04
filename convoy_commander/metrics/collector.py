@@ -36,6 +36,9 @@ class SimMetrics:
     num_safe_mode_activations: int = 0
     sim_duration: float = 0.0
     comms_by_type: dict = field(default_factory=dict)  # per-MessageType {sent, delivered, dropped}
+    # Phase 6 realism metrics
+    string_stability_max: float = 0.0
+    string_stability_median: float = 0.0
 
 
 @dataclass
@@ -64,6 +67,9 @@ class MetricsCollector:
         self.arrival_times: dict[int, float] = {}
         self.leader_elections: int = 0
         self.safe_mode_activations: int = 0
+        # Phase 6: string stability (set by runner after sim)
+        self.string_stability_max: float = 0.0
+        self.string_stability_median: float = 0.0
 
         # Per-step snapshots for plotting
         self.comms_adjacency_snapshots: list[dict[int, list[int]]] = []
@@ -165,6 +171,10 @@ class MetricsCollector:
 
         # Per-type comms stats
         m.comms_by_type = comms_by_type or {}
+
+        # String stability (Phase 6, set by runner)
+        m.string_stability_max = self.string_stability_max
+        m.string_stability_median = self.string_stability_median
 
         return m
 

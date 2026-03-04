@@ -43,8 +43,9 @@ class EstimatorState:
     y: float = 0.0
     heading: float = 0.0
     uncertainty: float = 0.0  # 1-sigma proxy: sqrt(trace(cov)/2)
-    bias_x: float = 0.0  # accumulated drift bias
+    bias_x: float = 0.0  # accumulated drift bias (Gauss-Markov)
     bias_y: float = 0.0
+    heading_bias: float = 0.0  # gyro bias drift (rate random walk)
     total_fixes_applied: int = 0  # audit counter
     cov: np.ndarray = field(default_factory=lambda: np.eye(2) * 0.25)  # 2×2 covariance
 
@@ -81,56 +82,84 @@ class PositionEstimator:
         self.state.uncertainty = _cov_to_scalar(self.state.cov)
         self.state.bias_x = 0.0
         self.state.bias_y = 0.0
+        self.state.heading_bias = 0.0
         self.state.total_fixes_applied = 0
 
     def propagate(self, speed: float, heading: float, dt: float) -> None:
-        """Dead-reckoning propagation with drift.
+        """Dead-reckoning propagation with Gauss-Markov + ARW/RRW IMU noise model.
 
         Preconditions: dt > 0, speed >= 0.
         Postcondition: cov is symmetric positive semi-definite,
                        uncertainty >= 0 (capped at _MAX_UNCERTAINTY_CAP).
 
-        The covariance prediction step is  P_{k+1} = F·P_k·Fᵀ + Q
-        where F = I (position-only state, no velocity in the state vector)
-        and Q models process noise from IMU drift and speed-proportional error.
+        IMU noise components (Phase 6):
+          1. **Gauss-Markov position bias**: first-order process with correlation
+             time τ and stationary σ = bias_instability.  Exact discrete:
+             decay = exp(-dt/τ), drive_σ = σ_ss * √(1 - decay²).
+          2. **Heading bias (rate random walk)**: gyro bias drift accumulates
+             as a random walk: Δbias = N(0, rate_random_walk * √dt).
+          3. **Angle random walk**: white noise on heading each step:
+             N(0, angle_random_walk * √dt).
+
+        Legacy drift_rate and drift_bias_rate are still applied for backward
+        compatibility; the Gauss-Markov model adds on top.
         """
         if dt <= 0:
             return
         if speed < 0:
             speed = 0.0  # Defensive
 
-        # Bias random walk
-        self.state.bias_x += self.rng.normal(0, self.config.drift_bias_rate * dt)
-        self.state.bias_y += self.rng.normal(0, self.config.drift_bias_rate * dt)
+        cfg = self.config
+        sqrt_dt = math.sqrt(dt)
+
+        # --- 1. Gauss-Markov position bias (replaces pure random walk) ---
+        tau = cfg.bias_correlation_time
+        decay = math.exp(-dt / tau)
+        sigma_ss = cfg.bias_instability  # stationary std
+        decay_sq = decay * decay
+        drive_sigma = sigma_ss * math.sqrt(max(0.0, 1.0 - decay_sq))  # exact discrete noise
+        self.state.bias_x = self.state.bias_x * decay + self.rng.normal(0, drive_sigma)
+        self.state.bias_y = self.state.bias_y * decay + self.rng.normal(0, drive_sigma)
+
+        # Legacy bias random walk (additive, backward-compatible)
+        self.state.bias_x += self.rng.normal(0, cfg.drift_bias_rate * dt)
+        self.state.bias_y += self.rng.normal(0, cfg.drift_bias_rate * dt)
+
+        # --- 2. Heading bias (rate random walk) ---
+        self.state.heading_bias += self.rng.normal(0, cfg.rate_random_walk * sqrt_dt)
+
+        # --- 3. Angle random walk (heading white noise) ---
+        heading_noise = self.rng.normal(0, cfg.angle_random_walk * sqrt_dt)
+
+        # Effective heading for odometry includes bias + noise
+        effective_heading = heading + self.state.heading_bias + heading_noise
 
         # Noisy odometry
-        noise_x = self.rng.normal(0, self.config.drift_rate * dt)
-        noise_y = self.rng.normal(0, self.config.drift_rate * dt)
+        noise_x = self.rng.normal(0, cfg.drift_rate * dt)
+        noise_y = self.rng.normal(0, cfg.drift_rate * dt)
 
-        dx = speed * math.cos(heading) * dt + self.state.bias_x * dt + noise_x
-        dy = speed * math.sin(heading) * dt + self.state.bias_y * dt + noise_y
+        dx = speed * math.cos(effective_heading) * dt + self.state.bias_x * dt + noise_x
+        dy = speed * math.sin(effective_heading) * dt + self.state.bias_y * dt + noise_y
 
         self.state.x += dx
         self.state.y += dy
         self.state.heading = heading
 
-        # Process noise covariance Q
-        #
-        # To maintain backward compatibility with the legacy scalar model
-        # (which grew σ linearly per step rather than as √t), Q is derived
-        # from the legacy per-step σ increment so that:
-        #   σ_new = σ_old + Δσ   →   σ²_new = σ²_old + 2·σ_old·Δσ + Δσ²
-        # The variance increment is therefore  Δ(σ²) = 2·σ·Δσ + Δσ².
-        # This is state-dependent (like an adaptive filter) and is a valid
-        # engineering model: larger uncertainty begets larger process noise.
-        delta_sigma = self.config.drift_rate * math.sqrt(dt) + abs(speed) * 0.001 * dt
+        # --- Process noise covariance Q ---
+        delta_sigma = cfg.drift_rate * sqrt_dt + abs(speed) * 0.001 * dt
         current_sigma = _cov_to_scalar(self.state.cov)
         delta_var = 2.0 * current_sigma * delta_sigma + delta_sigma ** 2
-        # Add heading-dependent noise structure:
-        # More noise along the direction of travel, less perpendicular
+
+        # Heading-induced position uncertainty from ARW + heading bias
+        heading_var_contribution = (speed * dt) ** 2 * (
+            cfg.angle_random_walk ** 2 * dt
+            + self.state.heading_bias ** 2
+        )
+
+        # Add heading-dependent noise structure
         c, s = math.cos(heading), math.sin(heading)
-        along_var = delta_var * (1.0 + abs(speed) * 0.01 * dt)
-        cross_var = delta_var
+        along_var = delta_var * (1.0 + abs(speed) * 0.01 * dt) + heading_var_contribution
+        cross_var = delta_var + heading_var_contribution * 0.5
         # Q = R · diag(along_var, cross_var) · Rᵀ
         Q = np.array([
             [c * c * along_var + s * s * cross_var, c * s * (along_var - cross_var)],

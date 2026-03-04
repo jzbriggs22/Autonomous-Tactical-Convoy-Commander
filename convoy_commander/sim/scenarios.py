@@ -26,6 +26,8 @@ def get_scenario(name: str, **overrides: object) -> SimConfig:
         "comms_blackout": _comms_blackout,
         # Phase 3 scenarios
         "sensor_drift_spike": _sensor_drift_spike,
+        # Phase 6 scenarios
+        "platooning": _platooning,
     }
     if name not in builders:
         raise ValueError(f"Unknown scenario: {name}. Available: {list(builders.keys())}")
@@ -158,4 +160,33 @@ def _sensor_drift_spike(**overrides: object) -> SimConfig:
     )
     config.estimator.drift_rate = 0.06       # slightly elevated baseline drift
     config.estimator.drift_bias_rate = 0.003
+    return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 scenarios
+# ---------------------------------------------------------------------------
+
+
+def _platooning(**overrides: object) -> SimConfig:
+    """Platooning with realism upgrades: actuator lag, time headway,
+    corridor adherence, and structured IMU noise.
+
+    Leader speed perturbation at t=40s (brake to 6 m/s for 5s) is injected
+    by the runner when ``scenario == "platooning"``.  String stability is
+    computed on the disturbance window (t=40-60s).
+    """
+    config = SimConfig(
+        gps_available=True,
+        duration=300.0,
+    )
+    # Actuator lag
+    config.vehicle.actuator_lag = 0.2
+    # Time headway
+    config.coordination.time_headway = 1.5
+    # Corridor adherence
+    config.road_corridor_width = 25.0
+    # Elevated IMU noise
+    config.estimator.bias_instability = 0.02
+    config.estimator.angle_random_walk = 0.01
     return _apply_overrides(config, **overrides)

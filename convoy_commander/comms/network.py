@@ -10,6 +10,7 @@ import numpy as np
 
 from convoy_commander.comms.messages import Message
 from convoy_commander.core.config import CommsConfig
+from convoy_commander.core.spatial import SpatialHash
 
 
 @dataclass
@@ -53,12 +54,26 @@ class CommsNetwork:
         sender_pos: tuple[float, float],
         all_vehicles: dict[int, tuple[float, float]],
         current_time: float,
+        spatial_hash: SpatialHash | None = None,
     ) -> None:
-        """Broadcast message to all vehicles in range."""
-        for vid, vpos in all_vehicles.items():
-            if vid == msg.sender_id:
-                continue
-            self._try_send(msg, sender_pos, vid, vpos, current_time)
+        """Broadcast message to all vehicles in range.
+
+        If ``spatial_hash`` is provided, only nearby vehicles are checked
+        (O(k) instead of O(N)).
+        """
+        if spatial_hash is not None:
+            nearby = spatial_hash.query_radius(
+                sender_pos[0], sender_pos[1], self.config.max_range, all_vehicles,
+            )
+            for vid in nearby:
+                if vid == msg.sender_id:
+                    continue
+                self._try_send(msg, sender_pos, vid, all_vehicles[vid], current_time)
+        else:
+            for vid, vpos in all_vehicles.items():
+                if vid == msg.sender_id:
+                    continue
+                self._try_send(msg, sender_pos, vid, vpos, current_time)
 
     def send_to(
         self,
@@ -144,21 +159,34 @@ class CommsNetwork:
         return msgs
 
     def get_adjacency(
-        self, positions: dict[int, tuple[float, float]]
+        self,
+        positions: dict[int, tuple[float, float]],
+        spatial_hash: SpatialHash | None = None,
     ) -> dict[int, list[int]]:
-        """Get comms adjacency graph based on distance."""
+        """Get comms adjacency graph based on distance.
+
+        If ``spatial_hash`` is provided, queries use the grid (O(N*k)
+        instead of O(N^2)).
+        """
         adj: dict[int, list[int]] = {vid: [] for vid in positions}
-        vids = list(positions.keys())
-        for i in range(len(vids)):
-            for j in range(i + 1, len(vids)):
-                a, b = vids[i], vids[j]
-                dist = math.hypot(
-                    positions[a][0] - positions[b][0],
-                    positions[a][1] - positions[b][1],
-                )
-                if dist <= self.config.max_range:
-                    adj[a].append(b)
-                    adj[b].append(a)
+        if spatial_hash is not None:
+            for vid, (vx, vy) in positions.items():
+                nearby = spatial_hash.query_radius(vx, vy, self.config.max_range, positions)
+                for nid in nearby:
+                    if nid != vid:
+                        adj[vid].append(nid)
+        else:
+            vids = list(positions.keys())
+            for i in range(len(vids)):
+                for j in range(i + 1, len(vids)):
+                    a, b = vids[i], vids[j]
+                    dist = math.hypot(
+                        positions[a][0] - positions[b][0],
+                        positions[a][1] - positions[b][1],
+                    )
+                    if dist <= self.config.max_range:
+                        adj[a].append(b)
+                        adj[b].append(a)
         return adj
 
     def get_stats_by_type(self) -> dict[str, dict[str, int]]:
