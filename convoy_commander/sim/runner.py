@@ -36,6 +36,7 @@ from convoy_commander.core.event_log import EventKind, EventLog, Severity
 from convoy_commander.core.world import World
 from convoy_commander.metrics.collector import MetricsCollector
 from convoy_commander.planning.global_planner import plan_route
+from convoy_commander.stamp import ReproStamp, collect_stamp
 from convoy_commander.planning.local_planner import compute_command
 from convoy_commander.vehicles.vehicle import CommsMode, Vehicle, VehicleStatus
 
@@ -50,6 +51,7 @@ class SimResult:
     collector: MetricsCollector
     comms: CommsNetwork
     event_log: EventLog
+    stamp: ReproStamp | None = None
 
 
 class SimRunner:
@@ -341,6 +343,8 @@ class SimRunner:
             arrived=arrived, total=len(self.vehicles),
         )
 
+        stamp = collect_stamp(self.config)
+
         return SimResult(
             config=self.config,
             vehicles=self.vehicles,
@@ -348,6 +352,7 @@ class SimRunner:
             collector=self.collector,
             comms=self.comms,
             event_log=self.event_log,
+            stamp=stamp,
         )
 
     # ------------------------------------------------------------------

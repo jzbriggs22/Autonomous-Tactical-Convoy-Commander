@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from datetime import datetime
@@ -21,7 +22,7 @@ def main() -> None:
     run_parser.add_argument(
         "--scenario", default="baseline",
         help="Scenario name: baseline|gps_denied|comms_degraded|leader_failure|"
-             "obstacle_pop|gps_spoofed|silent_running|comms_blackout",
+             "obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike",
     )
     run_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     run_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
@@ -31,9 +32,29 @@ def main() -> None:
     run_parser.add_argument("--output", type=str, default=None, help="Output directory")
 
     # report command
-    report_parser = subparsers.add_parser("report", help="Regenerate report from last run")
-    report_parser.add_argument("--last", action="store_true", help="Use last run")
+    report_parser = subparsers.add_parser("report", help="Display metrics from a previous run")
+    report_parser.add_argument("--last", action="store_true", help="Use most recent run")
     report_parser.add_argument("--dir", type=str, default=None, help="Run directory")
+
+    # evaluate command
+    eval_parser = subparsers.add_parser(
+        "evaluate", help="Run evaluation sweep: multiple scenarios x seeds"
+    )
+    eval_parser.add_argument(
+        "--scenarios", type=str, default=None,
+        help="Comma-separated scenario names (default: baseline,gps_denied,"
+             "comms_degraded,leader_failure,comms_blackout)",
+    )
+    eval_parser.add_argument(
+        "--seeds", type=str, default=None,
+        help="Comma-separated seeds (default: 42,123,7)",
+    )
+    eval_parser.add_argument(
+        "--duration", type=float, default=60.0,
+        help="Duration per run in seconds (default: 60)",
+    )
+    eval_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
+    eval_parser.add_argument("--output", type=str, default=None, help="Output base directory")
 
     # test command
     subparsers.add_parser("test", help="Run tests")
@@ -44,6 +65,8 @@ def main() -> None:
         _cmd_run(args)
     elif args.command == "report":
         _cmd_report(args)
+    elif args.command == "evaluate":
+        _cmd_evaluate(args)
     elif args.command == "test":
         _cmd_test()
     else:
@@ -141,10 +164,108 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
 
 def _cmd_report(args: argparse.Namespace) -> None:
-    """Regenerate report from saved artifacts."""
-    print("Report regeneration from saved artifacts is not yet implemented.")
-    print("Run a new simulation with: python -m convoy_commander run --scenario baseline")
-    sys.exit(0)
+    """Display metrics from a previous run."""
+    if args.dir:
+        run_dir = Path(args.dir)
+    elif args.last:
+        run_dir = _find_last_run()
+    else:
+        print("Error: specify --last or --dir <path>")
+        sys.exit(1)
+
+    if not run_dir.exists():
+        print(f"Error: directory not found: {run_dir}")
+        sys.exit(1)
+
+    metrics_path = run_dir / "metrics.json"
+    if not metrics_path.exists():
+        print(f"Error: no metrics.json in {run_dir}")
+        sys.exit(1)
+
+    with open(metrics_path) as f:
+        m = json.load(f)
+
+    print(f"=== Report: {run_dir} ===")
+    print(f"  Mission:     {'SUCCESS' if m.get('mission_success') else 'FAILURE'}")
+    print(f"  Arrived:     {m.get('vehicles_arrived')}/{m.get('vehicles_total')}")
+    print(f"  Avg ETA:     {m.get('avg_time_to_destination', 0):.1f}s")
+    print(f"  Total fuel:  {m.get('total_fuel_used', 0):.1f}")
+    print(f"  Cohesion:    {m.get('convoy_cohesion_score', 0):.1f}m")
+    print(f"  Collisions:  {m.get('collision_count', 0)}")
+    print(f"  Near misses: {m.get('near_miss_count', 0)}")
+    print(f"  Comms:       {m.get('comms_delivery_ratio', 0):.1%}")
+    print(f"  Avg pos err: {m.get('avg_position_error', 0):.2f}m")
+
+    report_path = run_dir / "report.md"
+    if report_path.exists():
+        print(f"\n  Full report: {report_path}")
+
+    config_path = run_dir / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            stamp = json.load(f)
+        print(f"\n  Git:      {stamp.get('git_commit', 'N/A')}")
+        print(f"  Python:   {stamp.get('python_version', 'N/A')}")
+        print(f"  Platform: {stamp.get('platform_info', 'N/A')}")
+
+
+def _find_last_run() -> Path:
+    """Find the most recently modified run directory."""
+    runs_dir = Path("runs")
+    if not runs_dir.exists():
+        print("Error: no runs/ directory found")
+        sys.exit(1)
+
+    candidates = [
+        d for d in runs_dir.iterdir()
+        if d.is_dir() and (d / "metrics.json").exists()
+    ]
+    if not candidates:
+        print("Error: no run directories with metrics.json found in runs/")
+        sys.exit(1)
+
+    candidates.sort(key=lambda d: (d / "metrics.json").stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _cmd_evaluate(args: argparse.Namespace) -> None:
+    """Run evaluation sweep."""
+    from convoy_commander.evaluate import run_evaluation, DEFAULT_SCENARIOS, DEFAULT_SEEDS
+
+    scenarios = args.scenarios.split(",") if args.scenarios else None
+    seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else None
+    output_base = Path(args.output) if args.output else None
+
+    effective_scenarios = scenarios or DEFAULT_SCENARIOS
+    effective_seeds = seeds or DEFAULT_SEEDS
+    total = len(effective_scenarios) * len(effective_seeds)
+
+    print(f"=== Convoy Commander Evaluation ===")
+    print(f"Scenarios: {effective_scenarios}")
+    print(f"Seeds:     {effective_seeds}")
+    print(f"Total runs: {total}")
+    print(f"Duration:  {args.duration}s per run")
+    print(f"Vehicles:  {args.vehicles}")
+    print()
+
+    def progress(done: int, total: int, scenario: str, seed: int) -> None:
+        print(f"  [{done}/{total}] {scenario} seed={seed} complete")
+
+    summary, summary_dir = run_evaluation(
+        scenarios=scenarios,
+        seeds=seeds,
+        duration=args.duration,
+        num_vehicles=args.vehicles,
+        output_base=output_base,
+        progress_callback=progress,
+    )
+
+    print(f"\n=== Evaluation Complete ===")
+    print(f"  Success rate: {summary.overall_success_rate:.0f}%")
+    print(f"  Collisions:   {summary.total_collisions}")
+    print(f"  Near misses:  {summary.total_near_misses}")
+    print(f"  Summary:  {summary_dir / 'summary.md'}")
+    print(f"  Data:     {summary_dir / 'summary.json'}")
 
 
 def _cmd_test() -> None:

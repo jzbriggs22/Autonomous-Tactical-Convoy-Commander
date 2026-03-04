@@ -1,10 +1,22 @@
 # Autonomous Tactical Convoy Commander
 
+[![CI](https://github.com/jzbriggs22/Autonomous-Tactical-Convoy-Commander/actions/workflows/ci.yml/badge.svg)](https://github.com/jzbriggs22/Autonomous-Tactical-Convoy-Commander/actions/workflows/ci.yml)
+
 Simulates a fleet of unmanned trucks coordinating in GPS-denied environments with
 degraded communications, decentralized decision-making, and safe fallback modes.
 
 **Safety-critical design**: conservative defaults, explicit assumptions documented
 at every model boundary, structured audit trail for every safety-relevant event.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module layout, trust boundaries, and data flow.
+
+## Quick Evaluation (3 minutes)
+
+```bash
+make install       # pip install -e ".[dev]"
+make test          # 186 tests
+make evaluate      # 5 scenarios x 3 seeds -> eval_results/sweep_*/summary.md
+```
 
 ## Quickstart
 
@@ -18,7 +30,13 @@ python -m convoy_commander run --scenario baseline --seed 42
 # Run GPS-denied scenario with 8 vehicles
 python -m convoy_commander run --scenario gps_denied --seed 42 --vehicles 8
 
-# Run unit tests (166 tests: 30 safety + 38 Phase 2 + 33 Phase 3 + 33 Phase 4)
+# Run evaluation harness (5 scenarios x 3 seeds, produces summary.md)
+python -m convoy_commander evaluate
+
+# View last run results
+python -m convoy_commander report --last
+
+# Run unit tests (186 tests)
 python -m pytest -q
 ```
 
@@ -56,7 +74,7 @@ pip install -e ".[dev]"
 
 # 4. Verify installation
 python -m convoy_commander --help
-python -m pytest -q --tb=short     # 166 tests should pass
+python -m pytest -q --tb=short     # 186 tests should pass
 ```
 
 #### Run All Scenarios Locally
@@ -177,7 +195,8 @@ Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 8 scenarios in 
 python -m convoy_commander run --scenario <name> [options]
 
 Options:
-  --scenario  Scenario name (baseline|gps_denied|comms_degraded|leader_failure|obstacle_pop)
+  --scenario  Scenario name (baseline|gps_denied|comms_degraded|leader_failure|
+              obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike)
   --seed      Random seed (default: 42)
   --vehicles  Number of vehicles (default: 8)
   --loss      Packet loss rate 0-1 (overrides scenario default)
@@ -186,12 +205,42 @@ Options:
   --output    Output directory (default: runs/<scenario>_<timestamp>/)
 ```
 
+```
+python -m convoy_commander evaluate [options]
+
+Options:
+  --scenarios  Comma-separated scenario names (default: baseline,gps_denied,
+               comms_degraded,leader_failure,comms_blackout)
+  --seeds      Comma-separated seeds (default: 42,123,7)
+  --duration   Duration per run in seconds (default: 60)
+  --vehicles   Number of vehicles (default: 8)
+  --output     Output base directory (default: eval_results/)
+```
+
+```
+python -m convoy_commander report --last      # display metrics from most recent run
+python -m convoy_commander report --dir <path> # display metrics from specific run
+```
+
 Each run produces:
-- `report.md` — markdown report with metrics, safety audit, and model assumptions
+- `report.md` — markdown report with metrics, safety audit, performance notes, and model assumptions
+- `config.json` — reproducibility stamp (git hash, python version, platform, full config)
 - `plots/` — trajectory maps, position error, speed/fuel/uncertainty timelines, comms graph
 - `metrics.json` — machine-readable metrics
 - `time_series.jsonl` — per-vehicle per-timestep data
 - `event_log.jsonl` — structured safety audit trail (every event with timestamp, severity, vehicle ID)
+
+### Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make install` | Install package with dev dependencies |
+| `make test` | Run all 186 tests |
+| `make demo` | Run baseline scenario (60s) |
+| `make evaluate` | Run evaluation harness (5 scenarios x 3 seeds) |
+| `make sweep` | Run all 9 scenarios sequentially (60s each) |
+| `make typecheck` | Run mypy type checker |
+| `make clean` | Remove caches |
 
 ## Safety Design
 
@@ -330,6 +379,8 @@ Then register it in the `builders` dict inside `get_scenario()`.
 
 ## Architecture
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full diagram with trust boundaries and data flow.
+
 ```
 convoy_commander/
   core/           World model (obstacles, road graph, spoof regions), physics,
@@ -345,9 +396,12 @@ convoy_commander/
   sim/            Simulation runner loop, 9 scenario definitions
   metrics/        Per-step collection, final aggregation, JSON export
   viz/            Matplotlib plots, markdown report with safety audit section
-  cli.py          CLI entry point
-tests/            166 tests: physics, estimator, comms, planning, election,
-                  sim, safety (30), Phase 2 (38), Phase 3 (33), Phase 4 (33)
+  evaluate.py     Batch evaluation harness (multi-scenario x multi-seed)
+  stamp.py        Reproducibility metadata (git hash, python, platform)
+  cli.py          CLI entry point (run, evaluate, report, test)
+tests/            186 tests: physics, estimator, comms, planning, election,
+                  sim, safety (30), Phase 2 (38), Phase 3 (33), Phase 4 (33),
+                  Phase 5 (20)
 runs/             Output directory for simulation results
 ```
 
@@ -372,6 +426,15 @@ runs/             Output directory for simulation results
 - **2×2 Position Covariance (EKF upgrade)**: `EstimatorState.cov` is a 2×2 numpy array; propagation applies heading-dependent process noise Q; measurement updates use Joseph-form Kalman update preserving positive semi-definiteness; scalar `uncertainty` retained as sqrt(trace(P)/2) for backward compat; `cov_eigenvalues` property for error-ellipse visualisation
 - **CBBA-lite Auction**: `cbba_allocate()` in `coordination/cbba.py` runs a consensus-based bundle algorithm where vehicles bid on formation slot positions based on proximity + fuel bonus; winner-takes-all with ID tie-breaking; re-auctioned every 10s in the sim loop; enabled by default (`use_cbba=True`); falls back to greedy index-based allocation when disabled
 - **Enhanced Visualization**: `plot_world()` now renders rectangular obstacles (dimgray rectangles) and GPS spoof regions (translucent magenta circles) on all trajectory and comms graph plots
+
+**Phase 5 — Implemented:**
+- **Evaluation harness**: `evaluate` CLI command runs 5 scenarios x 3 seeds = 15 runs, produces `summary.md` with aggregate metrics table and per-scenario averages, plus per-run reports with full details
+- **Reproducibility stamp**: every run records git commit hash, Python version, platform, and full resolved config in `config.json`; displayed in report's "Reproducibility" section
+- **`report --last`**: displays key metrics from the most recent run directory (reads saved `metrics.json`)
+- **Performance notes**: each report includes complexity analysis (O(N^2) collision detection, O(E log V) planning, O(N*S) CBBA)
+- **GitHub Actions CI**: tests on Python 3.11 and 3.12 with pytest + mypy
+- **Makefile**: `make install`, `make test`, `make demo`, `make evaluate`, `make sweep`, `make typecheck`, `make clean`
+- **Architecture documentation**: [ARCHITECTURE.md](ARCHITECTURE.md) with module diagram, trust boundaries, data flow, and determinism guarantees
 
 **Remaining limitations:**
 - 2D only — no terrain elevation or 3D dynamics

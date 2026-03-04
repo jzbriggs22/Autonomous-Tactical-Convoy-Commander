@@ -7,6 +7,7 @@ assumptions and their implications.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from pathlib import Path
 
@@ -57,6 +58,12 @@ def generate_report(result: SimResult, output_dir: Path) -> Path:
     result.collector.save_time_series(output_dir / "time_series.jsonl")
     result.event_log.save(output_dir / "event_log.jsonl")
 
+    # Save reproducibility stamp
+    if result.stamp is not None:
+        config_path = output_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(result.stamp.to_dict(), f, indent=2, default=str)
+
     # Generate markdown
     report_path = output_dir / "report.md"
     md = _build_markdown(metrics, result, plots_dir)
@@ -82,6 +89,23 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
         f"- **GPS Available:** {cfg.gps_available}",
         f"- **Packet Loss:** {cfg.comms.packet_loss:.0%}",
         f"- **Latency:** {cfg.comms.latency_mean_ms:.0f}ms",
+        "",
+        "",
+    ]
+
+    # Reproducibility stamp
+    if result.stamp is not None:
+        s = result.stamp
+        lines += [
+            "## Reproducibility",
+            f"- **Git commit:** `{s.git_commit}`{'  (dirty)' if s.git_dirty else ''}",
+            f"- **Python:** {s.python_version}",
+            f"- **Platform:** {s.platform_info}",
+            f"- **Package:** convoy_commander {s.package_version}",
+            f"- **Full config:** see `config.json`",
+        ]
+
+    lines += [
         "",
         "## Mission Summary",
         f"- **Mission Success:** {'YES' if m.mission_success else 'NO'}",
@@ -128,6 +152,9 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
     # --- Safety Audit ---
     lines += _build_safety_audit(elog, cfg)
 
+    # --- Performance notes ---
+    lines += _build_performance_notes(result)
+
     # --- Assumptions ---
     lines += _build_assumptions_section()
 
@@ -150,6 +177,29 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
     ]
 
     return "\n".join(lines)
+
+
+def _build_performance_notes(result: SimResult) -> list[str]:
+    """Document performance characteristics and complexity."""
+    cfg = result.config
+    n = cfg.num_vehicles
+    steps = int(cfg.duration / cfg.dt)
+
+    return [
+        "## Performance Notes",
+        "",
+        f"- **Sim duration:** {cfg.duration}s at dt={cfg.dt}s = {steps:,} steps",
+        f"- **Vehicles:** {n}",
+        f"- **Per-step complexity:** O(N^2) for collision detection, O(N) for planning/control",
+        f"- **Total step-vehicle evaluations:** {steps * n:,}",
+        "",
+        "### Complexity Drivers",
+        "- Collision/near-miss detection: pairwise O(N^2) per step",
+        "- Comms broadcast: O(N^2) adjacency check per broadcast interval",
+        "- A* route planning: O(E log V) on road graph; called once per vehicle + on replan",
+        "- CBBA auction: O(N * S) per re-allocation (every 10s), S = number of slots",
+        "",
+    ]
 
 
 def _build_safety_audit(elog: EventLog, cfg: object) -> list[str]:
