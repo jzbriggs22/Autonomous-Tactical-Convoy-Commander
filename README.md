@@ -14,8 +14,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module layout, trust boundaries, and 
 
 ```bash
 make install       # pip install -e ".[dev]"
-make test          # 242 tests
-make evaluate      # 6 scenarios x 3 seeds -> eval_results/sweep_*/summary.md
+make test          # 278 tests
+make evaluate      # 7 scenarios x 3 seeds -> eval_results/sweep_*/summary.md
 ```
 
 ## Quickstart
@@ -36,7 +36,7 @@ python -m convoy_commander evaluate
 # View last run results
 python -m convoy_commander report --last
 
-# Run unit tests (242 tests)
+# Run unit tests (278 tests)
 python -m pytest -q
 ```
 
@@ -74,7 +74,7 @@ pip install -e ".[dev]"
 
 # 4. Verify installation
 python -m convoy_commander --help
-python -m pytest -q --tb=short     # 242 tests should pass
+python -m pytest -q --tb=short     # 278 tests should pass
 ```
 
 #### Run All Scenarios Locally
@@ -167,14 +167,14 @@ sudo dnf install -y parallel          # Amazon Linux
 # or: sudo apt install -y parallel    # Ubuntu
 
 scenarios=(baseline gps_denied comms_degraded leader_failure obstacle_pop \
-           gps_spoofed silent_running comms_blackout sensor_drift_spike platooning)
+           gps_spoofed silent_running comms_blackout sensor_drift_spike platooning mesh_relay)
 
 parallel -j 8 python -m convoy_commander run \
     --scenario {} --seed 42 --vehicles 8 \
     --output /tmp/runs/{}_42 ::: "${scenarios[@]}"
 ```
 
-Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 10 scenarios in parallel.
+Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 11 scenarios in parallel.
 
 #### Storage Estimates
 
@@ -184,7 +184,7 @@ Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 10 scenarios in
 | `metrics.json` | ~2 KB |
 | `time_series.jsonl` | ~5–20 MB (300 s, 8 vehicles) |
 | `event_log.jsonl` | ~100–500 KB |
-| `plots/` (7 PNGs) | ~4–8 MB |
+| `plots/` (9 PNGs) | ~5–10 MB |
 | **Total per run** | **~8–25 MB** |
 
 ---
@@ -196,7 +196,8 @@ python -m convoy_commander run --scenario <name> [options]
 
 Options:
   --scenario  Scenario name (baseline|gps_denied|comms_degraded|leader_failure|
-              obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|platooning)
+              obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|
+              platooning|mesh_relay)
   --seed      Random seed (default: 42)
   --vehicles  Number of vehicles (default: 8)
   --loss      Packet loss rate 0-1 (overrides scenario default)
@@ -210,7 +211,7 @@ python -m convoy_commander evaluate [options]
 
 Options:
   --scenarios  Comma-separated scenario names (default: baseline,gps_denied,
-               comms_degraded,leader_failure,comms_blackout,platooning)
+               comms_degraded,leader_failure,comms_blackout,platooning,mesh_relay)
   --seeds      Comma-separated seeds (default: 42,123,7)
   --duration   Duration per run in seconds (default: 60)
   --vehicles   Number of vehicles (default: 8)
@@ -225,7 +226,7 @@ python -m convoy_commander report --dir <path> # display metrics from specific r
 Each run produces:
 - `report.md` — markdown report with metrics, safety audit, performance notes, and model assumptions
 - `config.json` — reproducibility stamp (git hash, python version, platform, full config)
-- `plots/` — trajectory maps, position error, speed/fuel/uncertainty/headway timelines, comms graph, headway gaps, string stability, corridor adherence
+- `plots/` — trajectory maps, position error, speed/fuel/uncertainty/headway timelines, comms graph, headway gaps, string stability, corridor adherence, error ellipses, network topology
 - `metrics.json` — machine-readable metrics
 - `time_series.jsonl` — per-vehicle per-timestep data
 - `event_log.jsonl` — structured safety audit trail (every event with timestamp, severity, vehicle ID)
@@ -235,10 +236,10 @@ Each run produces:
 | Target | Description |
 |--------|-------------|
 | `make install` | Install package with dev dependencies |
-| `make test` | Run all 242 tests |
+| `make test` | Run all 278 tests |
 | `make demo` | Run baseline scenario (60s) |
-| `make evaluate` | Run evaluation harness (6 scenarios x 3 seeds) |
-| `make sweep` | Run all 10 scenarios sequentially (60s each) |
+| `make evaluate` | Run evaluation harness (7 scenarios x 3 seeds) |
+| `make sweep` | Run all 11 scenarios sequentially (60s each) |
 | `make typecheck` | Run mypy type checker |
 | `make clean` | Remove caches |
 
@@ -302,6 +303,7 @@ Limitations** section. Key assumptions:
 | `comms_blackout` | 120m-radius blackout zone (20× loss) on convoy path |
 | `sensor_drift_spike` | Sudden IMU bias spike at t=60s (GPS denied); tests estimator recovery |
 | `platooning` | Actuator lag (0.2s), time headway (1.5s), corridor (25m), elevated IMU noise; leader brakes at t=40s for string stability |
+| `mesh_relay` | Halved comms range (100m), 2-hop multi-hop relay enabled (10% per-hop loss); tests mesh networking |
 
 ## Models and Assumptions
 
@@ -326,6 +328,7 @@ Limitations** section. Key assumptions:
 - Packet loss: base rate + distance-squared degradation + blackout region multiplier
 - Latency: Gaussian-distributed, floor at 1ms
 - Message types: state broadcast, intent, hazard alert, leader election, heartbeat, waypoint bid
+- **Multi-hop relay** (Phase 8): vehicles forward received broadcasts to out-of-range peers; configurable max hops (0–4) with per-hop loss penalty; neighbor state table caches latest broadcast per peer
 
 ### Coordination
 - **Formation control**: consensus-based — each vehicle maintains spacing behind the leader with heading alignment from neighbor averaging
@@ -394,15 +397,15 @@ convoy_commander/
   coordination/   Formation control, Bully leader election, CBBA-lite auction,
                   waypoint allocation
   supervisor/     Centralised supervisor agent (fleet-level anomaly detection)
-  sim/            Simulation runner loop, 10 scenario definitions
+  sim/            Simulation runner loop, 11 scenario definitions
   metrics/        Per-step collection, final aggregation, JSON export
-  viz/            Matplotlib plots, markdown report with safety audit section
+  viz/            Matplotlib plots (9 types), markdown report with safety audit section
   evaluate.py     Batch evaluation harness (multi-scenario x multi-seed)
   stamp.py        Reproducibility metadata (git hash, python, platform)
   cli.py          CLI entry point (run, evaluate, report, test)
-tests/            242 tests: physics, estimator, comms, planning, election,
+tests/            278 tests: physics, estimator, comms, planning, election,
                   sim, safety (30), Phase 2 (38), Phase 3 (33), Phase 4 (33),
-                  Phase 5 (20), Phase 6 (30), Phase 7 (26)
+                  Phase 5 (20), Phase 6 (30), Phase 7 (26), Phase 8 (36)
 runs/             Output directory for simulation results
 ```
 
@@ -456,18 +459,24 @@ runs/             Output directory for simulation results
 - **CI coverage reporting**: `pytest-cov` with term-missing and XML output in GitHub Actions
 - **Per-step data collection**: `MetricsCollector` records headway_samples, corridor_samples, and spacing_error_samples per step
 
+**Phase 8 — Implemented:**
+- **Multi-hop message relay**: `CommsNetwork.relay_broadcast()` forwards messages through intermediate vehicles; configurable max hops (0–4) with per-hop loss penalty; `mesh_relay` scenario halves range to 100m and enables 2-hop relay
+- **Neighbor state tables**: each `Vehicle` caches the latest `STATE_BROADCAST` per peer in `neighbor_states` dict; stale entries pruned automatically (3× broadcast interval)
+- **Error-ellipse visualization**: `plot_error_ellipses` overlays 2×2 covariance ellipses (95% confidence) on trajectory plots; eigenvalues and rotation angle recorded every 100 steps
+- **Network topology monitoring**: `plot_network_topology` shows avg/min degree and partition count over time; `get_network_stats()` computes connected components and multi-hop reachability
+- **`mesh_relay` scenario**: reduced comms range (100m), 2-hop relay, 10% per-hop loss — tests mesh networking resilience
+- **Evaluate updated**: 7 default scenarios (added mesh_relay); 9 plot types per run
+
 **Remaining limitations:**
 - 2D only — no terrain elevation or 3D dynamics
 - DWA forward simulation uses point model (no swept volume)
 - Comms model is distance-based with no frequency / bandwidth modeling
-- Leader election assumes all non-failed vehicles eventually hear each other (multi-hop not modelled)
+- Multi-hop relay is store-and-forward with no routing protocol (flood-based)
 - IMU drift model is Gaussian (real drift is heavier-tailed)
-- No persistent vehicle-to-vehicle state sharing (each vehicle only uses the latest broadcast)
 - CBBA consensus is simulated centrally (not decentralised over the comms channel)
 
 **Future extensions:**
 - Terrain and elevation modeling
-- Multi-hop mesh comms model
 - Pareto frontier visualisation for multi-objective trade-offs
-- Error-ellipse overlay on trajectory plots (data available via `cov_eigenvalues`)
 - Decentralised CBBA consensus via actual message passing
+- Routing protocol for multi-hop (AODV or similar instead of flood)

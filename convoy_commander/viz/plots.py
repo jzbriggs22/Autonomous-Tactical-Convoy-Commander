@@ -355,6 +355,110 @@ def plot_corridor_adherence(
     plt.close(fig)
 
 
+def plot_error_ellipses(
+    world: World,
+    vehicles: list[Vehicle],
+    collector: MetricsCollector,
+    dt: float,
+    output_path: Path,
+) -> None:
+    """Plot true trajectories with covariance error ellipses at regular intervals."""
+    fig, ax = plt.subplots(figsize=(12, 10))
+    ax.set_title("Trajectories with Position Uncertainty Ellipses")
+    plot_world(world, ax)
+
+    # Draw true trajectories
+    for i, v in enumerate(vehicles):
+        color = COLORS[i % len(COLORS)]
+        xs = [p[0] for p in v.true_history]
+        ys = [p[1] for p in v.true_history]
+        ax.plot(xs, ys, "-", color=color, linewidth=0.8, alpha=0.6, label=f"V{v.id}")
+        ax.plot(xs[0], ys[0], "o", color=color, markersize=4)
+        ax.plot(xs[-1], ys[-1], "s", color=color, markersize=4)
+
+    # Overlay error ellipses from sampled covariance data
+    if collector.cov_ellipse_samples:
+        # Group by vehicle_id
+        by_vid: dict[int, list[dict]] = {}
+        for s in collector.cov_ellipse_samples:
+            vid = s["vehicle_id"]
+            if vid not in by_vid:
+                by_vid[vid] = []
+            by_vid[vid].append(s)
+
+        for i, (vid, samples) in enumerate(sorted(by_vid.items())):
+            color = COLORS[i % len(COLORS)]
+            # Subsample: draw ~10-15 ellipses per vehicle
+            step = max(1, len(samples) // 12)
+            for s in samples[::step]:
+                # Semi-axes are sqrt(eigenvalue) * 2 for 95% confidence
+                w = 2 * math.sqrt(max(0, s["major"])) * 2.0
+                h = 2 * math.sqrt(max(0, s["minor"])) * 2.0
+                # Cap ellipse size for readability
+                w = min(w, 60.0)
+                h = min(h, 60.0)
+                angle_deg = math.degrees(s["angle"])
+                ellipse = mpatches.Ellipse(
+                    (s["est_x"], s["est_y"]), w, h, angle=angle_deg,
+                    fill=False, edgecolor=color, linewidth=0.6, alpha=0.4,
+                )
+                ax.add_patch(ellipse)
+    else:
+        ax.text(
+            0.5, 0.02, "No covariance data recorded",
+            transform=ax.transAxes, ha="center", fontsize=10, color="gray",
+        )
+
+    ax.legend(fontsize=7, loc="upper right")
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_network_topology(
+    collector: MetricsCollector,
+    output_path: Path,
+) -> None:
+    """Plot network connectivity metrics over time."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    if not collector.network_stats_snapshots:
+        ax1.text(0.5, 0.5, "No network stats recorded", transform=ax1.transAxes,
+                 ha="center", va="center", fontsize=14, color="gray")
+        ax2.text(0.5, 0.5, "No data", transform=ax2.transAxes,
+                 ha="center", va="center", fontsize=14, color="gray")
+    else:
+        times = [s["time"] for s in collector.network_stats_snapshots]
+        avg_deg = [float(s.get("avg_degree", 0)) for s in collector.network_stats_snapshots]
+        min_deg = [int(s.get("min_degree", 0)) for s in collector.network_stats_snapshots]
+        partitions = [int(s.get("num_partitions", 1)) for s in collector.network_stats_snapshots]
+        relay_reach = [float(s.get("relay_reach_avg", 0)) for s in collector.network_stats_snapshots]
+
+        # Top: degree metrics
+        ax1.set_title("Network Connectivity Over Time")
+        ax1.plot(times, avg_deg, "-", color=COLORS[0], linewidth=1.0, label="Avg degree (1-hop)")
+        ax1.plot(times, min_deg, "--", color=COLORS[1], linewidth=0.8, label="Min degree (1-hop)")
+        if any(r != d for r, d in zip(relay_reach, avg_deg)):
+            ax1.plot(times, relay_reach, "-", color=COLORS[2], linewidth=1.0, label="Avg reach (multi-hop)")
+        ax1.set_ylabel("Neighbors")
+        ax1.legend(fontsize=7)
+        ax1.grid(True, alpha=0.3)
+
+        # Bottom: partitions
+        ax2.set_title("Network Partitions Over Time")
+        ax2.plot(times, partitions, "-", color=COLORS[3], linewidth=1.0)
+        ax2.set_ylabel("Connected Components")
+        ax2.set_xlabel("Time (s)")
+        ax2.set_ylim(bottom=0)
+        ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
 def plot_comms_graph(
     vehicles: list[Vehicle],
     adjacency: dict[int, list[int]],

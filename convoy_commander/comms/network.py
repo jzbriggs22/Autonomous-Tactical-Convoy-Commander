@@ -1,9 +1,9 @@
-"""Communications network model with range, latency, and packet loss."""
+"""Communications network model with range, latency, packet loss, and multi-hop relay."""
 
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -24,7 +24,7 @@ class CommsBlackoutRegion:
 
 
 class CommsNetwork:
-    """Simulates range-based ad-hoc network with loss and latency."""
+    """Simulates range-based ad-hoc network with loss, latency, and optional multi-hop relay."""
 
     def __init__(self, config: CommsConfig, rng: np.random.Generator) -> None:
         self.config = config
@@ -47,6 +47,10 @@ class CommsNetwork:
         self.sent_by_type: dict[str, int] = {}
         self.delivered_by_type: dict[str, int] = {}
         self.dropped_by_type: dict[str, int] = {}
+
+        # Phase 8: relay stats
+        self.total_relayed: int = 0
+        self.total_relay_delivered: int = 0
 
     def send_broadcast(
         self,
@@ -188,6 +192,177 @@ class CommsNetwork:
                         adj[a].append(b)
                         adj[b].append(a)
         return adj
+
+    # ------------------------------------------------------------------
+    # Multi-hop relay (Phase 8)
+    # ------------------------------------------------------------------
+
+    def relay_broadcast(
+        self,
+        msg: Message,
+        relayer_id: int,
+        relayer_pos: tuple[float, float],
+        all_vehicles: dict[int, tuple[float, float]],
+        current_time: float,
+        already_received: set[int],
+        spatial_hash: SpatialHash | None = None,
+    ) -> int:
+        """Relay a message from *relayer_id* to neighbors not in *already_received*.
+
+        Applies per-hop loss penalty on top of the normal loss model.
+        The message's ``relay_path`` payload field tracks the chain.
+        Returns the number of relay attempts made.
+        """
+        max_hops = self.config.max_relay_hops
+        if max_hops <= 0:
+            return 0
+
+        # Check hop count
+        relay_path: list[int] = list(msg.payload.get("_relay_path", []))
+        if len(relay_path) >= max_hops:
+            return 0
+
+        # Build extended relay path
+        new_path = relay_path + [relayer_id]
+
+        # Find targets in range of the relayer that haven't received this message
+        if spatial_hash is not None:
+            candidates = spatial_hash.query_radius(
+                relayer_pos[0], relayer_pos[1], self.config.max_range, all_vehicles,
+            )
+        else:
+            candidates = list(all_vehicles.keys())
+
+        relay_count = 0
+        for vid in candidates:
+            if vid == relayer_id or vid == msg.sender_id or vid in already_received:
+                continue
+            vpos = all_vehicles[vid]
+            dist = math.hypot(relayer_pos[0] - vpos[0], relayer_pos[1] - vpos[1])
+            if dist > self.config.max_range:
+                continue
+
+            self.total_relayed += 1
+            relay_count += 1
+
+            # Per-hop loss penalty
+            hop_loss = self.config.relay_loss_per_hop * len(new_path)
+            if self.rng.random() < hop_loss:
+                continue
+
+            # Normal distance-based loss
+            range_factor = (dist / self.config.max_range) ** 2
+            loss_prob = self.config.packet_loss + range_factor * 0.3
+            for region in self.blackout_regions:
+                d_relay = math.hypot(relayer_pos[0] - region.x, relayer_pos[1] - region.y)
+                d_recip = math.hypot(vpos[0] - region.x, vpos[1] - region.y)
+                if d_relay < region.radius or d_recip < region.radius:
+                    loss_prob = min(1.0, loss_prob * region.loss_multiplier)
+            if self.rng.random() < loss_prob:
+                continue
+
+            # Compute relay latency (additive per hop)
+            latency_ms = max(1.0, self.rng.normal(
+                self.config.latency_mean_ms, self.config.latency_std_ms,
+            ))
+            delivery_time = current_time + latency_ms / 1000.0
+
+            relayed_msg = Message(
+                msg_type=msg.msg_type,
+                sender_id=msg.sender_id,
+                timestamp=msg.timestamp,
+                payload={**msg.payload, "_relay_path": new_path},
+                delivered_at=delivery_time,
+            )
+            self._in_flight.append((relayed_msg, delivery_time, vid))
+            self.total_relay_delivered += 1
+
+        return relay_count
+
+    def get_multi_hop_adjacency(
+        self,
+        positions: dict[int, tuple[float, float]],
+        max_hops: int | None = None,
+    ) -> dict[int, list[int]]:
+        """Compute multi-hop reachability graph via BFS on the 1-hop adjacency.
+
+        Returns dict mapping vehicle_id -> list of reachable vehicle_ids
+        (including those reachable via relay, up to *max_hops*).
+        """
+        if max_hops is None:
+            max_hops = self.config.max_relay_hops
+        if max_hops <= 0:
+            return self.get_adjacency(positions)
+
+        one_hop = self.get_adjacency(positions)
+        multi: dict[int, list[int]] = {}
+        for vid in positions:
+            visited: set[int] = {vid}
+            frontier: deque[tuple[int, int]] = deque()  # (node, depth)
+            for n in one_hop.get(vid, []):
+                frontier.append((n, 1))
+                visited.add(n)
+            while frontier:
+                node, depth = frontier.popleft()
+                if depth < max_hops + 1:
+                    for n2 in one_hop.get(node, []):
+                        if n2 not in visited:
+                            visited.add(n2)
+                            frontier.append((n2, depth + 1))
+            visited.discard(vid)
+            multi[vid] = sorted(visited)
+        return multi
+
+    def get_network_stats(
+        self, positions: dict[int, tuple[float, float]],
+    ) -> dict[str, object]:
+        """Compute network topology statistics.
+
+        Returns dict with:
+          - avg_degree: mean 1-hop neighbor count
+          - min_degree: minimum 1-hop neighbor count
+          - num_partitions: number of connected components
+          - relay_reach_avg: mean reachable nodes with multi-hop (if enabled)
+          - total_relayed: total relay attempts
+          - relay_delivered: successful relay deliveries
+        """
+        adj = self.get_adjacency(positions)
+        degrees = [len(neighbors) for neighbors in adj.values()]
+        n = len(positions)
+
+        # Connected components via BFS
+        visited: set[int] = set()
+        partitions = 0
+        for vid in positions:
+            if vid in visited:
+                continue
+            partitions += 1
+            queue: deque[int] = deque([vid])
+            visited.add(vid)
+            while queue:
+                node = queue.popleft()
+                for nb in adj.get(node, []):
+                    if nb not in visited:
+                        visited.add(nb)
+                        queue.append(nb)
+
+        stats: dict[str, object] = {
+            "avg_degree": sum(degrees) / n if n > 0 else 0.0,
+            "min_degree": min(degrees) if degrees else 0,
+            "num_partitions": partitions,
+            "total_relayed": self.total_relayed,
+            "relay_delivered": self.total_relay_delivered,
+        }
+
+        # Multi-hop reachability
+        if self.config.max_relay_hops > 0:
+            multi = self.get_multi_hop_adjacency(positions)
+            reach = [len(v) for v in multi.values()]
+            stats["relay_reach_avg"] = sum(reach) / n if n > 0 else 0.0
+        else:
+            stats["relay_reach_avg"] = stats["avg_degree"]
+
+        return stats
 
     def get_stats_by_type(self) -> dict[str, dict[str, int]]:
         """Return per-message-type send/deliver/drop counts.

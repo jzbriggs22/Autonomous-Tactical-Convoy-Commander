@@ -356,11 +356,31 @@ class SimRunner:
             # === Record metrics ===
             self.collector.record_step(current_time, self.vehicles)
 
-            # Record comms adjacency periodically
+            # Record comms adjacency and network stats periodically
             if step % 50 == 0:
                 positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles}
                 adj = self.comms.get_adjacency(positions, self._comms_grid)
                 self.collector.record_comms_adjacency(current_time, adj)
+                # Phase 8: network topology stats
+                net_stats = self.comms.get_network_stats(positions)
+                self.collector.record_network_stats(current_time, net_stats)
+
+            # Phase 8: record covariance ellipses periodically (every 100 steps)
+            if step % 100 == 0:
+                for v in self.vehicles:
+                    if v.is_operational:
+                        cov = v.estimator.state.cov
+                        eigs, vecs = np.linalg.eigh(cov)
+                        major = float(max(eigs))
+                        minor = float(min(eigs))
+                        # Angle of major axis
+                        idx = 1 if eigs[1] >= eigs[0] else 0
+                        angle = float(np.arctan2(vecs[1, idx], vecs[0, idx]))
+                        self.collector.record_cov_ellipse(
+                            current_time, v.id,
+                            v.estimator.state.x, v.estimator.state.y,
+                            major, minor, angle,
+                        )
 
             # Check if all arrived
             if all(
@@ -629,7 +649,8 @@ class SimRunner:
                 elif msg.msg_type == MessageType.HAZARD:
                     pass
                 elif msg.msg_type == MessageType.STATE_BROADCAST:
-                    pass
+                    # Phase 8: cache neighbor state
+                    v.update_neighbor(msg.sender_id, msg.payload, msg.timestamp)
 
     def _run_elections(self, t: float) -> None:
         """Run leader election logic for all vehicles."""
@@ -675,9 +696,52 @@ class SimRunner:
             sender_pos = (v.state.x, v.state.y)
             self.comms.send_broadcast(msg, sender_pos, positions, t, self._comms_grid)
 
+        # Phase 8: multi-hop relay — each vehicle relays messages it received
+        if self.config.comms.max_relay_hops > 0:
+            self._relay_messages(t, positions)
+
     # ------------------------------------------------------------------
     # Safe mode logic
     # ------------------------------------------------------------------
+
+    def _relay_messages(self, t: float, positions: dict[int, tuple[float, float]]) -> None:
+        """Relay recently received STATE_BROADCAST messages via multi-hop."""
+        for v in self.vehicles:
+            if not v.is_operational or v.comms_mode == CommsMode.SILENT:
+                continue
+            # Relay the latest state broadcast each neighbor sent us
+            for nid, nstate in v.neighbor_states.items():
+                ts = float(nstate.get("timestamp", 0.0))
+                # Only relay recent messages (within 2 broadcast intervals)
+                if t - ts > self.config.comms.broadcast_interval * 2:
+                    continue
+                relay_msg = make_state_broadcast(
+                    sender_id=nid,
+                    timestamp=ts,
+                    x=float(nstate.get("x", 0.0)),
+                    y=float(nstate.get("y", 0.0)),
+                    heading=float(nstate.get("heading", 0.0)),
+                    speed=float(nstate.get("speed", 0.0)),
+                    uncertainty=float(nstate.get("uncertainty", 0.0)),
+                    status=str(nstate.get("status", "ACTIVE")),
+                    fuel=float(nstate.get("fuel", 0.0)),
+                )
+                # Track which vehicles already have this info
+                already_received = {v.id, nid}
+                # Add vehicles that are direct neighbors of the original sender
+                for vv in self.vehicles:
+                    if vv.id != v.id and nid in vv.neighbor_states:
+                        already_received.add(vv.id)
+                relayer_pos = (v.state.x, v.state.y)
+                self.comms.relay_broadcast(
+                    relay_msg, v.id, relayer_pos, positions, t,
+                    already_received, self._comms_grid,
+                )
+
+        # Prune stale neighbor entries (older than 3× broadcast interval)
+        max_age = self.config.comms.broadcast_interval * 3
+        for v in self.vehicles:
+            v.prune_stale_neighbors(t, max_age)
 
     def _check_safe_mode(self, t: float) -> None:
         """Enter/exit safe mode based on safety conditions.

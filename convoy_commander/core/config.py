@@ -111,6 +111,9 @@ class CommsConfig(BaseModel):
     latency_mean_ms: float = Field(default=50.0, ge=0, description="Mean latency ms")
     latency_std_ms: float = Field(default=10.0, ge=0, description="Latency std ms")
     broadcast_interval: float = Field(default=1.0, gt=0, description="State broadcast interval s")
+    # Multi-hop relay (Phase 8)
+    max_relay_hops: int = Field(default=0, ge=0, le=4, description="Max relay hops (0=disabled)")
+    relay_loss_per_hop: float = Field(default=0.1, ge=0, le=1.0, description="Additional loss per relay hop")
 
 
 class CoordinationConfig(BaseModel):

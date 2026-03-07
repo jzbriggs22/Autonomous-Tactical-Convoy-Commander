@@ -38,7 +38,7 @@
 | **Physics** | `convoy_commander/core/physics.py` | Kinematics, Euler integration |
 | **Vehicle** | `convoy_commander/vehicles/vehicle.py` | Per-agent state, fuel, status |
 | **Estimator** | `convoy_commander/vehicles/estimator.py` | 2x2 covariance EKF, innovation gating |
-| **CommsNetwork** | `convoy_commander/comms/network.py` | LOS propagation, loss, latency, blackout zones |
+| **CommsNetwork** | `convoy_commander/comms/network.py` | LOS propagation, loss, latency, blackout zones, multi-hop relay |
 | **Messages** | `convoy_commander/comms/messages.py` | Typed messages: heartbeat, election, hazard, state |
 | **LeaderElection** | `convoy_commander/coordination/leader_election.py` | Bully algorithm |
 | **CBBA** | `convoy_commander/coordination/cbba.py` | Consensus-based formation slot auction |
@@ -46,8 +46,8 @@
 | **GlobalPlanner** | `convoy_commander/planning/global_planner.py` | Multi-objective A* on road graph |
 | **LocalPlanner** | `convoy_commander/planning/local_planner.py` | DWA + potential fields |
 | **Supervisor** | `convoy_commander/supervisor/supervisor.py` | Centralised anomaly detector (optional) |
-| **Metrics** | `convoy_commander/metrics/collector.py` | Per-step data (incl. headway, corridor, spacing error samples), aggregate computation |
-| **Report** | `convoy_commander/viz/report.py` | Markdown + 7 plot types + JSON artifacts |
+| **Metrics** | `convoy_commander/metrics/collector.py` | Per-step data (incl. headway, corridor, spacing error, cov ellipse, network stats), aggregate computation |
+| **Report** | `convoy_commander/viz/report.py` | Markdown + 9 plot types + JSON artifacts |
 | **Stamp** | `convoy_commander/stamp.py` | Reproducibility metadata (git, python, platform) |
 | **EventLog** | `convoy_commander/core/event_log.py` | Structured safety audit trail |
 
@@ -177,6 +177,34 @@ section of `report.md`.
 ### Runner Instrumentation
 - After each vehicle step: record corridor distance and headway gap (for followers)
 - During `_track_spacing_errors`: also record per-step spacing errors with timestamps for visualization
+
+## Multi-Hop Relay & Neighbor State (Phase 8)
+
+### Multi-Hop Message Relay
+- `CommsNetwork.relay_broadcast()`: vehicles forward received broadcasts to peers beyond single-hop range
+- Configurable `max_relay_hops` (0–4, default 0=disabled) with `relay_loss_per_hop` (default 10%)
+- Messages carry `_relay_path` in payload to track hop chain and prevent infinite loops
+- `get_multi_hop_adjacency()`: BFS on 1-hop graph to compute full reachability under relay
+- `get_network_stats()`: computes avg/min degree, connected components, relay reachability
+
+### Neighbor State Tables
+- Each `Vehicle.neighbor_states` dict caches latest `STATE_BROADCAST` per peer
+- `update_neighbor()`: called when processing STATE_BROADCAST messages
+- `prune_stale_neighbors()`: removes entries older than 3× broadcast interval
+- `get_stale_neighbors()`: identifies peers with outdated state
+
+### New Visualizations
+- `plot_error_ellipses`: Overlay 2×2 covariance ellipses (95% confidence) on trajectory plots
+- `plot_network_topology`: Avg/min degree and partition count over time
+
+### New Collector Fields
+- `cov_ellipse_samples`: Per-vehicle `{time, vehicle_id, est_x, est_y, major, minor, angle}` every 100 steps
+- `network_stats_snapshots`: `{time, avg_degree, min_degree, num_partitions, relay_reach_avg}` every 50 steps
+
+### mesh_relay Scenario
+- Comms range halved to 100m (fragmented direct connectivity)
+- 2-hop relay enabled with 10% per-hop loss
+- Tests mesh networking resilience when convoy is spread beyond single-hop range
 
 ## Determinism
 

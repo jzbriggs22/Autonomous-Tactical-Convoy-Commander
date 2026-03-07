@@ -29,6 +29,7 @@ DEFAULT_SCENARIOS: list[str] = [
     "leader_failure",
     "comms_blackout",
     "platooning",
+    "mesh_relay",
 ]
 
 DEFAULT_SEEDS: list[int] = [42, 123, 7]

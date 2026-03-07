@@ -126,6 +126,11 @@ class Vehicle:
         self._command_buffer: deque[tuple[float, VehicleCommand]] = deque()
         self._last_applied_cmd: VehicleCommand | None = None
 
+        # Neighbor state table (Phase 8): cache latest STATE_BROADCAST per peer
+        # Keys: neighbor vehicle_id; values: dict with x, y, heading, speed,
+        # uncertainty, fuel, status, timestamp
+        self.neighbor_states: dict[int, dict[str, object]] = {}
+
         # Metrics
         self.total_distance: float = 0.0
         self.near_miss_count: int = 0
@@ -268,3 +273,34 @@ class Vehicle:
         dx = self.state.x - self.assigned_destination[0]
         dy = self.state.y - self.assigned_destination[1]
         return (dx * dx + dy * dy) < threshold * threshold
+
+    # ------------------------------------------------------------------
+    # Neighbor state table (Phase 8)
+    # ------------------------------------------------------------------
+
+    def update_neighbor(self, sender_id: int, payload: dict[str, object], timestamp: float) -> None:
+        """Cache a received STATE_BROADCAST in the neighbor table."""
+        self.neighbor_states[sender_id] = {
+            "x": payload.get("x", 0.0),
+            "y": payload.get("y", 0.0),
+            "heading": payload.get("heading", 0.0),
+            "speed": payload.get("speed", 0.0),
+            "uncertainty": payload.get("uncertainty", 0.0),
+            "fuel": payload.get("fuel", 0.0),
+            "status": payload.get("status", "ACTIVE"),
+            "timestamp": timestamp,
+        }
+
+    def get_stale_neighbors(self, current_time: float, max_age: float) -> list[int]:
+        """Return IDs of neighbors whose last update is older than *max_age*."""
+        return [
+            nid for nid, state in self.neighbor_states.items()
+            if current_time - float(state["timestamp"]) > max_age
+        ]
+
+    def prune_stale_neighbors(self, current_time: float, max_age: float) -> int:
+        """Remove stale entries from the neighbor table. Returns count removed."""
+        stale = self.get_stale_neighbors(current_time, max_age)
+        for nid in stale:
+            del self.neighbor_states[nid]
+        return len(stale)

@@ -82,6 +82,11 @@ class MetricsCollector:
         # Phase 7: per-step spacing errors for string stability viz
         self.spacing_error_samples: list[dict] = []
 
+        # Phase 8: covariance eigenvalue samples for error-ellipse viz
+        self.cov_ellipse_samples: list[dict] = []
+        # Phase 8: network topology snapshots
+        self.network_stats_snapshots: list[dict] = []
+
     def record_step(
         self, time: float, vehicles: list[Vehicle]
     ) -> None:
@@ -139,6 +144,22 @@ class MetricsCollector:
     def record_comms_adjacency(self, time: float, adj: dict[int, list[int]]) -> None:
         self.comms_adjacency_snapshots.append(adj)
         self.time_stamps.append(time)
+
+    def record_cov_ellipse(
+        self, time: float, vehicle_id: int,
+        est_x: float, est_y: float,
+        major: float, minor: float, angle: float,
+    ) -> None:
+        """Record covariance ellipse parameters for error-ellipse visualization."""
+        self.cov_ellipse_samples.append({
+            "time": time, "vehicle_id": vehicle_id,
+            "est_x": est_x, "est_y": est_y,
+            "major": major, "minor": minor, "angle": angle,
+        })
+
+    def record_network_stats(self, time: float, stats: dict[str, object]) -> None:
+        """Record a snapshot of network topology statistics."""
+        self.network_stats_snapshots.append({"time": time, **stats})
 
     def compute_final(
         self,

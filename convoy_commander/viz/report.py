@@ -17,8 +17,10 @@ from convoy_commander.sim.runner import SimResult
 from convoy_commander.viz.plots import (
     plot_comms_graph,
     plot_corridor_adherence,
+    plot_error_ellipses,
     plot_headway_gaps,
     plot_metrics_summary,
+    plot_network_topology,
     plot_position_errors,
     plot_string_stability,
     plot_trajectories,
@@ -52,6 +54,11 @@ def generate_report(result: SimResult, output_dir: Path) -> Path:
     plot_string_stability(result.collector, plots_dir / "string_stability.png")
     plot_corridor_adherence(result.world, result.vehicles, result.collector,
                             plots_dir / "corridor_adherence.png")
+
+    # Phase 8: error-ellipse overlay and network topology
+    plot_error_ellipses(result.world, result.vehicles, result.collector,
+                        result.config.dt, plots_dir / "error_ellipses.png")
+    plot_network_topology(result.collector, plots_dir / "network_topology.png")
 
     # Compute metrics
     metrics = result.collector.compute_final(
@@ -210,6 +217,12 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
         "### Corridor Adherence",
         "![Corridor Adherence](plots/corridor_adherence.png)",
         "",
+        "### Position Uncertainty Ellipses",
+        "![Error Ellipses](plots/error_ellipses.png)",
+        "",
+        "### Network Topology",
+        "![Network Topology](plots/network_topology.png)",
+        "",
     ]
 
     return "\n".join(lines)
@@ -339,6 +352,9 @@ def _build_assumptions_section() -> list[str]:
         "- Line-of-sight with distance-squared degradation; no multipath or fading.",
         "- Per-packet independent loss; no burst-error model.",
         "- No frequency, bandwidth, or queuing model.",
+        "- Multi-hop relay (Phase 8): vehicles forward messages to out-of-range peers; "
+        "  configurable max hops (0=disabled) with per-hop loss penalty.",
+        "- Neighbor state table caches latest broadcast per peer; stale entries pruned.",
         "",
         "### Coordination",
         "- Formation uses constant time headway (CTH) gap model with "
@@ -346,8 +362,8 @@ def _build_assumptions_section() -> list[str]:
         "- Collision radius is centre-to-centre distance; swept-volume "
         "  overlap is not modelled.",
         "- Road corridor adherence uses simple polyline distance penalty.",
-        "- Leader election assumes all non-failed vehicles can eventually "
-        "  communicate (multi-hop not modelled).",
+        "- Leader election benefits from multi-hop relay when enabled, "
+        "  but does not implement full multi-hop routing protocol.",
         "",
         "### Realism Limitations (Phase 6)",
         "- Actuator lag is first-order dead-time only (no higher-order dynamics).",

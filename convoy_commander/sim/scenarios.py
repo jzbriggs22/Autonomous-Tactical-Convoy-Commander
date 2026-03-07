@@ -28,6 +28,8 @@ def get_scenario(name: str, **overrides: object) -> SimConfig:
         "sensor_drift_spike": _sensor_drift_spike,
         # Phase 6 scenarios
         "platooning": _platooning,
+        # Phase 8 scenarios
+        "mesh_relay": _mesh_relay,
     }
     if name not in builders:
         raise ValueError(f"Unknown scenario: {name}. Available: {list(builders.keys())}")
@@ -189,4 +191,27 @@ def _platooning(**overrides: object) -> SimConfig:
     # Elevated IMU noise
     config.estimator.bias_instability = 0.02
     config.estimator.angle_random_walk = 0.01
+    return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 scenarios
+# ---------------------------------------------------------------------------
+
+
+def _mesh_relay(**overrides: object) -> SimConfig:
+    """Mesh relay: reduced comms range that requires multi-hop forwarding.
+
+    Comms range is halved to 100m so direct LOS connectivity is fragmented.
+    Multi-hop relay with 2 hops is enabled so vehicles can maintain
+    coordination through intermediate relay nodes.  Per-hop loss is 10%.
+    """
+    config = SimConfig(
+        gps_available=True,
+        duration=300.0,
+    )
+    config.comms.max_range = 100.0
+    config.comms.packet_loss = 0.05
+    config.comms.max_relay_hops = 2
+    config.comms.relay_loss_per_hop = 0.1
     return _apply_overrides(config, **overrides)
