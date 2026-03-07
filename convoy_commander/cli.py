@@ -22,7 +22,7 @@ def main() -> None:
     run_parser.add_argument(
         "--scenario", default="baseline",
         help="Scenario name: baseline|gps_denied|comms_degraded|leader_failure|"
-             "obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike",
+             "obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|platooning",
     )
     run_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     run_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
@@ -43,7 +43,7 @@ def main() -> None:
     eval_parser.add_argument(
         "--scenarios", type=str, default=None,
         help="Comma-separated scenario names (default: baseline,gps_denied,"
-             "comms_degraded,leader_failure,comms_blackout)",
+             "comms_degraded,leader_failure,comms_blackout,platooning)",
     )
     eval_parser.add_argument(
         "--seeds", type=str, default=None,

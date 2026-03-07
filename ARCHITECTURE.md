@@ -46,8 +46,8 @@
 | **GlobalPlanner** | `convoy_commander/planning/global_planner.py` | Multi-objective A* on road graph |
 | **LocalPlanner** | `convoy_commander/planning/local_planner.py` | DWA + potential fields |
 | **Supervisor** | `convoy_commander/supervisor/supervisor.py` | Centralised anomaly detector (optional) |
-| **Metrics** | `convoy_commander/metrics/collector.py` | Per-step data, aggregate computation |
-| **Report** | `convoy_commander/viz/report.py` | Markdown + plots + JSON artifacts |
+| **Metrics** | `convoy_commander/metrics/collector.py` | Per-step data (incl. headway, corridor, spacing error samples), aggregate computation |
+| **Report** | `convoy_commander/viz/report.py` | Markdown + 7 plot types + JSON artifacts |
 | **Stamp** | `convoy_commander/stamp.py` | Reproducibility metadata (git, python, platform) |
 | **EventLog** | `convoy_commander/core/event_log.py` | Structured safety audit trail |
 
@@ -160,6 +160,23 @@ section of `report.md`.
 - **Heading bias (RRW)**: gyro bias drift as random walk `Δbias = N(0, rate_rw × √dt)`
 - **Heading noise (ARW)**: white noise `N(0, angle_rw × √dt)` on heading per step
 - Process noise Q includes heading-induced position uncertainty
+
+## Visualization (Phase 7)
+
+### New Plot Types
+- `plot_headway_gaps`: Actual vs desired inter-vehicle headway gap over time (per follower)
+- `plot_string_stability`: Spacing error time series + RMS bar chart per vehicle
+- `plot_corridor_adherence`: Dual-panel — trajectories on world map + corridor distance over time
+- `plot_metrics_summary`: Extended to 4 subplots (speed, fuel, uncertainty, headway gap)
+
+### New Collector Fields
+- `headway_samples`: Per-step `{time, vehicle_id, actual_gap, desired_gap}` for each follower
+- `corridor_samples`: Per-step `{time, vehicle_id, corridor_dist}` for each operational vehicle
+- `spacing_error_samples`: Per-step `{time, vehicle_id, error}` during string stability window
+
+### Runner Instrumentation
+- After each vehicle step: record corridor distance and headway gap (for followers)
+- During `_track_spacing_errors`: also record per-step spacing errors with timestamps for visualization
 
 ## Determinism
 

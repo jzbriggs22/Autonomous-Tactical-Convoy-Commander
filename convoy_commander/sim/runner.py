@@ -315,6 +315,19 @@ class SimRunner:
                 # === Safety envelope enforcement (post-step) ===
                 self._enforce_safety_envelope(v, current_time)
 
+                # === Phase 7: record corridor distance ===
+                corridor_dist = v.route_corridor_distance(v.state.x, v.state.y)
+                self.collector.record_corridor_distance(current_time, v.id, corridor_dist)
+
+                # === Phase 7: record headway gap for followers ===
+                if leader and not v.is_leader:
+                    pred = self._find_predecessor(v, leader, operational_ids)
+                    if pred is not None:
+                        actual_gap = v.state.distance_to(pred.state)
+                        coord = self.config.coordination
+                        desired_gap = coord.standoff_distance + coord.time_headway * v.state.speed
+                        self.collector.record_headway(current_time, v.id, actual_gap, desired_gap)
+
                 # Check waypoint advance
                 self._advance_waypoint(v)
 
@@ -757,6 +770,29 @@ class SimRunner:
                 return v
         return None
 
+    def _find_predecessor(self, v: Vehicle, leader: Vehicle, operational_ids: list[int]) -> Vehicle | None:
+        """Find the vehicle directly ahead of *v* in formation order."""
+        if self.config.use_cbba and v.id in self._cbba_slots:
+            my_idx = self._cbba_slots[v.id]
+        else:
+            my_idx = get_formation_index(v.id, leader.id, operational_ids)
+        if my_idx <= 0:
+            return None
+        # Find vehicle with formation index == my_idx - 1
+        target_idx = my_idx - 1
+        for vv in self.vehicles:
+            if not vv.is_operational or vv.id == v.id:
+                continue
+            if target_idx == 0 and vv.is_leader:
+                return vv
+            if self.config.use_cbba and vv.id in self._cbba_slots:
+                vv_idx = self._cbba_slots[vv.id]
+            else:
+                vv_idx = get_formation_index(vv.id, leader.id, operational_ids)
+            if vv_idx == target_idx:
+                return vv
+        return leader  # fallback to leader if predecessor not found
+
     def _get_current_target(self, v: Vehicle) -> tuple[float, float] | None:
         """Get current waypoint target for vehicle."""
         if not v.waypoints:
@@ -858,6 +894,7 @@ class SimRunner:
             if v.id not in self._spacing_errors:
                 self._spacing_errors[v.id] = []
             self._spacing_errors[v.id].append(error)
+            self.collector.record_spacing_error(t, v.id, error)
 
     def _compute_string_stability(self) -> None:
         """Compute RMS-based string stability ratio and store in collector."""

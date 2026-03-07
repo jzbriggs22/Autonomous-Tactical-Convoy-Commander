@@ -14,8 +14,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module layout, trust boundaries, and 
 
 ```bash
 make install       # pip install -e ".[dev]"
-make test          # 216 tests
-make evaluate      # 5 scenarios x 3 seeds -> eval_results/sweep_*/summary.md
+make test          # 242 tests
+make evaluate      # 6 scenarios x 3 seeds -> eval_results/sweep_*/summary.md
 ```
 
 ## Quickstart
@@ -36,7 +36,7 @@ python -m convoy_commander evaluate
 # View last run results
 python -m convoy_commander report --last
 
-# Run unit tests (216 tests)
+# Run unit tests (242 tests)
 python -m pytest -q
 ```
 
@@ -74,7 +74,7 @@ pip install -e ".[dev]"
 
 # 4. Verify installation
 python -m convoy_commander --help
-python -m pytest -q --tb=short     # 216 tests should pass
+python -m pytest -q --tb=short     # 242 tests should pass
 ```
 
 #### Run All Scenarios Locally
@@ -184,7 +184,7 @@ Expected wall-clock time on `c5.2xlarge`: ~2–4 minutes for all 10 scenarios in
 | `metrics.json` | ~2 KB |
 | `time_series.jsonl` | ~5–20 MB (300 s, 8 vehicles) |
 | `event_log.jsonl` | ~100–500 KB |
-| `plots/` (4 PNGs) | ~2–4 MB |
+| `plots/` (7 PNGs) | ~4–8 MB |
 | **Total per run** | **~8–25 MB** |
 
 ---
@@ -210,7 +210,7 @@ python -m convoy_commander evaluate [options]
 
 Options:
   --scenarios  Comma-separated scenario names (default: baseline,gps_denied,
-               comms_degraded,leader_failure,comms_blackout)
+               comms_degraded,leader_failure,comms_blackout,platooning)
   --seeds      Comma-separated seeds (default: 42,123,7)
   --duration   Duration per run in seconds (default: 60)
   --vehicles   Number of vehicles (default: 8)
@@ -225,7 +225,7 @@ python -m convoy_commander report --dir <path> # display metrics from specific r
 Each run produces:
 - `report.md` — markdown report with metrics, safety audit, performance notes, and model assumptions
 - `config.json` — reproducibility stamp (git hash, python version, platform, full config)
-- `plots/` — trajectory maps, position error, speed/fuel/uncertainty timelines, comms graph
+- `plots/` — trajectory maps, position error, speed/fuel/uncertainty/headway timelines, comms graph, headway gaps, string stability, corridor adherence
 - `metrics.json` — machine-readable metrics
 - `time_series.jsonl` — per-vehicle per-timestep data
 - `event_log.jsonl` — structured safety audit trail (every event with timestamp, severity, vehicle ID)
@@ -235,9 +235,9 @@ Each run produces:
 | Target | Description |
 |--------|-------------|
 | `make install` | Install package with dev dependencies |
-| `make test` | Run all 216 tests |
+| `make test` | Run all 242 tests |
 | `make demo` | Run baseline scenario (60s) |
-| `make evaluate` | Run evaluation harness (5 scenarios x 3 seeds) |
+| `make evaluate` | Run evaluation harness (6 scenarios x 3 seeds) |
 | `make sweep` | Run all 10 scenarios sequentially (60s each) |
 | `make typecheck` | Run mypy type checker |
 | `make clean` | Remove caches |
@@ -400,9 +400,9 @@ convoy_commander/
   evaluate.py     Batch evaluation harness (multi-scenario x multi-seed)
   stamp.py        Reproducibility metadata (git hash, python, platform)
   cli.py          CLI entry point (run, evaluate, report, test)
-tests/            216 tests: physics, estimator, comms, planning, election,
+tests/            242 tests: physics, estimator, comms, planning, election,
                   sim, safety (30), Phase 2 (38), Phase 3 (33), Phase 4 (33),
-                  Phase 5 (20), Phase 6 (30)
+                  Phase 5 (20), Phase 6 (30), Phase 7 (26)
 runs/             Output directory for simulation results
 ```
 
@@ -429,7 +429,7 @@ runs/             Output directory for simulation results
 - **Enhanced Visualization**: `plot_world()` now renders rectangular obstacles (dimgray rectangles) and GPS spoof regions (translucent magenta circles) on all trajectory and comms graph plots
 
 **Phase 5 — Implemented:**
-- **Evaluation harness**: `evaluate` CLI command runs 5 scenarios x 3 seeds = 15 runs, produces `summary.md` with aggregate metrics table and per-scenario averages, plus per-run reports with full details
+- **Evaluation harness**: `evaluate` CLI command runs 6 scenarios x 3 seeds = 18 runs, produces `summary.md` with aggregate metrics table and per-scenario averages, plus per-run reports with full details
 - **Reproducibility stamp**: every run records git commit hash, Python version, platform, and full resolved config in `config.json`; displayed in report's "Reproducibility" section
 - **`report --last`**: displays key metrics from the most recent run directory (reads saved `metrics.json`)
 - **Performance notes**: each report includes complexity analysis (O(N^2) collision detection, O(E log V) planning, O(N*S) CBBA)
@@ -445,6 +445,16 @@ runs/             Output directory for simulation results
 - **Actuator lag**: dead-time buffer with hold-last policy (not coast-to-zero); configurable 0–1s
 - **Gauss-Markov + ARW/RRW IMU noise**: first-order Gauss-Markov position bias (exact discrete: σ_drive = σ_ss√(1−decay²)), heading bias random walk, angle random walk; process noise Q includes heading-induced position uncertainty
 - **Platooning scenario**: combines actuator lag (0.2s), time headway (1.5s), corridor (25m), elevated IMU noise; leader speed perturbation for string stability test
+
+**Phase 7 — Implemented:**
+- **Platooning in default evaluation**: `platooning` added to `DEFAULT_SCENARIOS` (6 scenarios × 3 seeds = 18 runs)
+- **Headway gap visualization**: `plot_headway_gaps` shows actual vs desired inter-vehicle gaps over time
+- **String stability visualization**: `plot_string_stability` shows spacing errors and RMS per vehicle during disturbance window
+- **Corridor adherence visualization**: `plot_corridor_adherence` shows trajectory + corridor distance over time
+- **Metrics summary 4-subplot**: headway gap added as 4th subplot in `plot_metrics_summary`
+- **Updated assumptions**: Phase 6 realism features (Gauss-Markov, CTH, actuator lag, corridor) reflected in model assumptions section
+- **CI coverage reporting**: `pytest-cov` with term-missing and XML output in GitHub Actions
+- **Per-step data collection**: `MetricsCollector` records headway_samples, corridor_samples, and spacing_error_samples per step
 
 **Remaining limitations:**
 - 2D only — no terrain elevation or 3D dynamics

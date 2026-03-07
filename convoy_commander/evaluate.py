@@ -28,6 +28,7 @@ DEFAULT_SCENARIOS: list[str] = [
     "comms_degraded",
     "leader_failure",
     "comms_blackout",
+    "platooning",
 ]
 
 DEFAULT_SEEDS: list[int] = [42, 123, 7]

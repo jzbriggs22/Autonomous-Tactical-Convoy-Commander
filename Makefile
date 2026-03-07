@@ -23,7 +23,7 @@ sweep:  ## Run all 10 scenarios sequentially (seed=42, 60s each)
 		python -m convoy_commander run --scenario $$s --seed 42 --duration 60; \
 	done
 
-evaluate:  ## Run evaluation harness (5 scenarios x 3 seeds)
+evaluate:  ## Run evaluation harness (6 scenarios x 3 seeds)
 	python -m convoy_commander evaluate
 
 clean:  ## Remove caches (does not delete runs/)

@@ -75,6 +75,13 @@ class MetricsCollector:
         self.comms_adjacency_snapshots: list[dict[int, list[int]]] = []
         self.time_stamps: list[float] = []
 
+        # Phase 7: per-step headway gaps for visualization
+        self.headway_samples: list[dict] = []
+        # Phase 7: per-step corridor distances for visualization
+        self.corridor_samples: list[dict] = []
+        # Phase 7: per-step spacing errors for string stability viz
+        self.spacing_error_samples: list[dict] = []
+
     def record_step(
         self, time: float, vehicles: list[Vehicle]
     ) -> None:
@@ -109,6 +116,25 @@ class MetricsCollector:
     def record_arrival(self, vehicle_id: int, time: float) -> None:
         if vehicle_id not in self.arrival_times:
             self.arrival_times[vehicle_id] = time
+
+    def record_headway(self, time: float, vehicle_id: int, actual_gap: float, desired_gap: float) -> None:
+        """Record a headway gap sample for visualization."""
+        self.headway_samples.append({
+            "time": time, "vehicle_id": vehicle_id,
+            "actual_gap": actual_gap, "desired_gap": desired_gap,
+        })
+
+    def record_corridor_distance(self, time: float, vehicle_id: int, corridor_dist: float) -> None:
+        """Record corridor distance sample for visualization."""
+        self.corridor_samples.append({
+            "time": time, "vehicle_id": vehicle_id, "corridor_dist": corridor_dist,
+        })
+
+    def record_spacing_error(self, time: float, vehicle_id: int, error: float) -> None:
+        """Record spacing error sample for string stability visualization."""
+        self.spacing_error_samples.append({
+            "time": time, "vehicle_id": vehicle_id, "error": error,
+        })
 
     def record_comms_adjacency(self, time: float, adj: dict[int, list[int]]) -> None:
         self.comms_adjacency_snapshots.append(adj)

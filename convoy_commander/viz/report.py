@@ -16,8 +16,11 @@ from convoy_commander.metrics.collector import MetricsCollector, SimMetrics
 from convoy_commander.sim.runner import SimResult
 from convoy_commander.viz.plots import (
     plot_comms_graph,
+    plot_corridor_adherence,
+    plot_headway_gaps,
     plot_metrics_summary,
     plot_position_errors,
+    plot_string_stability,
     plot_trajectories,
 )
 
@@ -42,6 +45,13 @@ def generate_report(result: SimResult, output_dir: Path) -> Path:
     positions = {v.id: (v.state.x, v.state.y) for v in result.vehicles}
     adj = result.comms.get_adjacency(positions)
     plot_comms_graph(result.vehicles, adj, result.world, plots_dir / "comms_graph.png")
+
+    # Phase 7: new visualization plots
+    plot_headway_gaps(result.collector, result.config, result.config.dt,
+                      plots_dir / "headway_gaps.png")
+    plot_string_stability(result.collector, plots_dir / "string_stability.png")
+    plot_corridor_adherence(result.world, result.vehicles, result.collector,
+                            plots_dir / "corridor_adherence.png")
 
     # Compute metrics
     metrics = result.collector.compute_final(
@@ -191,6 +201,15 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
         "### Communications Graph (Final State)",
         "![Comms Graph](plots/comms_graph.png)",
         "",
+        "### Headway Gap (Actual vs Desired)",
+        "![Headway Gaps](plots/headway_gaps.png)",
+        "",
+        "### String Stability",
+        "![String Stability](plots/string_stability.png)",
+        "",
+        "### Corridor Adherence",
+        "![Corridor Adherence](plots/corridor_adherence.png)",
+        "",
     ]
 
     return "\n".join(lines)
@@ -308,12 +327,11 @@ def _build_assumptions_section() -> list[str]:
         "- Fuel consumption is linear in speed; transient effects not modelled.",
         "",
         "### Position Estimation",
-        "- IMU drift: additive Gaussian noise + slow bias random walk.",
+        "- Gauss-Markov bias model and ARW/RRW IMU noise added in Phase 6.",
+        "- 2×2 covariance EKF tracks full error ellipse; scalar `uncertainty` "
+        "  retained as sqrt(trace(P)/2) for safe-mode logic.",
         "- Real IMU errors are non-Gaussian and correlated; this model "
         "  *underestimates* worst-case drift.",
-        "- Complementary filter (scalar gain) is an approximation of a Kalman "
-        "  filter.  No full covariance maintained.",
-        "- Uncertainty is a scalar 1-sigma proxy, optimistic in cross-track.",
         "- Landmark/GPS fixes use ground-truth position + noise.  Real "
         "  landmark detection can fail or be spoofed; not modelled.",
         "",
@@ -323,11 +341,19 @@ def _build_assumptions_section() -> list[str]:
         "- No frequency, bandwidth, or queuing model.",
         "",
         "### Coordination",
-        "- Formation is single-file behind leader; no lateral offsets.",
+        "- Formation uses constant time headway (CTH) gap model with "
+        "  standoff distance and first-order actuator lag (Phase 6).",
         "- Collision radius is centre-to-centre distance; swept-volume "
         "  overlap is not modelled.",
+        "- Road corridor adherence uses simple polyline distance penalty.",
         "- Leader election assumes all non-failed vehicles can eventually "
         "  communicate (multi-hop not modelled).",
+        "",
+        "### Realism Limitations (Phase 6)",
+        "- Actuator lag is first-order dead-time only (no higher-order dynamics).",
+        "- Road corridor adherence penalty is based on planned route polyline; "
+        "  no lane-level or road-width modeling.",
+        "- Gauss-Markov IMU model is a scalar approximation per axis.",
         "",
         "### Safe Mode Policy",
         "- Conservative: enters on ANY single trigger (high uncertainty OR "
