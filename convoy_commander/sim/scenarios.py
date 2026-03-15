@@ -195,8 +195,11 @@ def _platooning(**overrides: object) -> SimConfig:
     )
     # Actuator lag
     config.vehicle.actuator_lag = 0.2
-    # Time headway
-    config.coordination.time_headway = 1.5
+    # Time headway — increased for safer following
+    config.coordination.time_headway = 2.0
+    # Increased standoff and formation spacing for platoon safety
+    config.coordination.standoff_distance = 12.0
+    config.coordination.formation_spacing = 30.0
     # Corridor adherence
     config.road_corridor_width = 25.0
     # Elevated IMU noise

@@ -38,11 +38,11 @@ _DWA_N_SPEED = 9           # speed samples
 _DWA_N_OMEGA = 13          # turn-rate samples
 _DWA_HORIZON = 0.5         # forward simulation horizon (s)
 _DWA_SIM_STEPS = 5         # steps within horizon
-_DWA_ALPHA = 0.35          # heading score weight
-_DWA_BETA = 0.30           # clearance score weight (increased for safety)
-_DWA_GAMMA = 0.10          # velocity score weight
-_DWA_DELTA = 0.25          # corridor adherence weight (Phase 6)
-_DWA_MIN_CLEARANCE = 5.0   # m — trajectory is invalid if clearance drops below this
+_DWA_ALPHA = 0.30          # heading score weight
+_DWA_BETA = 0.40           # clearance score weight (prioritize safety)
+_DWA_GAMMA = 0.08          # velocity score weight
+_DWA_DELTA = 0.22          # corridor adherence weight (Phase 6)
+_DWA_MIN_CLEARANCE = 8.0   # m — trajectory is invalid if clearance drops below this
 _DWA_MIN_SCORE = 0.05      # minimum score to accept DWA result (else use fallback)
 
 
@@ -169,7 +169,7 @@ def _min_clearance(
         if other.id == own_id or not other.is_operational:
             continue
         d = math.hypot(x - other.estimator.state.x, y - other.estimator.state.y)
-        clr = min(clr, max(0.0, d - 3.0))
+        clr = min(clr, max(0.0, d - 6.0))
     return clr
 
 
@@ -218,15 +218,22 @@ def _potential_field_command(
             repulse += (nz_vec / nz_dist) * strength
 
     min_sep = vehicle.config.coordination.min_separation
+    collision_r = vehicle.config.coordination.collision_radius
     for other in neighbors:
         if other.id == vehicle.id or not other.is_operational:
             continue
         other_pos = np.array([other.estimator.state.x, other.estimator.state.y])
         sep_vec = pos - other_pos
         sep_dist = float(np.linalg.norm(sep_vec))
-        if 0 < sep_dist < min_sep * 2.0:
-            strength = (1.0 / max(sep_dist, 1.0) - 1.0 / (min_sep * 2.0)) * 75.0
-            repulse += (sep_vec / sep_dist) * strength
+        if 0 < sep_dist < min_sep * 3.0:
+            # Strong exponential repulsion that ramps up steeply near collision radius
+            base_strength = (1.0 / max(sep_dist, 0.5) - 1.0 / (min_sep * 3.0)) * 120.0
+            # Extra boost when dangerously close
+            if sep_dist < min_sep:
+                base_strength *= 2.5
+            if sep_dist < collision_r * 1.5:
+                base_strength *= 4.0
+            repulse += (sep_vec / sep_dist) * base_strength
 
     # Corridor attraction: pull toward nearest point on planned route polyline
     if vehicle.waypoints:
@@ -273,13 +280,12 @@ def _potential_field_command(
 
     # Slow down near other vehicles to prevent collisions
     neighbor_factor = 1.0
-    collision_r = vehicle.config.coordination.collision_radius
     for other in neighbors:
         if other.id == vehicle.id or not other.is_operational:
             continue
         d = math.hypot(est.x - other.estimator.state.x, est.y - other.estimator.state.y)
-        if d < min_sep * 1.3:
-            neighbor_factor = min(neighbor_factor, max(0.1, (d - collision_r) / (min_sep * 1.3 - collision_r)))
+        if d < min_sep * 2.0:
+            neighbor_factor = min(neighbor_factor, max(0.05, (d - collision_r) / (min_sep * 2.0 - collision_r)))
 
     desired_speed = max_speed * heading_factor * approach_factor * obstacle_factor * neighbor_factor
     speed_error = desired_speed - vehicle.state.speed

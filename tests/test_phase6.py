@@ -313,7 +313,7 @@ class TestStringStability:
         config = get_scenario("platooning", duration=10, vehicles=4, seed=42)
         assert config.scenario == "platooning"
         assert config.vehicle.actuator_lag == 0.2
-        assert config.coordination.time_headway == 1.5
+        assert config.coordination.time_headway == 2.0
 
     def test_string_stability_computed(self):
         """Short platooning run should compute string stability metrics."""

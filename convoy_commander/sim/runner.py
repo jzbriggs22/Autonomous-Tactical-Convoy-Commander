@@ -293,7 +293,15 @@ class SimRunner:
                         formation_idx,
                         v.effective_spacing,
                     )
-                    target = (target[0] + correction[0] * 2.5, target[1] + correction[1] * 2.5)
+                    # Scale formation correction down when near other vehicles
+                    corr_scale = 1.5
+                    for vv in self.vehicles:
+                        if vv.id != v.id and vv.is_operational:
+                            d = v.state.distance_to(vv.state)
+                            if d < self.config.coordination.min_separation * 1.5:
+                                corr_scale = min(corr_scale, 0.3)
+                                break
+                    target = (target[0] + correction[0] * corr_scale, target[1] + correction[1] * corr_scale)
 
                 # Compute and apply command
                 neighbors = [vv for vv in self.vehicles if vv.id != v.id]
@@ -309,6 +317,17 @@ class SimRunner:
                     max_safe = v.effective_max_speed
                     if v.state.speed > max_safe and cmd.accel > 0:
                         cmd.accel = -v.vcfg.max_decel * 0.3
+
+                # Emergency braking: hard brake if any neighbor is within collision danger zone
+                collision_r = self.config.coordination.collision_radius
+                for vv in self.vehicles:
+                    if vv.id != v.id and vv.is_operational:
+                        d = v.state.distance_to(vv.state)
+                        if d < collision_r * 2.0:
+                            cmd.accel = -v.vcfg.max_decel * 0.8
+                            break
+                        elif d < self.config.coordination.min_separation:
+                            cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.4)
 
                 v.step(cmd, dt)
 
