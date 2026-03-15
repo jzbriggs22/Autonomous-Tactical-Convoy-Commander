@@ -293,7 +293,7 @@ class SimRunner:
                         formation_idx,
                         v.effective_spacing,
                     )
-                    target = (target[0] + correction[0] * 2.0, target[1] + correction[1] * 2.0)
+                    target = (target[0] + correction[0] * 2.5, target[1] + correction[1] * 2.5)
 
                 # Compute and apply command
                 neighbors = [vv for vv in self.vehicles if vv.id != v.id]

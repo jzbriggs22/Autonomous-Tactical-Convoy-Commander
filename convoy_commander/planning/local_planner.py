@@ -38,11 +38,11 @@ _DWA_N_SPEED = 9           # speed samples
 _DWA_N_OMEGA = 13          # turn-rate samples
 _DWA_HORIZON = 0.5         # forward simulation horizon (s)
 _DWA_SIM_STEPS = 5         # steps within horizon
-_DWA_ALPHA = 0.4           # heading score weight
-_DWA_BETA = 0.2            # clearance score weight
-_DWA_GAMMA = 0.15          # velocity score weight
+_DWA_ALPHA = 0.35          # heading score weight
+_DWA_BETA = 0.30           # clearance score weight (increased for safety)
+_DWA_GAMMA = 0.10          # velocity score weight
 _DWA_DELTA = 0.25          # corridor adherence weight (Phase 6)
-_DWA_MIN_CLEARANCE = 4.0   # m — trajectory is invalid if clearance drops below this
+_DWA_MIN_CLEARANCE = 5.0   # m — trajectory is invalid if clearance drops below this
 _DWA_MIN_SCORE = 0.05      # minimum score to accept DWA result (else use fallback)
 
 
@@ -224,8 +224,8 @@ def _potential_field_command(
         other_pos = np.array([other.estimator.state.x, other.estimator.state.y])
         sep_vec = pos - other_pos
         sep_dist = float(np.linalg.norm(sep_vec))
-        if 0 < sep_dist < min_sep * 1.5:
-            strength = (1.0 / max(sep_dist, 1.0) - 1.0 / (min_sep * 1.5)) * 60.0
+        if 0 < sep_dist < min_sep * 2.0:
+            strength = (1.0 / max(sep_dist, 1.0) - 1.0 / (min_sep * 2.0)) * 75.0
             repulse += (sep_vec / sep_dist) * strength
 
     # Corridor attraction: pull toward nearest point on planned route polyline
@@ -278,8 +278,8 @@ def _potential_field_command(
         if other.id == vehicle.id or not other.is_operational:
             continue
         d = math.hypot(est.x - other.estimator.state.x, est.y - other.estimator.state.y)
-        if d < min_sep:
-            neighbor_factor = min(neighbor_factor, max(0.1, (d - collision_r) / (min_sep - collision_r)))
+        if d < min_sep * 1.3:
+            neighbor_factor = min(neighbor_factor, max(0.1, (d - collision_r) / (min_sep * 1.3 - collision_r)))
 
     desired_speed = max_speed * heading_factor * approach_factor * obstacle_factor * neighbor_factor
     speed_error = desired_speed - vehicle.state.speed

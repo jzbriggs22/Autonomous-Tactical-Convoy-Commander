@@ -47,8 +47,8 @@ def compute_formation_correction(
         error_mag = float(np.linalg.norm(formation_error))
 
         if error_mag > 1.0:
-            # Proportional correction, capped
-            gain = min(1.0, error_mag / spacing)
+            # Proportional correction with stronger gain for large errors
+            gain = min(1.5, error_mag / (spacing * 0.7))
             correction = (formation_error / error_mag) * gain
 
         # Heading alignment
