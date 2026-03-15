@@ -1,15 +1,17 @@
 """Global planner: multi-objective A* on road graph.
 
-The planner supports three objectives via ``PlanningObjective``:
+The planner supports four objectives via ``PlanningObjective``:
   - w_time: weight on travel distance (proxy for time)
   - w_fuel: weight on fuel consumption (proportional to distance)
   - w_risk: weight on per-edge risk score (proximity to obstacles / no-go zones)
+  - w_slope: weight on elevation/slope cost (requires DEM data)
 
 The composite edge cost is:
-    (w_time + w_fuel) * base_weight + w_risk * edge_risk * dist
+    (w_time + w_fuel) * base_weight + w_risk * edge_risk * dist + w_slope * slope_cost * dist
 
-Setting all weights equal to the defaults (1.0, 0.3, 0.5) biases the planner
-toward shorter, less risky routes over raw time minimisation.
+Setting all weights equal to the defaults (1.0, 0.3, 0.5, 0.0) biases the planner
+toward shorter, less risky routes.  Enable w_slope > 0 with a DEM for
+elevation-aware routing that prefers flatter terrain.
 """
 
 from __future__ import annotations
@@ -90,7 +92,22 @@ def _make_weight_fn(world: World, obj: PlanningObjective):
         pos_v = world.get_node_pos(v)
         dist = math.hypot(pos_u[0] - pos_v[0], pos_u[1] - pos_v[1])
         risk = float(data.get("risk", 0.0))
-        return (obj.w_time + obj.w_fuel) * base_w + obj.w_risk * risk * dist
+
+        cost = (obj.w_time + obj.w_fuel) * base_w + obj.w_risk * risk * dist
+
+        # Elevation/slope cost
+        if obj.w_slope > 0:
+            if world.elevation_grid is not None:
+                sc = world.elevation_grid.slope_cost(
+                    pos_u[0], pos_u[1], pos_v[0], pos_v[1]
+                )
+            else:
+                # Use pre-annotated edge slope if available
+                edge_slope = float(data.get("slope", 0.0))
+                sc = min(abs(edge_slope) / 0.3, 1.0)  # normalise to [0,1]
+            cost += obj.w_slope * sc * dist
+
+        return cost
 
     return weight
 

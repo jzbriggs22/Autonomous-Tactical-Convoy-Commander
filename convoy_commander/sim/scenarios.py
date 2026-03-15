@@ -30,6 +30,8 @@ def get_scenario(name: str, **overrides: object) -> SimConfig:
         "platooning": _platooning,
         # Phase 8 scenarios
         "mesh_relay": _mesh_relay,
+        # Phase 9 scenarios
+        "terrain_real": _terrain_real,
     }
     if name not in builders:
         raise ValueError(f"Unknown scenario: {name}. Available: {list(builders.keys())}")
@@ -50,6 +52,15 @@ def _apply_overrides(config: SimConfig, **overrides: object) -> SimConfig:
         config.comms.latency_mean_ms = float(overrides["latency"])  # type: ignore[arg-type]
     if "duration" in overrides:
         config.duration = float(overrides["duration"])  # type: ignore[arg-type]
+    # Geospatial overrides (Phase 9)
+    if "elevation" in overrides and overrides["elevation"]:
+        config.world.elevation_tiff = str(overrides["elevation"])
+    if "osm_source" in overrides and overrides["osm_source"]:
+        config.world.osm_source = str(overrides["osm_source"])
+    if "geo_bounds" in overrides and overrides["geo_bounds"]:
+        config.world.geo_bounds = overrides["geo_bounds"]  # type: ignore[assignment]
+    if "slope_weight" in overrides and overrides["slope_weight"] is not None:
+        config.planning.w_slope = float(overrides["slope_weight"])  # type: ignore[arg-type]
     return config
 
 
@@ -214,4 +225,24 @@ def _mesh_relay(**overrides: object) -> SimConfig:
     config.comms.packet_loss = 0.05
     config.comms.max_relay_hops = 2
     config.comms.relay_loss_per_hop = 0.1
+    return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 scenarios
+# ---------------------------------------------------------------------------
+
+
+def _terrain_real(**overrides: object) -> SimConfig:
+    """Real-world terrain: OSM road network + DEM elevation.
+
+    Requires ``--elevation`` and/or ``--osm-source`` CLI flags to supply
+    geospatial data.  Without them, falls back to procedural generation
+    but with slope-aware routing enabled.
+    """
+    config = SimConfig(
+        gps_available=True,
+        duration=600.0,  # longer for real-world scale
+    )
+    config.planning.w_slope = 0.4  # enable slope-aware routing
     return _apply_overrides(config, **overrides)

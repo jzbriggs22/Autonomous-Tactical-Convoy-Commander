@@ -172,6 +172,16 @@ class WorldConfig(BaseModel):
     spoof_offset_max: float = Field(default=50.0, gt=0, description="Max GPS spoof offset magnitude m")
     poly_obstacle_count: int = Field(default=3, ge=0, description="Number of axis-aligned rectangle obstacles")
 
+    # Geospatial data (optional — when None, procedural generation is used)
+    elevation_tiff: str | None = Field(default=None, description="Path to DEM GeoTIFF file")
+    osm_source: str | None = Field(default=None, description="Path to OSM/GraphML file or place name")
+    geo_bounds: tuple[float, float, float, float] | None = Field(
+        default=None, description="(north, south, east, west) in WGS84 degrees"
+    )
+    osm_network_type: str = Field(default="drive", description="OSM network type for osmnx")
+    terrain_resolution: float = Field(default=10.0, gt=0, description="Elevation grid resolution m")
+    max_slope_threshold: float = Field(default=0.3, gt=0, description="Slope (rise/run) that maps to cost 1.0")
+
     @model_validator(mode="after")
     def _validate_radius_ranges(self) -> WorldConfig:
         lo, hi = self.obstacle_radius_range
@@ -201,6 +211,7 @@ class PlanningObjective(BaseModel):
     w_time: float = Field(default=1.0, ge=0, description="Travel time / distance weight")
     w_fuel: float = Field(default=0.3, ge=0, description="Fuel consumption weight")
     w_risk: float = Field(default=0.5, ge=0, description="Route risk weight")
+    w_slope: float = Field(default=0.0, ge=0, description="Elevation/slope cost weight (0 = disabled)")
 
 
 class SimConfig(BaseModel):

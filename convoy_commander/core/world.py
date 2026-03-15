@@ -115,7 +115,253 @@ class World:
         self.spoof_regions: list[SpoofRegion] = []
         self.road_graph: nx.Graph = nx.Graph()
 
-        self._generate(rng)
+        # Elevation grid (None when no DEM loaded)
+        from convoy_commander.geospatial.elevation import ElevationGrid
+        self.elevation_grid: ElevationGrid | None = None
+
+        if config.osm_source is not None or config.elevation_tiff is not None:
+            self._load_geospatial(rng)
+        else:
+            self._generate(rng)
+
+    # ------------------------------------------------------------------
+    # Geospatial loading
+    # ------------------------------------------------------------------
+
+    def _load_geospatial(self, rng: np.random.Generator) -> None:
+        """Load world from real-world geospatial data sources."""
+        cfg = self.config
+
+        # Load elevation DEM if provided
+        if cfg.elevation_tiff is not None:
+            from convoy_commander.geospatial.terrain import load_elevation_grid
+            self.elevation_grid = load_elevation_grid(
+                cfg.elevation_tiff,
+                target_width=self.width,
+                target_height=self.height,
+                max_slope_threshold=cfg.max_slope_threshold,
+            )
+
+        # Load road graph from OSM if provided
+        if cfg.osm_source is not None:
+            from convoy_commander.geospatial.osm_roads import load_osm_road_graph
+            self.road_graph = load_osm_road_graph(
+                cfg.osm_source,
+                target_width=self.width,
+                target_height=self.height,
+                bounds=cfg.geo_bounds,
+                network_type=cfg.osm_network_type,
+                elevation_grid=self.elevation_grid,
+            )
+        else:
+            # No OSM source but have DEM — use procedural road grid on top
+            self._generate_road_grid(rng)
+
+        # Generate procedural hazards on top of real terrain
+        self._generate_hazards(rng)
+
+        # Annotate edges with risk scores
+        self._annotate_edge_risk()
+
+        # Annotate edges with slope data if elevation is available
+        if self.elevation_grid is not None:
+            self._annotate_edge_slope()
+
+    def _generate_road_grid(self, rng: np.random.Generator) -> None:
+        """Generate the procedural road graph grid (extracted from _generate)."""
+        n = self.config.road_graph_density
+        spacing_x = self.width / (n + 1)
+        spacing_y = self.height / (n + 1)
+
+        for i in range(n):
+            for j in range(n):
+                node_id = i * n + j
+                x = spacing_x * (i + 1)
+                y = spacing_y * (j + 1)
+                self.road_graph.add_node(node_id, pos=(x, y))
+
+        for i in range(n):
+            for j in range(n):
+                node_id = i * n + j
+                pos = self.road_graph.nodes[node_id]["pos"]
+                if i + 1 < n:
+                    neighbor = (i + 1) * n + j
+                    npos = self.road_graph.nodes[neighbor]["pos"]
+                    dist = math.hypot(npos[0] - pos[0], npos[1] - pos[1])
+                    weight = dist * (1.0 + 0.3 * rng.random())
+                    self.road_graph.add_edge(node_id, neighbor, weight=weight)
+                if j + 1 < n:
+                    neighbor = i * n + (j + 1)
+                    npos = self.road_graph.nodes[neighbor]["pos"]
+                    dist = math.hypot(npos[0] - pos[0], npos[1] - pos[1])
+                    weight = dist * (1.0 + 0.3 * rng.random())
+                    self.road_graph.add_edge(node_id, neighbor, weight=weight)
+                if i + 1 < n and j + 1 < n and rng.random() < 0.3:
+                    neighbor = (i + 1) * n + (j + 1)
+                    npos = self.road_graph.nodes[neighbor]["pos"]
+                    dist = math.hypot(npos[0] - pos[0], npos[1] - pos[1])
+                    weight = dist * (1.0 + 0.3 * rng.random())
+                    self.road_graph.add_edge(node_id, neighbor, weight=weight)
+
+        edges = list(self.road_graph.edges())
+        for e in edges:
+            if rng.random() < 0.1:
+                self.road_graph.remove_edge(*e)
+                if not nx.is_connected(self.road_graph):
+                    pos_a = self.road_graph.nodes[e[0]]["pos"]
+                    pos_b = self.road_graph.nodes[e[1]]["pos"]
+                    dist = math.hypot(pos_b[0] - pos_a[0], pos_b[1] - pos_a[1])
+                    self.road_graph.add_edge(e[0], e[1], weight=dist)
+
+    def _generate_hazards(self, rng: np.random.Generator) -> None:
+        """Generate obstacles, no-go zones, landmarks, spoof regions."""
+        # No-go zones
+        for _ in range(self.config.nogo_zone_count):
+            for _attempt in range(50):
+                r = rng.uniform(*self.config.nogo_zone_radius_range)
+                x = rng.uniform(r, self.width - r)
+                y = rng.uniform(r, self.height - r)
+                if x > 150 and x < self.width - 150:
+                    self.nogo_zones.append(NoGoZone(x=x, y=y, radius=r))
+                    break
+
+        # Circular obstacles
+        for _ in range(self.config.obstacle_count):
+            for _attempt in range(50):
+                r = rng.uniform(*self.config.obstacle_radius_range)
+                x = rng.uniform(r, self.width - r)
+                y = rng.uniform(r, self.height - r)
+                ok = True
+                for nz in self.nogo_zones:
+                    if math.hypot(x - nz.x, y - nz.y) < r + nz.radius:
+                        ok = False
+                        break
+                if x < 100 and y < 200:
+                    ok = False
+                if ok:
+                    self.obstacles.append(Obstacle(x=x, y=y, radius=r))
+                    break
+
+        # Remove road edges through obstacles/nogo zones
+        edges_to_remove: list[tuple[int, int]] = []
+        for u, v in self.road_graph.edges():
+            pos_u = np.array(self.road_graph.nodes[u]["pos"])
+            pos_v = np.array(self.road_graph.nodes[v]["pos"])
+            blocked = False
+            for obs in self.obstacles:
+                if self._segment_intersects_circle(pos_u, pos_v, np.array([obs.x, obs.y]), obs.radius):
+                    blocked = True
+                    break
+            if not blocked:
+                for nz in self.nogo_zones:
+                    if self._segment_intersects_circle(pos_u, pos_v, np.array([nz.x, nz.y]), nz.radius):
+                        blocked = True
+                        break
+            if blocked:
+                edges_to_remove.append((u, v))
+        for e in edges_to_remove:
+            self.road_graph.remove_edge(*e)
+
+        # Ensure connectivity
+        if self.road_graph.number_of_nodes() > 0 and not nx.is_connected(self.road_graph):
+            components = list(nx.connected_components(self.road_graph))
+            largest = max(components, key=len)
+            for comp in components:
+                if comp is largest:
+                    continue
+                best_dist = float("inf")
+                best_pair = (list(comp)[0], list(largest)[0])
+                for a in comp:
+                    pa = np.array(self.road_graph.nodes[a]["pos"])
+                    for b in largest:
+                        pb = np.array(self.road_graph.nodes[b]["pos"])
+                        d = float(np.linalg.norm(pa - pb))
+                        if d < best_dist:
+                            best_dist = d
+                            best_pair = (a, b)
+                self.road_graph.add_edge(best_pair[0], best_pair[1], weight=best_dist * 1.5)
+
+        # Poly obstacles
+        for _ in range(self.config.poly_obstacle_count):
+            for _attempt in range(50):
+                half_w = rng.uniform(8.0, 30.0)
+                half_h = rng.uniform(8.0, 20.0)
+                x = rng.uniform(half_w + 10, self.width - half_w - 10)
+                y = rng.uniform(half_h + 10, self.height - half_h - 10)
+                if x < 120 and y < 220:
+                    continue
+                ok = True
+                for nz in self.nogo_zones:
+                    if math.hypot(x - nz.x, y - nz.y) < math.hypot(half_w, half_h) + nz.radius:
+                        ok = False
+                        break
+                if ok:
+                    self.poly_obstacles.append(PolyObstacle(x=x, y=y, half_w=half_w, half_h=half_h))
+                    break
+
+        # Remove edges blocked by poly obstacles
+        poly_blocked: list[tuple[int, int]] = []
+        for u, v in self.road_graph.edges():
+            pos_u = np.array(self.road_graph.nodes[u]["pos"])
+            pos_v = np.array(self.road_graph.nodes[v]["pos"])
+            for po in self.poly_obstacles:
+                if self._segment_intersects_rect(pos_u, pos_v, po.x, po.y, po.half_w, po.half_h):
+                    poly_blocked.append((u, v))
+                    break
+        for e in poly_blocked:
+            if self.road_graph.has_edge(*e):
+                self.road_graph.remove_edge(*e)
+                if self.road_graph.number_of_nodes() > 0 and not nx.is_connected(self.road_graph):
+                    self.road_graph.add_edge(e[0], e[1], weight=500.0, risk=0.9)
+
+        # Landmarks
+        for _ in range(self.config.landmark_count):
+            x = rng.uniform(50, self.width - 50)
+            y = rng.uniform(50, self.height - 50)
+            self.landmarks.append(Landmark(x=x, y=y))
+
+        # Spoof regions
+        for _ in range(self.config.spoof_region_count):
+            spoof_r = 80.0
+            x = rng.uniform(self.width * 0.3, self.width * 0.7)
+            y = rng.uniform(self.height * 0.3, self.height * 0.7)
+            angle = rng.uniform(0, 2 * math.pi)
+            magnitude = rng.uniform(self.config.spoof_offset_max * 0.5, self.config.spoof_offset_max)
+            offset_x = magnitude * math.cos(angle)
+            offset_y = magnitude * math.sin(angle)
+            self.spoof_regions.append(
+                SpoofRegion(x=x, y=y, radius=spoof_r, offset_x=offset_x, offset_y=offset_y)
+            )
+
+    def _annotate_edge_slope(self) -> None:
+        """Annotate road graph edges with slope from elevation grid."""
+        if self.elevation_grid is None:
+            return
+        for u, v in self.road_graph.edges():
+            pos_u = self.road_graph.nodes[u]["pos"]
+            pos_v = self.road_graph.nodes[v]["pos"]
+            slope = self.elevation_grid.slope_between(pos_u[0], pos_u[1], pos_v[0], pos_v[1])
+            self.road_graph[u][v]["slope"] = slope
+
+    # ------------------------------------------------------------------
+    # Elevation queries
+    # ------------------------------------------------------------------
+
+    def elevation_at(self, x: float, y: float) -> float:
+        """Return elevation at (x, y). Returns 0.0 if no elevation data loaded."""
+        if self.elevation_grid is None:
+            return 0.0
+        return self.elevation_grid.elevation_at(x, y)
+
+    def get_slope(self, x1: float, y1: float, x2: float, y2: float) -> float:
+        """Return slope between two points. Returns 0.0 if no elevation data."""
+        if self.elevation_grid is None:
+            return 0.0
+        return self.elevation_grid.slope_between(x1, y1, x2, y2)
+
+    # ------------------------------------------------------------------
+    # Procedural generation (original)
+    # ------------------------------------------------------------------
 
     def _generate(self, rng: np.random.Generator) -> None:
         """Generate world features deterministically."""

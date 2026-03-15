@@ -23,7 +23,7 @@ def main() -> None:
         "--scenario", default="baseline",
         help="Scenario name: baseline|gps_denied|comms_degraded|leader_failure|"
              "obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|"
-             "platooning|mesh_relay",
+             "platooning|mesh_relay|terrain_real",
     )
     run_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     run_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
@@ -31,6 +31,13 @@ def main() -> None:
     run_parser.add_argument("--latency", type=float, default=None, help="Mean latency ms")
     run_parser.add_argument("--duration", type=float, default=None, help="Sim duration seconds")
     run_parser.add_argument("--output", type=str, default=None, help="Output directory")
+    # Geospatial flags (Phase 9)
+    run_parser.add_argument("--elevation", type=str, default=None, help="Path to DEM GeoTIFF file")
+    run_parser.add_argument("--osm-source", type=str, default=None, help="OSM file path or place name")
+    run_parser.add_argument("--geo-bounds", type=str, default=None,
+                            help="Bounding box: north,south,east,west (WGS84 degrees)")
+    run_parser.add_argument("--slope-weight", type=float, default=None,
+                            help="Weight for slope cost in A* pathfinding (0=disabled)")
 
     # report command
     report_parser = subparsers.add_parser("report", help="Display metrics from a previous run")
@@ -88,6 +95,16 @@ def _cmd_run(args: argparse.Namespace) -> None:
         overrides["latency"] = args.latency
     if args.duration is not None:
         overrides["duration"] = args.duration
+    # Geospatial overrides (Phase 9)
+    if args.elevation is not None:
+        overrides["elevation"] = args.elevation
+    if args.osm_source is not None:
+        overrides["osm_source"] = args.osm_source
+    if args.geo_bounds is not None:
+        parts = [float(x) for x in args.geo_bounds.split(",")]
+        overrides["geo_bounds"] = tuple(parts)
+    if args.slope_weight is not None:
+        overrides["slope_weight"] = args.slope_weight
 
     config = get_scenario(args.scenario, **overrides)
 

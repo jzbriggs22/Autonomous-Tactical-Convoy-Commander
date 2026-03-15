@@ -338,6 +338,7 @@ Limitations** section. Key assumptions:
 | `sensor_drift_spike` | Sudden IMU bias spike at t=60s (GPS denied); tests estimator recovery |
 | `platooning` | Actuator lag (0.2s), time headway (1.5s), corridor (25m), elevated IMU noise; leader brakes at t=40s for string stability |
 | `mesh_relay` | Halved comms range (100m), 2-hop multi-hop relay enabled (10% per-hop loss); tests mesh networking |
+| `terrain_real` | Real-world terrain: OSM road network + DEM elevation with slope-aware A* routing |
 
 ## Models and Assumptions
 
@@ -501,8 +502,16 @@ runs/             Output directory for simulation results
 - **`mesh_relay` scenario**: reduced comms range (100m), 2-hop relay, 10% per-hop loss — tests mesh networking resilience
 - **Evaluate updated**: 7 default scenarios (added mesh_relay); 9 plot types per run
 
+**Phase 9 — Implemented:**
+- **Real-world terrain loading**: `geospatial/terrain.py` loads GeoTIFF DEM files (SRTM, ASTER, Copernicus) via rasterio and resamples to an `ElevationGrid` with bilinear interpolation
+- **OpenStreetMap road networks**: `geospatial/osm_roads.py` downloads/loads OSM data via osmnx, projects to local metric coordinates, and replaces the procedural grid
+- **Elevation-aware A* pathfinding**: `w_slope` weight in `PlanningObjective` penalises steep road segments; uphill costs more than downhill (asymmetric slope cost)
+- **Coordinate projection**: `geospatial/coords.py` provides equirectangular lat/lon ↔ local metre conversion
+- **`terrain_real` scenario**: enables slope-aware routing (w_slope=0.4); accepts `--elevation`, `--osm-source`, `--geo-bounds` CLI flags
+- **Optional dependencies**: `pip install convoy_commander[geo]` adds rasterio, osmnx, pyproj; base install unchanged
+- **Backward compatible**: all geospatial features are opt-in; default procedural world generation unchanged
+
 **Remaining limitations:**
-- 2D only — no terrain elevation or 3D dynamics
 - DWA forward simulation uses point model (no swept volume)
 - Comms model is distance-based with no frequency / bandwidth modeling
 - Multi-hop relay is store-and-forward with no routing protocol (flood-based)
@@ -510,7 +519,7 @@ runs/             Output directory for simulation results
 - CBBA consensus is simulated centrally (not decentralised over the comms channel)
 
 **Future extensions:**
-- Terrain and elevation modeling
+- Live satellite feed integration (Sentinel-2 near-real-time)
 - Pareto frontier visualisation for multi-objective trade-offs
 - Decentralised CBBA consensus via actual message passing
 - Routing protocol for multi-hop (AODV or similar instead of flood)

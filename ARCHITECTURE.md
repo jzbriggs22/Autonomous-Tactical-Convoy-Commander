@@ -50,6 +50,7 @@
 | **Report** | `convoy_commander/viz/report.py` | Markdown + 9 plot types + JSON artifacts |
 | **Stamp** | `convoy_commander/stamp.py` | Reproducibility metadata (git, python, platform) |
 | **EventLog** | `convoy_commander/core/event_log.py` | Structured safety audit trail |
+| **Geospatial** | `convoy_commander/geospatial/` | Optional real-world terrain (DEM/GeoTIFF), OSM road networks, coordinate projection |
 
 ## Trust Boundaries
 
