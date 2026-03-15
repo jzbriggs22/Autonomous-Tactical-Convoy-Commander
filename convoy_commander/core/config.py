@@ -197,6 +197,47 @@ class WorldConfig(BaseModel):
         return self
 
 
+class WeatherConfig(BaseModel):
+    """Weather conditions configuration.
+
+    Assumptions:
+      - Weather effects are modelled as multiplicative factors on vehicle
+        dynamics parameters.  This is a first-order approximation; real
+        tire-road friction models are far more complex.
+      - Wind effects use a simple cosine/sine decomposition relative to
+        vehicle heading; turbulence and gusting are not modelled.
+    """
+
+    enabled: bool = Field(default=False, description="Enable weather effects")
+    weather_source: str = Field(
+        default="static", description="'api' for Open-Meteo live data, 'static' for config values"
+    )
+    latitude: float | None = Field(default=None, description="Latitude for API weather fetch (WGS84)")
+    longitude: float | None = Field(default=None, description="Longitude for API weather fetch (WGS84)")
+
+    # Static fallback values (used when source='static' or API unavailable)
+    static_temperature_c: float = Field(default=20.0, description="Temperature Celsius")
+    static_precipitation_mm_h: float = Field(default=0.0, ge=0, description="Precipitation mm/h")
+    static_wind_speed_ms: float = Field(default=0.0, ge=0, description="Wind speed m/s")
+    static_wind_direction_deg: float = Field(default=0.0, description="Wind direction degrees (0=E)")
+    static_visibility_m: float = Field(default=10000.0, gt=0, description="Visibility m")
+
+    # Time-varying weather (static mode): sinusoidal modulation
+    weather_variability: float = Field(
+        default=0.0, ge=0, le=1.0,
+        description="0=constant, 1=full sinusoidal variation around static values",
+    )
+    weather_period_s: float = Field(default=120.0, gt=0, description="Period of weather variation cycle s")
+
+    # Sensitivity tuning
+    crosswind_sensitivity: float = Field(
+        default=0.02, ge=0, description="Heading perturbation per m/s crosswind (rad)"
+    )
+    wind_speed_effect: float = Field(
+        default=0.1, ge=0, le=1.0, description="Fraction of head/tailwind affecting vehicle speed"
+    )
+
+
 class PlanningObjective(BaseModel):
     """Weights for multi-objective route planning.
 
@@ -245,6 +286,8 @@ class SimConfig(BaseModel):
     use_cbba: bool = Field(default=True, description="Use CBBA-lite for formation slot allocation")
     # Road-corridor adherence (Phase 6)
     road_corridor_width: float = Field(default=30.0, gt=0, description="Max distance from route polyline (m)")
+    # Weather (Phase 10)
+    weather: WeatherConfig = Field(default_factory=WeatherConfig)
 
     @model_validator(mode="after")
     def _validate_timestep_safety(self) -> SimConfig:
@@ -293,5 +336,14 @@ class SimConfig(BaseModel):
                 f"max_speed * dt ({self.vehicle.max_speed * self.dt:.2f}m) exceeds "
                 f"collision_radius ({self.coordination.collision_radius}m). "
                 "Fast-moving vehicles may tunnel through each other's collision zones."
+            )
+        if self.weather.enabled and self.weather.static_precipitation_mm_h > 5.0:
+            warnings.append(
+                f"Heavy precipitation ({self.weather.static_precipitation_mm_h:.1f} mm/h) configured; "
+                "expect significantly reduced vehicle dynamics."
+            )
+        if self.weather.enabled and self.weather.static_visibility_m < 200.0:
+            warnings.append(
+                f"Very low visibility ({self.weather.static_visibility_m:.0f}m) may trigger permanent safe mode."
             )
         return warnings

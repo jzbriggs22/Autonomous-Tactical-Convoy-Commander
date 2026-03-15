@@ -94,6 +94,13 @@ class EventKind(Enum):
     # --- scenario ---
     SCENARIO_EVENT = "scenario_event"
 
+    # --- weather ---
+    WEATHER_UPDATED = "weather_updated"
+    WEATHER_FRICTION_LOW = "weather_friction_low"
+    WEATHER_VISIBILITY_LOW = "weather_visibility_low"
+    WEATHER_SAFE_MODE = "weather_safe_mode"
+    WEATHER_API_FALLBACK = "weather_api_fallback"
+
 
 @dataclass(frozen=True)
 class Event:

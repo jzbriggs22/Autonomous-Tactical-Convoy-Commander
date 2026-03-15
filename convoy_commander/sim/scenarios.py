@@ -32,6 +32,10 @@ def get_scenario(name: str, **overrides: object) -> SimConfig:
         "mesh_relay": _mesh_relay,
         # Phase 9 scenarios
         "terrain_real": _terrain_real,
+        # Phase 10 weather scenarios
+        "heavy_rain": _heavy_rain,
+        "winter_storm": _winter_storm,
+        "weather_api": _weather_api,
     }
     if name not in builders:
         raise ValueError(f"Unknown scenario: {name}. Available: {list(builders.keys())}")
@@ -61,6 +65,27 @@ def _apply_overrides(config: SimConfig, **overrides: object) -> SimConfig:
         config.world.geo_bounds = overrides["geo_bounds"]  # type: ignore[assignment]
     if "slope_weight" in overrides and overrides["slope_weight"] is not None:
         config.planning.w_slope = float(overrides["slope_weight"])  # type: ignore[arg-type]
+    # Weather overrides (Phase 10)
+    if overrides.get("weather_enabled"):
+        config.weather.enabled = True
+    if "weather_source" in overrides and overrides["weather_source"]:
+        config.weather.weather_source = str(overrides["weather_source"])
+    if "weather_lat" in overrides and overrides["weather_lat"] is not None:
+        config.weather.latitude = float(overrides["weather_lat"])  # type: ignore[arg-type]
+    if "weather_lon" in overrides and overrides["weather_lon"] is not None:
+        config.weather.longitude = float(overrides["weather_lon"])  # type: ignore[arg-type]
+    if "precipitation" in overrides and overrides["precipitation"] is not None:
+        config.weather.enabled = True
+        config.weather.static_precipitation_mm_h = float(overrides["precipitation"])  # type: ignore[arg-type]
+    if "wind_speed" in overrides and overrides["wind_speed"] is not None:
+        config.weather.enabled = True
+        config.weather.static_wind_speed_ms = float(overrides["wind_speed"])  # type: ignore[arg-type]
+    if "visibility" in overrides and overrides["visibility"] is not None:
+        config.weather.enabled = True
+        config.weather.static_visibility_m = float(overrides["visibility"])  # type: ignore[arg-type]
+    if "temperature" in overrides and overrides["temperature"] is not None:
+        config.weather.enabled = True
+        config.weather.static_temperature_c = float(overrides["temperature"])  # type: ignore[arg-type]
     return config
 
 
@@ -248,4 +273,57 @@ def _terrain_real(**overrides: object) -> SimConfig:
         duration=600.0,  # longer for real-world scale
     )
     config.planning.w_slope = 0.4  # enable slope-aware routing
+    return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 weather scenarios
+# ---------------------------------------------------------------------------
+
+
+def _heavy_rain(**overrides: object) -> SimConfig:
+    """Heavy rain: reduced friction, moderate visibility degradation.
+
+    Tests convoy behaviour under wet-road conditions with reduced
+    traction and increased stopping distances.
+    """
+    config = SimConfig(duration=300.0)
+    config.weather.enabled = True
+    config.weather.static_precipitation_mm_h = 8.0
+    config.weather.static_visibility_m = 500.0
+    config.weather.static_temperature_c = 10.0
+    config.weather.weather_variability = 0.3
+    return _apply_overrides(config, **overrides)
+
+
+def _winter_storm(**overrides: object) -> SimConfig:
+    """Winter storm: ice, strong crosswind, low visibility.
+
+    Combined adverse conditions: sub-zero temperatures with precipitation
+    create icy roads, high crosswind disturbs heading, and low visibility
+    degrades sensors and may trigger safe mode.
+    """
+    config = SimConfig(duration=300.0)
+    config.weather.enabled = True
+    config.weather.static_precipitation_mm_h = 5.0
+    config.weather.static_temperature_c = -5.0
+    config.weather.static_wind_speed_ms = 12.0
+    config.weather.static_wind_direction_deg = 90.0
+    config.weather.static_visibility_m = 200.0
+    config.weather.weather_variability = 0.5
+    return _apply_overrides(config, **overrides)
+
+
+def _weather_api(**overrides: object) -> SimConfig:
+    """Live weather from Open-Meteo API (requires internet).
+
+    Uses Berlin coordinates by default; override with --weather-lat and
+    --weather-lon CLI flags.  Falls back to static weather if the API
+    is unreachable.
+    """
+    config = SimConfig(duration=600.0)
+    config.weather.enabled = True
+    config.weather.weather_source = "api"
+    config.weather.latitude = 52.52
+    config.weather.longitude = 13.41
     return _apply_overrides(config, **overrides)

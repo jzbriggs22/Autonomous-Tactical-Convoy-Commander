@@ -23,7 +23,7 @@ def main() -> None:
         "--scenario", default="baseline",
         help="Scenario name: baseline|gps_denied|comms_degraded|leader_failure|"
              "obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|"
-             "platooning|mesh_relay|terrain_real",
+             "platooning|mesh_relay|terrain_real|heavy_rain|winter_storm|weather_api",
     )
     run_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     run_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
@@ -38,6 +38,22 @@ def main() -> None:
                             help="Bounding box: north,south,east,west (WGS84 degrees)")
     run_parser.add_argument("--slope-weight", type=float, default=None,
                             help="Weight for slope cost in A* pathfinding (0=disabled)")
+    # Weather flags (Phase 10)
+    run_parser.add_argument("--weather", action="store_true", help="Enable weather effects")
+    run_parser.add_argument("--weather-source", type=str, default=None,
+                            help="Weather source: 'api' or 'static'")
+    run_parser.add_argument("--weather-lat", type=float, default=None,
+                            help="Latitude for weather API (WGS84)")
+    run_parser.add_argument("--weather-lon", type=float, default=None,
+                            help="Longitude for weather API (WGS84)")
+    run_parser.add_argument("--precipitation", type=float, default=None,
+                            help="Static precipitation mm/h")
+    run_parser.add_argument("--wind-speed", type=float, default=None,
+                            help="Static wind speed m/s")
+    run_parser.add_argument("--visibility", type=float, default=None,
+                            help="Static visibility m")
+    run_parser.add_argument("--temperature", type=float, default=None,
+                            help="Static temperature Celsius")
 
     # report command
     report_parser = subparsers.add_parser("report", help="Display metrics from a previous run")
@@ -105,6 +121,23 @@ def _cmd_run(args: argparse.Namespace) -> None:
         overrides["geo_bounds"] = tuple(parts)
     if args.slope_weight is not None:
         overrides["slope_weight"] = args.slope_weight
+    # Weather overrides (Phase 10)
+    if args.weather:
+        overrides["weather_enabled"] = True
+    if args.weather_source is not None:
+        overrides["weather_source"] = args.weather_source
+    if args.weather_lat is not None:
+        overrides["weather_lat"] = args.weather_lat
+    if args.weather_lon is not None:
+        overrides["weather_lon"] = args.weather_lon
+    if args.precipitation is not None:
+        overrides["precipitation"] = args.precipitation
+    if args.wind_speed is not None:
+        overrides["wind_speed"] = args.wind_speed
+    if args.visibility is not None:
+        overrides["visibility"] = args.visibility
+    if args.temperature is not None:
+        overrides["temperature"] = args.temperature
 
     config = get_scenario(args.scenario, **overrides)
 
@@ -116,6 +149,13 @@ def _cmd_run(args: argparse.Namespace) -> None:
     print(f"GPS: {'available' if config.gps_available else 'denied'}")
     print(f"Packet loss: {config.comms.packet_loss:.0%}")
     print(f"Latency: {config.comms.latency_mean_ms:.0f}ms")
+    if config.weather.enabled:
+        w = config.weather
+        print(f"Weather: {w.weather_source} | "
+              f"temp={w.static_temperature_c}°C, "
+              f"precip={w.static_precipitation_mm_h}mm/h, "
+              f"wind={w.static_wind_speed_ms}m/s, "
+              f"vis={w.static_visibility_m}m")
 
     # Print safety warnings
     warnings = config.safety_warnings()

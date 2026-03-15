@@ -40,6 +40,7 @@ from convoy_commander.planning.global_planner import plan_route
 from convoy_commander.stamp import ReproStamp, collect_stamp
 from convoy_commander.planning.local_planner import compute_command
 from convoy_commander.vehicles.vehicle import CommsMode, Vehicle, VehicleStatus
+from convoy_commander.weather.effects import WeatherEffects, WeatherState
 
 
 @dataclass
@@ -170,6 +171,36 @@ class SimRunner:
         if config.use_cbba:
             self._run_cbba_allocation()
 
+        # Weather effects (Phase 10)
+        self._weather_effects: WeatherEffects | None = None
+        self._weather_state: WeatherState | None = None
+        self._weather_log_timer: float = 0.0
+        if config.weather.enabled:
+            self._weather_effects = WeatherEffects(config.weather)
+            if config.weather.weather_source == "api" and config.weather.latitude is not None:
+                try:
+                    from convoy_commander.weather.api_client import fetch_weather_forecast, WeatherFetchError
+                    points = fetch_weather_forecast(
+                        config.weather.latitude,
+                        config.weather.longitude or 0.0,
+                        config.duration,
+                    )
+                    self._weather_effects.set_data_points(points)
+                    self.event_log.log(
+                        0.0, EventKind.WEATHER_UPDATED, Severity.INFO,
+                        message=f"Weather API: loaded {len(points)} hourly data points",
+                    )
+                except Exception as exc:
+                    self.event_log.log(
+                        0.0, EventKind.WEATHER_API_FALLBACK, Severity.WARNING,
+                        message=f"Weather API unavailable ({exc}), using static fallback",
+                    )
+            else:
+                self.event_log.log(
+                    0.0, EventKind.WEATHER_UPDATED, Severity.INFO,
+                    message="Weather: static mode enabled",
+                )
+
         # Centralised supervisor (optional)
         self._supervisor = None
         if config.use_supervisor:
@@ -224,6 +255,10 @@ class SimRunner:
 
             # === Scenario events ===
             self._handle_scenario_events(current_time)
+
+            # === Weather effects ===
+            if self._weather_effects is not None:
+                self._apply_weather_effects(current_time, dt)
 
             # === Rebuild spatial grids ===
             self._rebuild_spatial_grids()
@@ -306,6 +341,13 @@ class SimRunner:
                 # Compute and apply command
                 neighbors = [vv for vv in self.vehicles if vv.id != v.id]
                 cmd = compute_command(v, target, self.world, neighbors, dt)
+
+                # Wind perturbation on steering
+                if self._weather_effects is not None and self._weather_state is not None:
+                    h_perturb, _ = self._weather_effects.wind_effects(
+                        self._weather_state, v.state.heading, v.state.speed,
+                    )
+                    cmd.turn_rate += h_perturb
 
                 # Platooning: force leader to brake during perturbation window
                 if (self._platooning_brake_active and v.is_leader
@@ -783,6 +825,12 @@ class SimRunner:
                     f"threshold={self.config.estimator.uncertainty_safe_threshold:.1f}m"
                 )
 
+            # Weather: extremely low visibility
+            if self._weather_effects is not None and self._weather_state is not None:
+                _, _, force_safe = self._weather_effects.visibility_effects(self._weather_state)
+                if force_safe:
+                    reasons.append(f"weather_visibility={self._weather_state.visibility_m:.0f}m < 100m")
+
             # Comms lost for too long
             comms_gap = t - v.last_comms_time
             if comms_gap > comms_timeout and t > 5.0:
@@ -978,6 +1026,56 @@ class SimRunner:
                 self._spacing_errors[v.id] = []
             self._spacing_errors[v.id].append(error)
             self.collector.record_spacing_error(t, v.id, error)
+
+    def _apply_weather_effects(self, t: float, dt: float) -> None:
+        """Update vehicle modifiers based on current weather conditions."""
+        assert self._weather_effects is not None
+        state = self._weather_effects.get_state(t)
+        self._weather_state = state
+
+        friction = self._weather_effects.friction_factor(state)
+        stopping = self._weather_effects.stopping_distance_factor(state)
+        fuel = self._weather_effects.fuel_factor(state)
+
+        for v in self.vehicles:
+            if v.is_operational:
+                v.weather_speed_factor = friction
+                v.weather_accel_factor = friction
+                v.weather_fuel_factor = fuel
+                v.weather_spacing_factor = stopping
+
+        # Periodic weather logging (every 10s)
+        self._weather_log_timer += dt
+        if self._weather_log_timer >= 10.0:
+            self._weather_log_timer = 0.0
+            self.event_log.log(
+                t, EventKind.WEATHER_UPDATED, Severity.INFO,
+                message=f"Weather: {state.temperature_c:.1f}°C, "
+                        f"precip={state.precipitation_mm_h:.1f}mm/h, "
+                        f"wind={state.wind_speed_ms:.1f}m/s, "
+                        f"vis={state.visibility_m:.0f}m, "
+                        f"friction={friction:.2f}",
+                temperature_c=state.temperature_c,
+                precipitation_mm_h=state.precipitation_mm_h,
+                wind_speed_ms=state.wind_speed_ms,
+                visibility_m=state.visibility_m,
+                friction_factor=friction,
+            )
+            if friction < 0.6:
+                self.event_log.log(
+                    t, EventKind.WEATHER_FRICTION_LOW, Severity.WARNING,
+                    message=f"Low surface friction: {friction:.2f}",
+                    friction_factor=friction,
+                )
+            if state.visibility_m < 200.0:
+                self.event_log.log(
+                    t, EventKind.WEATHER_VISIBILITY_LOW, Severity.WARNING,
+                    message=f"Low visibility: {state.visibility_m:.0f}m",
+                    visibility_m=state.visibility_m,
+                )
+
+        # Record weather metrics
+        self.collector.record_weather(t, state, friction)
 
     def _compute_string_stability(self) -> None:
         """Compute RMS-based string stability ratio and store in collector."""

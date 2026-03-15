@@ -131,6 +131,12 @@ class Vehicle:
         # uncertainty, fuel, status, timestamp
         self.neighbor_states: dict[int, dict[str, object]] = {}
 
+        # Weather modifiers (set per-step by runner)
+        self.weather_speed_factor: float = 1.0
+        self.weather_accel_factor: float = 1.0
+        self.weather_fuel_factor: float = 1.0
+        self.weather_spacing_factor: float = 1.0
+
         # Metrics
         self.total_distance: float = 0.0
         self.near_miss_count: int = 0
@@ -179,19 +185,19 @@ class Vehicle:
 
         prev_pos = self.state.position().copy()
 
-        # Apply kinematic step
+        # Apply kinematic step (weather + safe mode via effective_max_speed)
         self.state.step(
             accel=applied.accel,
             turn_rate=applied.turn_rate,
             dt=dt,
-            max_speed=self.vcfg.max_speed,
-            max_accel=self.vcfg.max_accel,
-            max_decel=self.vcfg.max_decel,
+            max_speed=self.effective_max_speed,
+            max_accel=self.vcfg.max_accel * self.weather_accel_factor,
+            max_decel=self.vcfg.max_decel * self.weather_accel_factor,
             max_turn_rate=self.vcfg.max_turn_rate,
         )
 
-        # Consume fuel
-        consumed = self.fuel.consume(self.state.speed, dt)
+        # Consume fuel (weather increases consumption in adverse conditions)
+        consumed = self.fuel.consume(self.state.speed, dt) * self.weather_fuel_factor
         self.total_fuel_consumed += consumed
 
         # Track distance
@@ -223,18 +229,19 @@ class Vehicle:
 
     @property
     def effective_max_speed(self) -> float:
-        """Max speed considering safe mode."""
+        """Max speed considering safe mode and weather."""
+        base = self.vcfg.max_speed
         if self.status == VehicleStatus.SAFE_MODE:
-            return self.vcfg.max_speed * self.config.coordination.safe_mode_speed_factor
-        return self.vcfg.max_speed
+            base *= self.config.coordination.safe_mode_speed_factor
+        return base * self.weather_speed_factor
 
     @property
     def effective_spacing(self) -> float:
-        """Formation spacing considering safe mode."""
+        """Formation spacing considering safe mode and weather."""
         base = self.config.coordination.formation_spacing
         if self.status == VehicleStatus.SAFE_MODE:
-            return base * self.config.coordination.safe_mode_spacing_factor
-        return base
+            base *= self.config.coordination.safe_mode_spacing_factor
+        return base * self.weather_spacing_factor
 
     @property
     def is_operational(self) -> bool:

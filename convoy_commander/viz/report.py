@@ -152,6 +152,18 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
         "",
     ]
 
+    # Weather conditions (Phase 10)
+    if cfg.weather.enabled:
+        lines += [
+            "### Weather Conditions",
+            "",
+            f"- **Source:** {m.weather_source}",
+            f"- **Avg Friction Factor:** {m.avg_friction_factor:.2f}",
+            f"- **Min Visibility:** {m.min_visibility_m:.0f}m",
+            f"- **Max Precipitation:** {m.max_precipitation_mm_h:.1f} mm/h",
+            "",
+        ]
+
     # Realism metrics (Phase 6)
     lines += [
         "### Realism Metrics (Phase 6)",

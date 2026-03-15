@@ -16,7 +16,7 @@ COPY tests/ tests/
 COPY Makefile .
 
 # Install package with dev + geo dependencies
-RUN pip install --no-cache-dir -e ".[dev,geo]"
+RUN pip install --no-cache-dir -e ".[dev,geo,weather]"
 
 ENTRYPOINT ["python", "-m"]
 CMD ["pytest", "-q"]

@@ -39,6 +39,11 @@ class SimMetrics:
     # Phase 6 realism metrics
     string_stability_max: float = 0.0
     string_stability_median: float = 0.0
+    # Phase 10 weather metrics
+    weather_source: str = "none"
+    avg_friction_factor: float = 1.0
+    min_visibility_m: float = 10000.0
+    max_precipitation_mm_h: float = 0.0
 
 
 @dataclass
@@ -86,6 +91,9 @@ class MetricsCollector:
         self.cov_ellipse_samples: list[dict] = []
         # Phase 8: network topology snapshots
         self.network_stats_snapshots: list[dict] = []
+
+        # Phase 10: weather samples
+        self.weather_samples: list[dict] = []
 
     def record_step(
         self, time: float, vehicles: list[Vehicle]
@@ -161,6 +169,17 @@ class MetricsCollector:
         """Record a snapshot of network topology statistics."""
         self.network_stats_snapshots.append({"time": time, **stats})
 
+    def record_weather(self, time: float, state: object, friction_factor: float) -> None:
+        """Record a weather snapshot for metrics computation."""
+        self.weather_samples.append({
+            "time": time,
+            "temperature_c": getattr(state, "temperature_c", 20.0),
+            "precipitation_mm_h": getattr(state, "precipitation_mm_h", 0.0),
+            "wind_speed_ms": getattr(state, "wind_speed_ms", 0.0),
+            "visibility_m": getattr(state, "visibility_m", 10000.0),
+            "friction_factor": friction_factor,
+        })
+
     def compute_final(
         self,
         vehicles: list[Vehicle],
@@ -222,6 +241,14 @@ class MetricsCollector:
         # String stability (Phase 6, set by runner)
         m.string_stability_max = self.string_stability_max
         m.string_stability_median = self.string_stability_median
+
+        # Weather (Phase 10)
+        if self.weather_samples:
+            m.weather_source = "active"
+            frictions = [s["friction_factor"] for s in self.weather_samples]
+            m.avg_friction_factor = float(np.mean(frictions))
+            m.min_visibility_m = min(s["visibility_m"] for s in self.weather_samples)
+            m.max_precipitation_mm_h = max(s["precipitation_mm_h"] for s in self.weather_samples)
 
         return m
 
