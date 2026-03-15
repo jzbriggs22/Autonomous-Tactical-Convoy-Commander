@@ -115,6 +115,10 @@ Each run writes output to `runs/<scenario>_<timestamp>/`.
 ### Docker (Recommended for Local Testing)
 
 ```bash
+# Clone and checkout
+git clone https://github.com/jzbriggs22/Autonomous-Tactical-Convoy-Commander.git
+cd Autonomous-Tactical-Convoy-Commander
+
 # Build the image
 docker build -t convoy-commander .
 
@@ -125,8 +129,13 @@ docker run --rm convoy-commander
 docker run --rm convoy-commander pytest --cov=convoy_commander --cov-report=term-missing -q
 
 # Run a simulation (mount volume to get output)
+# Linux / macOS:
 docker run --rm -v $(pwd)/runs:/app/runs \
     convoy-commander convoy_commander run --scenario platooning --seed 42 --duration 60
+# Windows CMD:
+docker run --rm -v %cd%\runs:/app/runs convoy-commander convoy_commander run --scenario platooning --seed 42 --duration 60
+# Windows PowerShell:
+docker run --rm -v ${PWD}/runs:/app/runs convoy-commander convoy_commander run --scenario platooning --seed 42 --duration 60
 
 # Run evaluation harness
 docker run --rm -v $(pwd)/eval_results:/app/eval_results \
