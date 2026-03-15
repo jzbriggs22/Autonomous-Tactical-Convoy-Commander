@@ -112,6 +112,30 @@ Each run writes output to `runs/<scenario>_<timestamp>/`.
 
 ---
 
+### Docker (Recommended for Local Testing)
+
+```bash
+# Build the image
+docker build -t convoy-commander .
+
+# Run all tests
+docker run --rm convoy-commander
+
+# Run tests with coverage
+docker run --rm convoy-commander pytest --cov=convoy_commander --cov-report=term-missing -q
+
+# Run a simulation (mount volume to get output)
+docker run --rm -v $(pwd)/runs:/app/runs \
+    convoy-commander convoy_commander run --scenario platooning --seed 42 --duration 60
+
+# Run evaluation harness
+docker run --rm -v $(pwd)/eval_results:/app/eval_results \
+    convoy-commander convoy_commander evaluate
+
+# Type check
+docker run --rm convoy-commander mypy convoy_commander/ --ignore-missing-imports
+```
+
 ### AWS Deployment
 
 AWS is recommended if you need:
@@ -241,6 +265,7 @@ Each run produces:
 | `make evaluate` | Run evaluation harness (7 scenarios x 3 seeds) |
 | `make sweep` | Run all 11 scenarios sequentially (60s each) |
 | `make typecheck` | Run mypy type checker |
+| `make docker` | Build and run tests in Docker |
 | `make clean` | Remove caches |
 
 ## Safety Design

@@ -1,4 +1,4 @@
-.PHONY: help install test typecheck demo sweep evaluate clean
+.PHONY: help install test typecheck demo sweep evaluate docker clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -25,6 +25,10 @@ sweep:  ## Run all 11 scenarios sequentially (seed=42, 60s each)
 
 evaluate:  ## Run evaluation harness (7 scenarios x 3 seeds)
 	python -m convoy_commander evaluate
+
+docker:  ## Build and run tests in Docker
+	docker build -t convoy-commander .
+	docker run --rm convoy-commander
 
 clean:  ## Remove caches (does not delete runs/)
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
