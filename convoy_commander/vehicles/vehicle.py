@@ -115,6 +115,9 @@ class Vehicle:
         self._comms_was_lost: bool = False  # edge-detect for logging
         self._in_blackout: bool = False  # edge-detect for blackout zone logging
 
+        # Multi-convoy (Phase 12)
+        self.convoy_id: int = 0
+
         # Planning
         self.waypoints: list[tuple[float, float]] = []
         self.current_waypoint_idx: int = 0

@@ -24,7 +24,8 @@ def main() -> None:
         help="Scenario name: baseline|gps_denied|comms_degraded|leader_failure|"
              "obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|"
              "platooning|mesh_relay|terrain_real|heavy_rain|winter_storm|weather_api|"
-             "jammed_corridor|mobile_jammer|multi_threat",
+             "jammed_corridor|mobile_jammer|multi_threat|"
+             "two_convoy_crossing|convoy_merge|convoy_split_reroute|multi_convoy_contested",
     )
     run_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     run_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
@@ -107,7 +108,12 @@ def main() -> None:
 
 def _cmd_run(args: argparse.Namespace) -> None:
     """Run a simulation."""
-    from convoy_commander.sim.scenarios import get_scenario
+    from convoy_commander.sim.scenarios import get_scenario, MULTI_CONVOY_SCENARIOS
+
+    # Check if this is a multi-convoy scenario
+    if args.scenario in MULTI_CONVOY_SCENARIOS:
+        return _cmd_run_multi(args)
+
     from convoy_commander.sim.runner import SimRunner
     from convoy_commander.viz.report import generate_report
 
@@ -233,6 +239,75 @@ def _cmd_run(args: argparse.Namespace) -> None:
     print(f"  WARNING:  {warn}")
     if crit > 0:
         print(f"  ** {crit} CRITICAL event(s) — see {output_dir / 'event_log.jsonl'}")
+
+
+def _cmd_run_multi(args: argparse.Namespace) -> None:
+    """Run a multi-convoy simulation (Phase 12)."""
+    from convoy_commander.sim.scenarios import get_multi_convoy_scenario
+    from convoy_commander.sim.multi_runner import MultiConvoyRunner
+
+    overrides: dict[str, object] = {"seed": args.seed}
+    if args.duration is not None:
+        overrides["duration"] = args.duration
+
+    mc_config = get_multi_convoy_scenario(args.scenario, **overrides)
+    base = mc_config.base
+
+    print(f"=== Convoy Commander (Multi-Convoy) ===")
+    print(f"Scenario: {base.scenario}")
+    print(f"Seed: {base.seed}")
+    print(f"Convoys: {len(mc_config.convoys)}")
+    print(f"Total vehicles: {mc_config.total_vehicles}")
+    print(f"Duration: {base.duration}s")
+    for spec in mc_config.convoys:
+        print(f"  Convoy {spec.convoy_id}: {spec.num_vehicles} vehicles, "
+              f"priority={spec.priority}, "
+              f"dest=({spec.dest_x:.0f}, {spec.dest_y:.0f})")
+    print()
+
+    runner = MultiConvoyRunner(mc_config)
+
+    start_time = time.time()
+
+    def progress(step: int, total: int) -> None:
+        pct = step / total * 100
+        print(f"\r  Simulating... {pct:5.1f}%", end="", flush=True)
+
+    result = runner.run(progress_callback=progress)
+    elapsed = time.time() - start_time
+    print(f"\r  Simulation complete in {elapsed:.1f}s        ")
+
+    # Output directory
+    if args.output:
+        output_dir = Path(args.output)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path("runs") / f"{base.scenario}_{timestamp}"
+
+    # Save event log
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result.event_log.save(output_dir / "event_log.jsonl")
+
+    agg = result.aggregate_metrics
+    print(f"\n=== Multi-Convoy Results ===")
+    if agg:
+        print(f"  Mission: {'SUCCESS' if agg.overall_mission_success else 'FAILURE'}")
+        print(f"  Arrived: {agg.total_arrived}/{agg.total_vehicles}")
+        print(f"  Collisions: {agg.total_collisions} "
+              f"(inter-convoy: {agg.inter_convoy_collisions})")
+        print(f"  Near misses: {agg.total_near_misses}")
+        print(f"  Merges: {agg.merge_count}")
+        print(f"  Splits: {agg.split_count}")
+        print(f"  Right-of-way yields: {agg.right_of_way_yields}")
+
+    by_sev = result.event_log.count_by_severity()
+    crit = by_sev.get("CRITICAL", 0)
+    warn = by_sev.get("WARNING", 0)
+    print(f"\n=== Safety Audit ===")
+    print(f"  Total events: {len(result.event_log)}")
+    print(f"  CRITICAL: {crit}")
+    print(f"  WARNING:  {warn}")
+    print(f"\n  Audit log: {output_dir / 'event_log.jsonl'}")
 
 
 def _cmd_report(args: argparse.Namespace) -> None:

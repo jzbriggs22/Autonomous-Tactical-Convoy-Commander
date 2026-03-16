@@ -108,6 +108,14 @@ class EventKind(Enum):
     GPS_JAMMED = "gps_jammed"
     THREAT_AVOIDANCE_REPLAN = "threat_avoidance_replan"
 
+    # --- multi-convoy (Phase 12) ---
+    CONVOY_MERGE = "convoy_merge"
+    CONVOY_SPLIT = "convoy_split"
+    RIGHT_OF_WAY_YIELD = "right_of_way_yield"
+    RIGHT_OF_WAY_CLEAR = "right_of_way_clear"
+    INTER_CONVOY_NEAR_MISS = "inter_convoy_near_miss"
+    INTER_CONVOY_COLLISION = "inter_convoy_collision"
+
 
 @dataclass(frozen=True)
 class Event:

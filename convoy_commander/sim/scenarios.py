@@ -378,3 +378,168 @@ def _multi_threat(**overrides: object) -> SimConfig:
     config.planning.w_threat = 0.8
     config.comms.max_range = 150.0
     return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 12 multi-convoy scenarios
+# ---------------------------------------------------------------------------
+
+MULTI_CONVOY_SCENARIOS = {
+    "two_convoy_crossing",
+    "convoy_merge",
+    "convoy_split_reroute",
+    "multi_convoy_contested",
+}
+
+
+def get_multi_convoy_scenario(
+    name: str, **overrides: object
+) -> "MultiConvoyConfig":
+    """Get a multi-convoy scenario configuration by name."""
+    from convoy_commander.core.convoy_config import MultiConvoyConfig, ConvoySpec
+
+    builders: dict[str, Callable[..., "MultiConvoyConfig"]] = {
+        "two_convoy_crossing": _two_convoy_crossing,
+        "convoy_merge": _convoy_merge,
+        "convoy_split_reroute": _convoy_split_reroute,
+        "multi_convoy_contested": _multi_convoy_contested,
+    }
+    if name not in builders:
+        raise ValueError(
+            f"Unknown multi-convoy scenario: {name}. "
+            f"Available: {list(builders.keys())}"
+        )
+    config = builders[name](**overrides)
+    config.base.scenario = name
+    return config
+
+
+def _apply_multi_overrides(
+    config: "MultiConvoyConfig", **overrides: object,
+) -> "MultiConvoyConfig":
+    """Apply CLI overrides to multi-convoy config."""
+    if "seed" in overrides:
+        config.base.seed = int(overrides["seed"])  # type: ignore[arg-type]
+    if "duration" in overrides:
+        config.base.duration = float(overrides["duration"])  # type: ignore[arg-type]
+    return config
+
+
+def _two_convoy_crossing(**overrides: object) -> "MultiConvoyConfig":
+    """Two 4-vehicle convoys crossing paths.  Convoy 0 has higher priority.
+
+    Convoy 0: bottom-left → top-right (NE).
+    Convoy 1: bottom-right → top-left (NW).
+    Routes cross in the center, testing right-of-way negotiation.
+    """
+    from convoy_commander.core.convoy_config import MultiConvoyConfig, ConvoySpec
+
+    base = SimConfig(duration=300.0, num_vehicles=8)
+    config = MultiConvoyConfig(
+        base=base,
+        convoys=[
+            ConvoySpec(
+                convoy_id=0, num_vehicles=4, priority=1,
+                start_x=50.0, start_y=50.0,
+                dest_x=920.0, dest_y=920.0,
+                start_heading=0.78,  # ~45° NE
+            ),
+            ConvoySpec(
+                convoy_id=1, num_vehicles=4, priority=0,
+                start_x=920.0, start_y=50.0,
+                dest_x=50.0, dest_y=920.0,
+                start_heading=2.36,  # ~135° NW
+            ),
+        ],
+        right_of_way_radius=80.0,
+    )
+    return _apply_multi_overrides(config, **overrides)
+
+
+def _convoy_merge(**overrides: object) -> "MultiConvoyConfig":
+    """Two 4-vehicle convoys heading to the same destination, close starts.
+
+    Convoy 0 starts at (50, 50), convoy 1 starts at (50, 150).
+    Both head to (920, 920).  Merge when leaders are within merge_distance.
+    """
+    from convoy_commander.core.convoy_config import MultiConvoyConfig, ConvoySpec
+
+    base = SimConfig(duration=300.0, num_vehicles=8)
+    config = MultiConvoyConfig(
+        base=base,
+        convoys=[
+            ConvoySpec(
+                convoy_id=0, num_vehicles=4, priority=1,
+                start_x=50.0, start_y=50.0,
+                dest_x=920.0, dest_y=920.0,
+                start_heading=0.3,
+            ),
+            ConvoySpec(
+                convoy_id=1, num_vehicles=4, priority=0,
+                start_x=50.0, start_y=150.0,
+                dest_x=920.0, dest_y=920.0,
+                start_heading=0.3,
+            ),
+        ],
+        merge_distance=60.0,
+    )
+    return _apply_multi_overrides(config, **overrides)
+
+
+def _convoy_split_reroute(**overrides: object) -> "MultiConvoyConfig":
+    """One 8-vehicle convoy splits at t=60s into two 4-vehicle groups.
+
+    After split, convoy 0 continues to original destination (920, 920),
+    convoy 1 reroutes to (80, 920) — upper-left.
+    """
+    from convoy_commander.core.convoy_config import MultiConvoyConfig, ConvoySpec
+
+    base = SimConfig(duration=300.0, num_vehicles=8)
+    config = MultiConvoyConfig(
+        base=base,
+        convoys=[
+            ConvoySpec(
+                convoy_id=0, num_vehicles=8, priority=0,
+                start_x=50.0, start_y=50.0,
+                dest_x=920.0, dest_y=920.0,
+                start_heading=0.3,
+            ),
+        ],
+        split_min_vehicles=2,
+    )
+    return _apply_multi_overrides(config, **overrides)
+
+
+def _multi_convoy_contested(**overrides: object) -> "MultiConvoyConfig":
+    """Three convoys with overlapping routes.  Stress test for all
+    multi-convoy features (right-of-way, near-miss detection, etc.).
+    """
+    from convoy_commander.core.convoy_config import MultiConvoyConfig, ConvoySpec
+
+    base = SimConfig(duration=300.0, num_vehicles=10)
+    base.comms.packet_loss = 0.15
+    config = MultiConvoyConfig(
+        base=base,
+        convoys=[
+            ConvoySpec(
+                convoy_id=0, num_vehicles=3, priority=2,
+                start_x=50.0, start_y=50.0,
+                dest_x=920.0, dest_y=920.0,
+                start_heading=0.78,
+            ),
+            ConvoySpec(
+                convoy_id=1, num_vehicles=4, priority=1,
+                start_x=500.0, start_y=50.0,
+                dest_x=500.0, dest_y=920.0,
+                start_heading=1.57,  # due north
+            ),
+            ConvoySpec(
+                convoy_id=2, num_vehicles=3, priority=0,
+                start_x=920.0, start_y=50.0,
+                dest_x=50.0, dest_y=920.0,
+                start_heading=2.36,  # NW
+            ),
+        ],
+        right_of_way_radius=80.0,
+    )
+    return _apply_multi_overrides(config, **overrides)
