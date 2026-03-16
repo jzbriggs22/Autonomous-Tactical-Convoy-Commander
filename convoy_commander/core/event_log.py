@@ -101,6 +101,13 @@ class EventKind(Enum):
     WEATHER_SAFE_MODE = "weather_safe_mode"
     WEATHER_API_FALLBACK = "weather_api_fallback"
 
+    # --- electronic warfare ---
+    JAMMER_DETECTED = "jammer_detected"
+    JAMMER_TRIANGULATED = "jammer_triangulated"
+    ECM_ACTIVATED = "ecm_activated"
+    GPS_JAMMED = "gps_jammed"
+    THREAT_AVOIDANCE_REPLAN = "threat_avoidance_replan"
+
 
 @dataclass(frozen=True)
 class Event:

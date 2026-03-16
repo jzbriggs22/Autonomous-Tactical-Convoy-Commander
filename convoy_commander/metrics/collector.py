@@ -44,6 +44,12 @@ class SimMetrics:
     avg_friction_factor: float = 1.0
     min_visibility_m: float = 10000.0
     max_precipitation_mm_h: float = 0.0
+    # Phase 11 EW metrics
+    jammers_detected: int = 0
+    jammers_triangulated: int = 0
+    ecm_activations: int = 0
+    gps_jammed_ticks: int = 0
+    threat_replans: int = 0
 
 
 @dataclass
@@ -250,7 +256,19 @@ class MetricsCollector:
             m.min_visibility_m = min(s["visibility_m"] for s in self.weather_samples)
             m.max_precipitation_mm_h = max(s["precipitation_mm_h"] for s in self.weather_samples)
 
+        # EW (Phase 11) — populated by populate_ew_metrics()
         return m
+
+    def populate_ew_metrics(self, metrics: SimMetrics, event_log: object) -> None:
+        """Populate EW metrics from event log counts."""
+        if not hasattr(event_log, "count_by_kind"):
+            return
+        counts = event_log.count_by_kind()
+        metrics.jammers_detected = counts.get("jammer_detected", 0)
+        metrics.jammers_triangulated = counts.get("jammer_triangulated", 0)
+        metrics.ecm_activations = counts.get("ecm_activated", 0)
+        metrics.gps_jammed_ticks = counts.get("gps_jammed", 0)
+        metrics.threat_replans = counts.get("threat_avoidance_replan", 0)
 
     def save_metrics(self, metrics: SimMetrics, path: Path) -> None:
         """Save metrics to JSON."""

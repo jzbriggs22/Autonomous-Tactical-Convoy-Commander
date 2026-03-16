@@ -70,6 +70,9 @@ def generate_report(result: SimResult, output_dir: Path) -> Path:
         comms_by_type=result.comms.get_stats_by_type(),
     )
 
+    # Populate EW metrics from event log (Phase 11)
+    result.collector.populate_ew_metrics(metrics, result.event_log)
+
     # Save artifacts
     result.collector.save_metrics(metrics, output_dir / "metrics.json")
     result.collector.save_time_series(output_dir / "time_series.jsonl")
@@ -161,6 +164,19 @@ def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> 
             f"- **Avg Friction Factor:** {m.avg_friction_factor:.2f}",
             f"- **Min Visibility:** {m.min_visibility_m:.0f}m",
             f"- **Max Precipitation:** {m.max_precipitation_mm_h:.1f} mm/h",
+            "",
+        ]
+
+    # EW metrics (Phase 11)
+    if cfg.ew.enabled:
+        lines += [
+            "### Electronic Warfare",
+            "",
+            f"- **Jammers Detected:** {m.jammers_detected}",
+            f"- **Jammers Triangulated:** {m.jammers_triangulated}",
+            f"- **ECM Activations:** {m.ecm_activations}",
+            f"- **GPS Jammed Events:** {m.gps_jammed_ticks}",
+            f"- **Threat Avoidance Replans:** {m.threat_replans}",
             "",
         ]
 

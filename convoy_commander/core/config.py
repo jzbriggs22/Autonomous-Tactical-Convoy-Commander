@@ -238,6 +238,30 @@ class WeatherConfig(BaseModel):
     )
 
 
+class EWConfig(BaseModel):
+    """Electronic warfare configuration.
+
+    Assumptions:
+      - Jammer effects use a simple inverse-square-law SNR model.
+        Real jammers have far more complex radiation patterns,
+        frequency-dependent effects, and terrain shielding.
+      - ECM (frequency hopping) is modelled as a multiplicative
+        reduction in jammer effectiveness, not a full spectrum model.
+    """
+
+    enabled: bool = Field(default=False, description="Enable EW/jammer effects")
+    jammer_detection_threshold: float = Field(
+        default=0.1, ge=0, description="RSSI anomaly detection threshold"
+    )
+    bearing_noise_std: float = Field(
+        default=0.1, ge=0, description="Bearing estimate noise std (rad)"
+    )
+    freq_hop_loss_reduction: float = Field(
+        default=0.6, ge=0, le=1.0,
+        description="Loss reduction factor when frequency hopping active",
+    )
+
+
 class PlanningObjective(BaseModel):
     """Weights for multi-objective route planning.
 
@@ -253,6 +277,7 @@ class PlanningObjective(BaseModel):
     w_fuel: float = Field(default=0.3, ge=0, description="Fuel consumption weight")
     w_risk: float = Field(default=0.5, ge=0, description="Route risk weight")
     w_slope: float = Field(default=0.0, ge=0, description="Elevation/slope cost weight (0 = disabled)")
+    w_threat: float = Field(default=0.0, ge=0, description="Jammer threat avoidance weight (0 = disabled)")
 
 
 class SimConfig(BaseModel):
@@ -288,6 +313,8 @@ class SimConfig(BaseModel):
     road_corridor_width: float = Field(default=30.0, gt=0, description="Max distance from route polyline (m)")
     # Weather (Phase 10)
     weather: WeatherConfig = Field(default_factory=WeatherConfig)
+    # Electronic warfare (Phase 11)
+    ew: EWConfig = Field(default_factory=EWConfig)
 
     @model_validator(mode="after")
     def _validate_timestep_safety(self) -> SimConfig:

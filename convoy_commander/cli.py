@@ -23,7 +23,8 @@ def main() -> None:
         "--scenario", default="baseline",
         help="Scenario name: baseline|gps_denied|comms_degraded|leader_failure|"
              "obstacle_pop|gps_spoofed|silent_running|comms_blackout|sensor_drift_spike|"
-             "platooning|mesh_relay|terrain_real|heavy_rain|winter_storm|weather_api",
+             "platooning|mesh_relay|terrain_real|heavy_rain|winter_storm|weather_api|"
+             "jammed_corridor|mobile_jammer|multi_threat",
     )
     run_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     run_parser.add_argument("--vehicles", type=int, default=8, help="Number of vehicles")
@@ -54,6 +55,12 @@ def main() -> None:
                             help="Static visibility m")
     run_parser.add_argument("--temperature", type=float, default=None,
                             help="Static temperature Celsius")
+    # EW flags (Phase 11)
+    run_parser.add_argument("--threats", action="store_true", help="Enable EW/jammer effects")
+    run_parser.add_argument("--jammer-power", type=float, default=None,
+                            help="Jammer power in dBm")
+    run_parser.add_argument("--jammer-radius", type=float, default=None,
+                            help="Jammer effect radius in meters")
 
     # report command
     report_parser = subparsers.add_parser("report", help="Display metrics from a previous run")
@@ -138,6 +145,13 @@ def _cmd_run(args: argparse.Namespace) -> None:
         overrides["visibility"] = args.visibility
     if args.temperature is not None:
         overrides["temperature"] = args.temperature
+    # EW overrides (Phase 11)
+    if args.threats:
+        overrides["threats_enabled"] = True
+    if args.jammer_power is not None:
+        overrides["jammer_power"] = args.jammer_power
+    if args.jammer_radius is not None:
+        overrides["jammer_radius"] = args.jammer_radius
 
     config = get_scenario(args.scenario, **overrides)
 

@@ -137,6 +137,10 @@ class Vehicle:
         self.weather_fuel_factor: float = 1.0
         self.weather_spacing_factor: float = 1.0
 
+        # EW state (Phase 11) — set by runner if EW enabled
+        self.ecm: object | None = None  # ECMState
+        self.threat_detector: object | None = None  # ThreatDetector
+
         # Metrics
         self.total_distance: float = 0.0
         self.near_miss_count: int = 0

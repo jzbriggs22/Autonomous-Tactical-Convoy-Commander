@@ -20,6 +20,7 @@ import numpy as np
 from convoy_commander.comms.messages import (
     Message,
     MessageType,
+    make_bearing_report,
     make_hazard,
     make_state_broadcast,
 )
@@ -40,6 +41,9 @@ from convoy_commander.planning.global_planner import plan_route
 from convoy_commander.stamp import ReproStamp, collect_stamp
 from convoy_commander.planning.local_planner import compute_command
 from convoy_commander.vehicles.vehicle import CommsMode, Vehicle, VehicleStatus
+from convoy_commander.ew.detection import BearingEstimate, ThreatDetector
+from convoy_commander.ew.ecm import ECMState
+from convoy_commander.ew.jammer import RFJammer
 from convoy_commander.weather.effects import WeatherEffects, WeatherState
 
 
@@ -201,6 +205,24 @@ class SimRunner:
                     message="Weather: static mode enabled",
                 )
 
+        # Electronic warfare (Phase 11)
+        self._ew_enabled = config.ew.enabled
+        self._jammers: list[RFJammer] = []
+        self._ecm_states: dict[int, ECMState] = {}
+        self._ew_triangulated = False
+        self._ew_detection_logged: set[int] = set()  # vehicles that already logged detection
+        if self._ew_enabled:
+            for v in self.vehicles:
+                ecm = ECMState(freq_hop_loss_reduction=config.ew.freq_hop_loss_reduction)
+                self._ecm_states[v.id] = ecm
+                v.ecm = ecm
+                v.threat_detector = ThreatDetector(
+                    rng=np.random.default_rng(config.seed + v.id + 1000),
+                    detection_threshold=config.ew.jammer_detection_threshold,
+                    bearing_noise_std=config.ew.bearing_noise_std,
+                )
+            self.comms.ecm_states = self._ecm_states
+
         # Centralised supervisor (optional)
         self._supervisor = None
         if config.use_supervisor:
@@ -255,6 +277,10 @@ class SimRunner:
 
             # === Scenario events ===
             self._handle_scenario_events(current_time)
+
+            # === Electronic warfare tick ===
+            if self._ew_enabled:
+                self._ew_tick(current_time, dt)
 
             # === Weather effects ===
             if self._weather_effects is not None:
@@ -621,6 +647,48 @@ class SimRunner:
                     message="SCENARIO: Leader brake released, returning to cruise speed",
                 )
 
+        # EW scenarios: place jammers
+        if scenario == "jammed_corridor" and not self._jammers and t < 0.2:
+            w, h = self.config.world.width, self.config.world.height
+            jammers = [
+                RFJammer(x=150.0, y=150.0, radius=200.0, power_dbm=40.0),
+                RFJammer(x=w * 0.5, y=h * 0.5, radius=120.0, power_dbm=30.0),
+                RFJammer(x=w * 0.5, y=h * 0.5, radius=100.0, power_dbm=25.0, jam_gps=True),
+            ]
+            self._place_jammers(jammers)
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message=f"SCENARIO: {len(jammers)} jammers placed along corridor",
+            )
+
+        if scenario == "mobile_jammer" and not self._jammers and t >= 30.0:
+            w, h = self.config.world.width, self.config.world.height
+            jammers = [
+                RFJammer(
+                    x=w * 0.3, y=h * 0.5, radius=150.0, power_dbm=28.0,
+                    mobile=True, velocity_x=2.0, velocity_y=1.0,
+                ),
+            ]
+            self._place_jammers(jammers)
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message="SCENARIO: Mobile jammer deployed at t=30s",
+            )
+
+        if scenario == "multi_threat" and not self._jammers and t < 0.2:
+            w, h = self.config.world.width, self.config.world.height
+            jammers = [
+                RFJammer(x=150.0, y=150.0, radius=200.0, power_dbm=40.0, jam_gps=True),
+                RFJammer(x=w * 0.5, y=h * 0.5, radius=150.0, power_dbm=30.0),
+            ]
+            self._place_jammers(jammers)
+            # Also add a blackout zone
+            self.comms.add_blackout_region(w * 0.5, h * 0.5, radius=80.0, loss_mult=10.0)
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message="SCENARIO: Multi-threat environment: 2 jammers + blackout zone",
+            )
+
     # ------------------------------------------------------------------
     # Position fixes
     # ------------------------------------------------------------------
@@ -633,6 +701,20 @@ class SimRunner:
         """
         for v in self.vehicles:
             if not v.is_operational:
+                continue
+
+            # Check GPS jamming (Phase 11)
+            gps_jammed = self._ew_enabled and self.world.is_gps_jammed(v.state.x, v.state.y)
+            if gps_jammed:
+                self.event_log.log(
+                    t, EventKind.GPS_JAMMED, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} GPS jammed at ({v.state.x:.0f}, {v.state.y:.0f})",
+                )
+                # Skip all GPS fixes for this vehicle this tick
+                # Still allow landmark fixes below
+                nearby = self.world.landmarks_in_range(v.state.x, v.state.y)
+                for lm in nearby:
+                    v.estimator.apply_landmark_fix(v.state.x, v.state.y)
                 continue
 
             # Check for GPS spoofing at vehicle's true position
@@ -709,6 +791,18 @@ class SimRunner:
                     self.elections[v.id].on_election_message(msg, t)
                 elif msg.msg_type == MessageType.HAZARD:
                     pass
+                elif msg.msg_type == MessageType.BEARING_REPORT:
+                    # Phase 11: collect bearing estimates for triangulation
+                    if v.threat_detector is not None:
+                        est = BearingEstimate(
+                            vehicle_id=msg.sender_id,
+                            vehicle_x=float(msg.payload.get("vehicle_x", 0.0)),
+                            vehicle_y=float(msg.payload.get("vehicle_y", 0.0)),
+                            bearing_rad=float(msg.payload.get("bearing_rad", 0.0)),
+                            rssi_anomaly=float(msg.payload.get("rssi_anomaly", 0.0)),
+                            timestamp=msg.timestamp,
+                        )
+                        v.threat_detector.add_estimate(est)
                 elif msg.msg_type == MessageType.STATE_BROADCAST:
                     # Phase 8: cache neighbor state
                     v.update_neighbor(msg.sender_id, msg.payload, msg.timestamp)
@@ -856,6 +950,100 @@ class SimRunner:
                     t, EventKind.SAFE_MODE_EXIT, Severity.INFO, vehicle_id=v.id,
                     message=f"Vehicle {v.id} exiting safe mode — all conditions clear",
                 )
+
+    # ------------------------------------------------------------------
+    # Electronic warfare (Phase 11)
+    # ------------------------------------------------------------------
+
+    def _place_jammers(self, jammers: list[RFJammer]) -> None:
+        """Register jammers in world and comms network."""
+        for j in jammers:
+            self.world.add_jammer(j)
+            self._jammers.append(j)
+        self.comms.jammers = self._jammers
+        # Pre-annotate edges with threat cost for route planning
+        self.world.annotate_edge_threat()
+
+    def _ew_tick(self, t: float, dt: float) -> None:
+        """Per-step EW processing: mobile jammer movement, detection, ECM, triangulation."""
+        if not self._jammers:
+            return
+
+        # Step mobile jammers
+        for j in self._jammers:
+            j.step(dt)
+
+        positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles if v.is_operational}
+
+        for v in self.vehicles:
+            if not v.is_operational or v.threat_detector is None:
+                continue
+
+            detector: ThreatDetector = v.threat_detector
+            ecm: ECMState = self._ecm_states[v.id]
+
+            # Measure RSSI anomaly
+            anomaly = detector.measure_rssi_anomaly(v.state.x, v.state.y, self._jammers)
+            if anomaly is None:
+                continue
+
+            # Jammer detected — log once per vehicle
+            if v.id not in self._ew_detection_logged:
+                self._ew_detection_logged.add(v.id)
+                self.event_log.log(
+                    t, EventKind.JAMMER_DETECTED, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} detected RF jammer (anomaly={anomaly:.2f})",
+                    anomaly=anomaly,
+                )
+
+            # Activate ECM if not already active
+            if not ecm.freq_hopping_active:
+                ecm.freq_hopping_active = True
+                ecm.adaptive_power_boost = 1.5
+                self.event_log.log(
+                    t, EventKind.ECM_ACTIVATED, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} activated frequency hopping + power boost",
+                )
+
+            # Estimate bearing and broadcast report
+            bearing = detector.estimate_bearing(v.state.x, v.state.y, self._jammers)
+            if bearing is not None:
+                est = BearingEstimate(
+                    vehicle_id=v.id,
+                    vehicle_x=v.state.x,
+                    vehicle_y=v.state.y,
+                    bearing_rad=bearing,
+                    rssi_anomaly=anomaly,
+                    timestamp=t,
+                )
+                detector.add_estimate(est)
+
+                # Broadcast bearing report to peers
+                msg = make_bearing_report(
+                    v.id, t, bearing, anomaly, v.state.x, v.state.y,
+                )
+                self.comms.send_broadcast(
+                    msg, (v.state.x, v.state.y), positions, t, self._comms_grid,
+                )
+
+            # Attempt triangulation
+            result = detector.try_triangulate(t)
+            if result is not None and not self._ew_triangulated:
+                self._ew_triangulated = True
+                jx, jy = result
+                self.event_log.log(
+                    t, EventKind.JAMMER_TRIANGULATED, Severity.INFO, vehicle_id=v.id,
+                    message=f"Jammer triangulated at ({jx:.0f}, {jy:.0f})",
+                    est_x=jx, est_y=jy,
+                )
+                # Re-annotate edges with updated threat map and replan
+                self.world.annotate_edge_threat()
+                if self.config.planning.w_threat > 0:
+                    self._plan_all_routes()
+                    self.event_log.log(
+                        t, EventKind.THREAT_AVOIDANCE_REPLAN, Severity.INFO,
+                        message="Routes replanned to avoid triangulated jammer",
+                    )
 
     def _run_supervisor(self, t: float) -> None:
         """Run the centralised supervisor and act on its advisories."""

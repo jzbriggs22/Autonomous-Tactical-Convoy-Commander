@@ -30,6 +30,8 @@ class CommsNetwork:
         self.config = config
         self.rng = rng
         self.blackout_regions: list[CommsBlackoutRegion] = []
+        self.jammers: list = []  # list[RFJammer] — set by runner
+        self.ecm_states: dict = {}  # dict[int, ECMState] — set by runner
 
         # In-flight messages: list of (message, delivery_time, recipient_id)
         self._in_flight: list[tuple[Message, float, int]] = []
@@ -122,6 +124,16 @@ class CommsNetwork:
             d_recip = math.hypot(recipient_pos[0] - region.x, recipient_pos[1] - region.y)
             if d_sender < region.radius or d_recip < region.radius:
                 loss_prob = min(1.0, loss_prob * region.loss_multiplier)
+
+        # RF jammer degradation (Phase 11)
+        for jammer in self.jammers:
+            sender_deg = jammer.snr_degradation(sender_pos[0], sender_pos[1])
+            recip_deg = jammer.snr_degradation(recipient_pos[0], recipient_pos[1])
+            deg = max(sender_deg, recip_deg)
+            if recipient_id in self.ecm_states:
+                deg = self.ecm_states[recipient_id].effective_jammer_degradation(deg)
+            if deg > 1.0:
+                loss_prob = min(1.0, loss_prob * deg)
 
         # Apply packet loss
         if self.rng.random() < loss_prob:
@@ -258,6 +270,15 @@ class CommsNetwork:
                 d_recip = math.hypot(vpos[0] - region.x, vpos[1] - region.y)
                 if d_relay < region.radius or d_recip < region.radius:
                     loss_prob = min(1.0, loss_prob * region.loss_multiplier)
+            # RF jammer degradation (Phase 11)
+            for jammer in self.jammers:
+                relay_deg = jammer.snr_degradation(relayer_pos[0], relayer_pos[1])
+                recip_deg = jammer.snr_degradation(vpos[0], vpos[1])
+                deg = max(relay_deg, recip_deg)
+                if vid in self.ecm_states:
+                    deg = self.ecm_states[vid].effective_jammer_degradation(deg)
+                if deg > 1.0:
+                    loss_prob = min(1.0, loss_prob * deg)
             if self.rng.random() < loss_prob:
                 continue
 

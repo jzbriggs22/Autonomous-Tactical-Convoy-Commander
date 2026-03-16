@@ -107,6 +107,11 @@ def _make_weight_fn(world: World, obj: PlanningObjective):
                 sc = min(abs(edge_slope) / 0.3, 1.0)  # normalise to [0,1]
             cost += obj.w_slope * sc * dist
 
+        # Jammer threat cost (Phase 11)
+        if obj.w_threat > 0:
+            threat = float(data.get("threat", 0.0))
+            cost += obj.w_threat * threat * dist
+
         return cost
 
     return weight

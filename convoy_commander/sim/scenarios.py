@@ -36,6 +36,10 @@ def get_scenario(name: str, **overrides: object) -> SimConfig:
         "heavy_rain": _heavy_rain,
         "winter_storm": _winter_storm,
         "weather_api": _weather_api,
+        # Phase 11 EW scenarios
+        "jammed_corridor": _jammed_corridor,
+        "mobile_jammer": _mobile_jammer,
+        "multi_threat": _multi_threat,
     }
     if name not in builders:
         raise ValueError(f"Unknown scenario: {name}. Available: {list(builders.keys())}")
@@ -86,6 +90,13 @@ def _apply_overrides(config: SimConfig, **overrides: object) -> SimConfig:
     if "temperature" in overrides and overrides["temperature"] is not None:
         config.weather.enabled = True
         config.weather.static_temperature_c = float(overrides["temperature"])  # type: ignore[arg-type]
+    # EW overrides (Phase 11)
+    if overrides.get("threats_enabled"):
+        config.ew.enabled = True
+    if "jammer_power" in overrides and overrides["jammer_power"] is not None:
+        config.ew.enabled = True
+    if "jammer_radius" in overrides and overrides["jammer_radius"] is not None:
+        config.ew.enabled = True
     return config
 
 
@@ -326,4 +337,44 @@ def _weather_api(**overrides: object) -> SimConfig:
     config.weather.weather_source = "api"
     config.weather.latitude = 52.52
     config.weather.longitude = 13.41
+    return _apply_overrides(config, **overrides)
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 EW scenarios
+# ---------------------------------------------------------------------------
+
+
+def _jammed_corridor(**overrides: object) -> SimConfig:
+    """Jammed corridor: static RF jammers blocking the route.
+
+    Two RF jammers and one GPS jammer placed along the convoy's path.
+    Tests detection, triangulation, ECM activation, and route avoidance.
+    """
+    config = SimConfig(duration=300.0)
+    config.ew.enabled = True
+    config.planning.w_threat = 0.8
+    return _apply_overrides(config, **overrides)
+
+
+def _mobile_jammer(**overrides: object) -> SimConfig:
+    """Mobile jammer: a moving jammer deployed at t=30s.
+
+    Tests adaptive ECM response as jammer position changes over time.
+    """
+    config = SimConfig(duration=300.0)
+    config.ew.enabled = True
+    config.planning.w_threat = 0.8
+    return _apply_overrides(config, **overrides)
+
+
+def _multi_threat(**overrides: object) -> SimConfig:
+    """Multi-threat: combined RF jammers, GPS jamming, and comms blackout.
+
+    Stress test for convoy operations under multiple simultaneous threats.
+    """
+    config = SimConfig(duration=300.0)
+    config.ew.enabled = True
+    config.planning.w_threat = 0.8
+    config.comms.max_range = 150.0
     return _apply_overrides(config, **overrides)

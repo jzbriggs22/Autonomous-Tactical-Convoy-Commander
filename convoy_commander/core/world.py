@@ -9,6 +9,7 @@ import networkx as nx
 import numpy as np
 
 from convoy_commander.core.config import WorldConfig
+from convoy_commander.ew.jammer import RFJammer
 
 
 @dataclass
@@ -113,6 +114,7 @@ class World:
         self.nogo_zones: list[NoGoZone] = []
         self.landmarks: list[Landmark] = []
         self.spoof_regions: list[SpoofRegion] = []
+        self.jammers: list[RFJammer] = []
         self.road_graph: nx.Graph = nx.Graph()
 
         # Elevation grid (None when no DEM loaded)
@@ -690,3 +692,53 @@ class World:
             if math.hypot(lm.x - x, lm.y - y) <= lm.detection_range:
                 result.append(lm)
         return result
+
+    # ------------------------------------------------------------------
+    # Electronic warfare (Phase 11)
+    # ------------------------------------------------------------------
+
+    def add_jammer(self, jammer: RFJammer) -> None:
+        """Add an RF jammer to the world."""
+        jammer._world_w = self.width
+        jammer._world_h = self.height
+        self.jammers.append(jammer)
+
+    def get_jammer_degradation(self, px: float, py: float) -> float:
+        """Return combined SNR loss multiplier from all jammers at position.
+
+        Returns 1.0 (no degradation) if no jammers affect this position.
+        """
+        max_deg = 1.0
+        for j in self.jammers:
+            deg = j.snr_degradation(px, py)
+            if deg > max_deg:
+                max_deg = deg
+        return max_deg
+
+    def is_gps_jammed(self, px: float, py: float) -> bool:
+        """Return True if any GPS jammer covers this position."""
+        for j in self.jammers:
+            if j.gps_denied_at(px, py):
+                return True
+        return False
+
+    def annotate_edge_threat(self) -> None:
+        """Annotate road graph edges with jammer threat score in [0, 1].
+
+        Same inverse-distance pattern as ``_annotate_edge_risk()``.
+        Called after jammers are placed or triangulated to update costs.
+        """
+        if not self.jammers:
+            return
+        for u, v in self.road_graph.edges():
+            pos_u = self.road_graph.nodes[u]["pos"]
+            pos_v = self.road_graph.nodes[v]["pos"]
+            mid_x = (pos_u[0] + pos_v[0]) * 0.5
+            mid_y = (pos_u[1] + pos_v[1]) * 0.5
+
+            threat = 0.0
+            for j in self.jammers:
+                d = math.hypot(mid_x - j.x, mid_y - j.y)
+                if d < j.radius:
+                    threat = max(threat, 1.0 - d / j.radius)
+            self.road_graph[u][v]["threat"] = min(1.0, threat)

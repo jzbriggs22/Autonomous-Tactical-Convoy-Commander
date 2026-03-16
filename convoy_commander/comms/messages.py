@@ -14,6 +14,7 @@ class MessageType(Enum):
     LEADER_HEARTBEAT = auto()  # heartbeat from leader
     CONSENSUS = auto()  # formation consensus
     WAYPOINT_BID = auto()  # auction bid for waypoint allocation
+    BEARING_REPORT = auto()  # jammer bearing estimate for triangulation
 
 
 @dataclass
@@ -104,4 +105,25 @@ def make_waypoint_bid(
         sender_id=sender_id,
         timestamp=timestamp,
         payload={"waypoint_idx": waypoint_idx, "bid_value": bid_value},
+    )
+
+
+def make_bearing_report(
+    sender_id: int,
+    timestamp: float,
+    bearing_rad: float,
+    rssi_anomaly: float,
+    vehicle_x: float,
+    vehicle_y: float,
+) -> Message:
+    return Message(
+        msg_type=MessageType.BEARING_REPORT,
+        sender_id=sender_id,
+        timestamp=timestamp,
+        payload={
+            "bearing_rad": bearing_rad,
+            "rssi_anomaly": rssi_anomaly,
+            "vehicle_x": vehicle_x,
+            "vehicle_y": vehicle_y,
+        },
     )
