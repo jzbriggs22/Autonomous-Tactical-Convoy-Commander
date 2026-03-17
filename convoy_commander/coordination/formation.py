@@ -46,9 +46,10 @@ def compute_formation_correction(
         formation_error = np.array([desired_x, desired_y]) - my_pos
         error_mag = float(np.linalg.norm(formation_error))
 
-        if error_mag > 1.0:
-            # Proportional correction with stronger gain for large errors
-            gain = min(1.5, error_mag / (spacing * 0.7))
+        if error_mag > 2.0:
+            # Proportional correction with moderate gain — avoid overpowering
+            # goal-tracking when formation error is small
+            gain = min(1.0, error_mag / (spacing * 1.0))
             correction = (formation_error / error_mag) * gain
 
         # Heading alignment

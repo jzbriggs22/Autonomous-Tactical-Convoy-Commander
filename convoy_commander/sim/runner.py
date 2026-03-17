@@ -151,6 +151,13 @@ class SimRunner:
         self._comms_lost_flags: dict[int, bool] = {v.id: False for v in self.vehicles}
         # Per-vehicle fuel-low tracking
         self._fuel_low_logged: set[int] = set()
+        # Near-miss cooldown: {(vid_a, vid_b): last_logged_time}
+        # Only count a near miss once per pair per cooldown window (1s)
+        self._near_miss_cooldown: dict[tuple[int, int], float] = {}
+        self._near_miss_cooldown_s: float = 1.0
+        # Stuck detection: track how long each vehicle has been near-zero speed
+        self._stuck_timers: dict[int, float] = {v.id: 0.0 for v in self.vehicles}
+        self._stuck_threshold: float = 5.0  # seconds at near-zero before waypoint skip
 
         # Comms blackout scenario: add blackout region to the comms network
         if config.scenario == "comms_blackout":
@@ -386,16 +393,38 @@ class SimRunner:
                     if v.state.speed > max_safe and cmd.accel > 0:
                         cmd.accel = -v.vcfg.max_decel * 0.3
 
-                # Emergency braking: hard brake if any neighbor is within collision danger zone
+                # Emergency braking: only when actually converging toward another vehicle.
+                # Uses closing speed (negative = diverging) to avoid deadlocking
+                # stationary vehicles that happen to be within min_separation.
                 collision_r = self.config.coordination.collision_radius
                 for vv in self.vehicles:
                     if vv.id != v.id and vv.is_operational:
                         d = v.state.distance_to(vv.state)
-                        if d < collision_r * 2.0:
+                        # Compute closing speed (positive = converging)
+                        dx = vv.state.x - v.state.x
+                        dy = vv.state.y - v.state.y
+                        if d > 0.1:
+                            # Project velocity difference onto line between vehicles
+                            nx, ny = dx / d, dy / d
+                            v_rel = (
+                                (v.state.speed * math.cos(v.state.heading)
+                                 - vv.state.speed * math.cos(vv.state.heading)) * nx
+                                + (v.state.speed * math.sin(v.state.heading)
+                                   - vv.state.speed * math.sin(vv.state.heading)) * ny
+                            )
+                        else:
+                            v_rel = v.state.speed  # very close: treat as converging
+
+                        if d < collision_r * 1.3:
+                            # Imminent collision: always brake hard
                             cmd.accel = -v.vcfg.max_decel * 0.8
                             break
-                        elif d < self.config.coordination.min_separation:
+                        elif d < collision_r * 2.0 and v_rel > 0.5:
+                            # Close and converging: moderate brake
                             cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.4)
+                        elif d < self.config.coordination.min_separation and v_rel > 1.0:
+                            # Within min sep and closing fast: gentle brake
+                            cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.15)
 
                 v.step(cmd, dt)
 
@@ -417,6 +446,22 @@ class SimRunner:
 
                 # Check waypoint advance
                 self._advance_waypoint(v)
+
+                # Stuck detection: skip waypoint if vehicle near-zero speed too long
+                if v.state.speed < 0.5 and v.status == VehicleStatus.ACTIVE:
+                    self._stuck_timers[v.id] += dt
+                    if self._stuck_timers[v.id] >= self._stuck_threshold:
+                        self._stuck_timers[v.id] = 0.0
+                        if v.waypoints and v.current_waypoint_idx < len(v.waypoints) - 1:
+                            v.current_waypoint_idx += 1
+                            self.event_log.log(
+                                current_time, EventKind.SCENARIO_EVENT, Severity.INFO,
+                                vehicle_id=v.id,
+                                message=f"Vehicle {v.id} stuck — skipping to waypoint "
+                                        f"{v.current_waypoint_idx}",
+                            )
+                else:
+                    self._stuck_timers[v.id] = 0.0
 
                 # Check arrival
                 if v.has_reached_destination():
@@ -1123,12 +1168,18 @@ class SimRunner:
         return v.assigned_destination
 
     def _advance_waypoint(self, v: Vehicle) -> None:
-        """Advance to next waypoint if close enough."""
+        """Advance to next waypoint if close enough.
+
+        Uses a speed-adaptive radius: faster vehicles can advance earlier
+        to avoid overshooting and circling back.
+        """
         if not v.waypoints or v.current_waypoint_idx >= len(v.waypoints):
             return
         wp = v.waypoints[v.current_waypoint_idx]
         dist = math.hypot(v.state.x - wp[0], v.state.y - wp[1])
-        if dist < 15.0:
+        # Base 15m + speed-proportional bonus (at 12m/s → 21m threshold)
+        threshold = 15.0 + v.state.speed * 0.5
+        if dist < threshold:
             v.current_waypoint_idx += 1
 
     def _rebuild_spatial_grids(self) -> None:
@@ -1173,14 +1224,18 @@ class SimRunner:
                         vehicle_a=v.id, vehicle_b=other.id, distance=dist,
                     )
                 elif dist < min_sep:
-                    v.near_miss_count += 1
-                    other.near_miss_count += 1
-                    self.event_log.log(
-                        t, EventKind.NEAR_MISS, Severity.WARNING,
-                        message=f"Near miss V{v.id}–V{other.id} "
-                                f"(dist={dist:.2f}m < min_sep={min_sep:.1f}m)",
-                        vehicle_a=v.id, vehicle_b=other.id, distance=dist,
-                    )
+                    # Cooldown: only count once per pair per cooldown window
+                    last_logged = self._near_miss_cooldown.get(pair, -999.0)
+                    if t - last_logged >= self._near_miss_cooldown_s:
+                        v.near_miss_count += 1
+                        other.near_miss_count += 1
+                        self._near_miss_cooldown[pair] = t
+                        self.event_log.log(
+                            t, EventKind.NEAR_MISS, Severity.WARNING,
+                            message=f"Near miss V{v.id}–V{other.id} "
+                                    f"(dist={dist:.2f}m < min_sep={min_sep:.1f}m)",
+                            vehicle_a=v.id, vehicle_b=other.id, distance=dist,
+                        )
 
     def _track_spacing_errors(self, t: float) -> None:
         """Track per-vehicle spacing errors for string stability computation."""

@@ -138,6 +138,10 @@ class MultiConvoyRunner:
         self._split_count = 0
         self._right_of_way_yields = 0
 
+        # Near-miss cooldown: {(vid_a, vid_b): last_logged_time}
+        self._near_miss_cooldown: dict[tuple[int, int], float] = {}
+        self._near_miss_cooldown_s: float = 1.0
+
         # Scenario event flags
         self._split_triggered = False
 
@@ -604,16 +608,31 @@ class MultiConvoyRunner:
                 if v.state.speed > max_safe and cmd.accel > 0:
                     cmd.accel = -v.vcfg.max_decel * 0.3
 
-            # Emergency braking for nearby vehicles (any convoy)
+            # Emergency braking: only when converging toward another vehicle.
             collision_r = base.coordination.collision_radius
             for vv in self.all_vehicles:
                 if vv.id != v.id and vv.is_operational:
                     d = v.state.distance_to(vv.state)
-                    if d < collision_r * 2.0:
+                    dx = vv.state.x - v.state.x
+                    dy = vv.state.y - v.state.y
+                    if d > 0.1:
+                        nx, ny = dx / d, dy / d
+                        v_rel = (
+                            (v.state.speed * math.cos(v.state.heading)
+                             - vv.state.speed * math.cos(vv.state.heading)) * nx
+                            + (v.state.speed * math.sin(v.state.heading)
+                               - vv.state.speed * math.sin(vv.state.heading)) * ny
+                        )
+                    else:
+                        v_rel = v.state.speed
+
+                    if d < collision_r * 1.3:
                         cmd.accel = -v.vcfg.max_decel * 0.8
                         break
-                    elif d < base.coordination.min_separation:
+                    elif d < collision_r * 2.0 and v_rel > 0.5:
                         cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.4)
+                    elif d < base.coordination.min_separation and v_rel > 1.0:
+                        cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.15)
 
             v.step(cmd, dt)
 
@@ -699,19 +718,23 @@ class MultiConvoyRunner:
                         vehicle_a=v.id, vehicle_b=other.id, distance=dist,
                     )
                 elif dist < min_sep:
-                    v.near_miss_count += 1
-                    other.near_miss_count += 1
-                    if same_convoy:
-                        kind = EventKind.NEAR_MISS
-                    else:
-                        kind = EventKind.INTER_CONVOY_NEAR_MISS
-                    self.event_log.log(
-                        t, kind, Severity.WARNING,
-                        message=f"Near miss V{v.id}(c{v.convoy_id})–"
-                                f"V{other.id}(c{other.convoy_id}) "
-                                f"dist={dist:.2f}m",
-                        vehicle_a=v.id, vehicle_b=other.id, distance=dist,
-                    )
+                    # Cooldown: only count once per pair per cooldown window
+                    last_logged = self._near_miss_cooldown.get(pair, -999.0)
+                    if t - last_logged >= self._near_miss_cooldown_s:
+                        v.near_miss_count += 1
+                        other.near_miss_count += 1
+                        self._near_miss_cooldown[pair] = t
+                        if same_convoy:
+                            kind = EventKind.NEAR_MISS
+                        else:
+                            kind = EventKind.INTER_CONVOY_NEAR_MISS
+                        self.event_log.log(
+                            t, kind, Severity.WARNING,
+                            message=f"Near miss V{v.id}(c{v.convoy_id})–"
+                                    f"V{other.id}(c{other.convoy_id}) "
+                                    f"dist={dist:.2f}m",
+                            vehicle_a=v.id, vehicle_b=other.id, distance=dist,
+                        )
 
     # ------------------------------------------------------------------
     # Safety helpers
@@ -785,10 +808,15 @@ class MultiConvoyRunner:
         return v.assigned_destination
 
     def _advance_waypoint(self, v: Vehicle) -> None:
-        """Advance to next waypoint if close enough."""
+        """Advance to next waypoint if close enough.
+
+        Uses a speed-adaptive radius: faster vehicles can advance earlier
+        to avoid overshooting and circling back.
+        """
         if not v.waypoints or v.current_waypoint_idx >= len(v.waypoints):
             return
         wp = v.waypoints[v.current_waypoint_idx]
         dist = math.hypot(v.state.x - wp[0], v.state.y - wp[1])
-        if dist < 15.0:
+        threshold = 15.0 + v.state.speed * 0.5
+        if dist < threshold:
             v.current_waypoint_idx += 1

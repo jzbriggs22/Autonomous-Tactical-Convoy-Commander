@@ -38,12 +38,12 @@ _DWA_N_SPEED = 9           # speed samples
 _DWA_N_OMEGA = 13          # turn-rate samples
 _DWA_HORIZON = 0.5         # forward simulation horizon (s)
 _DWA_SIM_STEPS = 5         # steps within horizon
-_DWA_ALPHA = 0.30          # heading score weight
-_DWA_BETA = 0.40           # clearance score weight (prioritize safety)
-_DWA_GAMMA = 0.08          # velocity score weight
-_DWA_DELTA = 0.22          # corridor adherence weight (Phase 6)
-_DWA_MIN_CLEARANCE = 8.0   # m — trajectory is invalid if clearance drops below this
-_DWA_MIN_SCORE = 0.05      # minimum score to accept DWA result (else use fallback)
+_DWA_ALPHA = 0.35          # heading score weight (increased: prioritise reaching goal)
+_DWA_BETA = 0.30           # clearance score weight (reduced: less conservative)
+_DWA_GAMMA = 0.15          # velocity score weight (increased: prefer faster trajectories)
+_DWA_DELTA = 0.20          # corridor adherence weight (Phase 6)
+_DWA_MIN_CLEARANCE = 5.0   # m — trajectory is invalid if clearance drops below this
+_DWA_MIN_SCORE = 0.03      # minimum score to accept DWA result (else use fallback)
 
 
 def compute_command(
@@ -76,9 +76,12 @@ def compute_command(
     max_omega = vehicle.vcfg.max_turn_rate
     dwa_dt = _DWA_HORIZON / _DWA_SIM_STEPS
 
-    # Dynamic window: reachable speeds in one step
-    v_min = max(0.0, cur_speed - max_decel * dt)
-    v_max = min(max_speed, cur_speed + max_accel * dt)
+    # Dynamic window: reachable speeds over the planning horizon.
+    # Using the full horizon (not just one dt) prevents deadlock when
+    # starting from zero speed — the vehicle can plan trajectories at
+    # speeds it will reach partway through the horizon.
+    v_min = max(0.0, cur_speed - max_decel * _DWA_HORIZON)
+    v_max = min(max_speed, cur_speed + max_accel * _DWA_HORIZON)
 
     best_score = -1.0
     best_cmd = VehicleCommand(accel=0.0, turn_rate=0.0)
@@ -169,7 +172,7 @@ def _min_clearance(
         if other.id == own_id or not other.is_operational:
             continue
         d = math.hypot(x - other.estimator.state.x, y - other.estimator.state.y)
-        clr = min(clr, max(0.0, d - 6.0))
+        clr = min(clr, max(0.0, d - 4.0))  # 4m buffer (vehicle half-diagonal ~3.25m)
     return clr
 
 
@@ -256,8 +259,18 @@ def _potential_field_command(
                 route_pull = route_pull / best_d
                 repulse += route_pull * min(2.0, corridor_dist / corridor_width) * -30.0 * -1
 
-    total_force = attract * 5.0 + repulse
+    total_force = attract * 8.0 + repulse
     force_mag = float(np.linalg.norm(total_force))
+
+    # Stuck escape: when force nearly cancels out (local minimum) and vehicle
+    # is slow, add a lateral perturbation to break the deadlock.
+    if force_mag < 0.5 and vehicle.state.speed < 1.0:
+        # Perpendicular to goal direction — deterministic based on vehicle id
+        perp_sign = 1.0 if vehicle.id % 2 == 0 else -1.0
+        perp = np.array([-attract[1], attract[0]]) * perp_sign
+        total_force += perp * 3.0
+        force_mag = float(np.linalg.norm(total_force))
+
     if force_mag > 0:
         total_force /= force_mag
 
@@ -266,8 +279,8 @@ def _potential_field_command(
     turn_rate = 2.5 * heading_error
 
     max_speed = vehicle.effective_max_speed
-    heading_factor = max(0.1, 1.0 - abs(heading_error) / math.pi)
-    approach_factor = min(1.0, target_dist / 30.0)
+    heading_factor = max(0.2, 1.0 - abs(heading_error) / (math.pi * 1.2))
+    approach_factor = min(1.0, target_dist / 20.0)
     obstacle_factor = 1.0
     for obs in world.obstacles:
         d = math.hypot(est.x - obs.x, est.y - obs.y) - obs.radius
