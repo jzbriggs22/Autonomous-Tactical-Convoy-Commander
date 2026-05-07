@@ -40,7 +40,7 @@ from convoy_commander.metrics.collector import MetricsCollector
 from convoy_commander.planning.global_planner import plan_route
 from convoy_commander.stamp import ReproStamp, collect_stamp
 from convoy_commander.planning.local_planner import compute_command
-from convoy_commander.vehicles.vehicle import CommsMode, Vehicle, VehicleStatus
+from convoy_commander.vehicles.vehicle import CommsMode, Vehicle, VehicleCommand, VehicleStatus
 from convoy_commander.ew.detection import BearingEstimate, ThreatDetector
 from convoy_commander.ew.ecm import ECMState
 from convoy_commander.ew.jammer import RFJammer
@@ -158,6 +158,17 @@ class SimRunner:
         # Stuck detection: track how long each vehicle has been near-zero speed
         self._stuck_timers: dict[int, float] = {v.id: 0.0 for v in self.vehicles}
         self._stuck_threshold: float = 5.0  # seconds at near-zero before waypoint skip
+        # Collision-triggered replanning: track recent collisions per vehicle
+        self._collision_window: dict[int, list[float]] = {v.id: [] for v in self.vehicles}
+        self._collision_replan_threshold: int = 8  # collisions in window triggers replan
+        self._collision_window_duration: float = 3.0  # seconds
+        self._last_replan_time: dict[int, float] = {v.id: -999.0 for v in self.vehicles}
+        self._replan_cooldown: float = 8.0  # min seconds between replans per vehicle
+        # Track collision partners: {vid: {partner_vid: count_in_window}}
+        self._collision_partners: dict[int, dict[int, int]] = {v.id: {} for v in self.vehicles}
+        # Vehicles ordered to reverse away from collision partner
+        self._hold_position_until: dict[int, float] = {}
+        self._hold_reverse_target: dict[int, tuple[float, float]] = {}  # target to reverse toward
 
         # Comms blackout scenario: add blackout region to the comms network
         if config.scenario == "comms_blackout":
@@ -344,17 +355,40 @@ class SimRunner:
                 if not v.is_operational:
                     continue
 
+                # Hold/reverse: vehicle ordered to move away from collision partner
+                if current_time < self._hold_position_until.get(v.id, 0.0):
+                    rev_target = self._hold_reverse_target.get(v.id)
+                    if rev_target is not None:
+                        neighbors = [vv for vv in self.vehicles if vv.id != v.id]
+                        cmd = compute_command(v, rev_target, self.world, neighbors, dt,
+                                              stuck_time=self._stuck_timers[v.id])
+                    else:
+                        cmd = VehicleCommand(accel=-v.vcfg.max_decel * 0.5, turn_rate=0.0)
+                    v.step(cmd, dt)
+                    self._enforce_safety_envelope(v, current_time)
+                    self._advance_waypoint(v)
+                    if v.has_reached_destination() and v.status != VehicleStatus.ARRIVED:
+                        v.status = VehicleStatus.ARRIVED
+                        v.state.speed = 0.0
+                        self.collector.record_arrival(v.id, current_time)
+                    continue
+
                 # Get current waypoint target
                 target = self._get_current_target(v)
                 if target is None:
                     continue
 
                 # Formation correction — use CBBA slot if available
+                # Suppress formation correction entirely when vehicle is
+                # accumulating collisions (scatter mode)
+                recent_collisions = len(self._collision_window.get(v.id, []))
+                in_scatter_mode = recent_collisions >= 4
+
                 if self.config.use_cbba and v.id in self._cbba_slots:
                     formation_idx = self._cbba_slots[v.id]
                 else:
                     formation_idx = get_formation_index(v.id, leader.id if leader else None, operational_ids)
-                if leader and not v.is_leader:
+                if leader and not v.is_leader and not in_scatter_mode:
                     correction = compute_formation_correction(
                         v, leader,
                         [vv for vv in self.vehicles if vv.id != v.id and vv.is_operational],
@@ -373,7 +407,8 @@ class SimRunner:
 
                 # Compute and apply command
                 neighbors = [vv for vv in self.vehicles if vv.id != v.id]
-                cmd = compute_command(v, target, self.world, neighbors, dt)
+                cmd = compute_command(v, target, self.world, neighbors, dt,
+                                      stuck_time=self._stuck_timers[v.id])
 
                 # Wind perturbation on steering
                 if self._weather_effects is not None and self._weather_state is not None:
@@ -451,15 +486,21 @@ class SimRunner:
                 if v.state.speed < 0.5 and v.status == VehicleStatus.ACTIVE:
                     self._stuck_timers[v.id] += dt
                     if self._stuck_timers[v.id] >= self._stuck_threshold:
-                        self._stuck_timers[v.id] = 0.0
                         if v.waypoints and v.current_waypoint_idx < len(v.waypoints) - 1:
-                            v.current_waypoint_idx += 1
+                            # Skip multiple waypoints if stuck repeatedly
+                            skip_count = min(3, len(v.waypoints) - 1 - v.current_waypoint_idx)
+                            v.current_waypoint_idx += skip_count
+                            self._stuck_timers[v.id] = 0.0
                             self.event_log.log(
                                 current_time, EventKind.SCENARIO_EVENT, Severity.INFO,
                                 vehicle_id=v.id,
-                                message=f"Vehicle {v.id} stuck — skipping to waypoint "
-                                        f"{v.current_waypoint_idx}",
+                                message=f"Vehicle {v.id} stuck — skipping {skip_count} "
+                                        f"waypoint(s) to idx {v.current_waypoint_idx}",
                             )
+                        else:
+                            # No more waypoints to skip; keep timer running so
+                            # DWA relaxes clearance constraints
+                            pass
                 else:
                     self._stuck_timers[v.id] = 0.0
 
@@ -1217,6 +1258,13 @@ class SimRunner:
                 if dist < collision_r:
                     v.collision_count += 1
                     other.collision_count += 1
+                    self._collision_window[v.id].append(t)
+                    self._collision_window[other.id].append(t)
+                    # Track collision partners
+                    vp = self._collision_partners.setdefault(v.id, {})
+                    vp[other.id] = vp.get(other.id, 0) + 1
+                    op = self._collision_partners.setdefault(other.id, {})
+                    op[v.id] = op.get(v.id, 0) + 1
                     self.event_log.log(
                         t, EventKind.COLLISION, Severity.CRITICAL,
                         message=f"COLLISION between V{v.id} and V{other.id} "
@@ -1236,6 +1284,123 @@ class SimRunner:
                                     f"(dist={dist:.2f}m < min_sep={min_sep:.1f}m)",
                             vehicle_a=v.id, vehicle_b=other.id, distance=dist,
                         )
+
+        # Check for collision-triggered replanning
+        self._check_collision_replan(t)
+
+    def _check_collision_replan(self, t: float) -> None:
+        """Replan route for vehicles with excessive recent collisions.
+
+        When two vehicles repeatedly collide with each other, the higher-ID
+        vehicle holds position while the lower-ID one replans with a large
+        lateral offset to create separation.
+        """
+        # First pass: identify vehicles needing replan and their actions
+        actions: list[tuple[Vehicle, str, int | None]] = []  # (vehicle, action_type, partner_id)
+
+        for v in self.vehicles:
+            if not v.is_operational or v.assigned_destination is None:
+                continue
+            if t < self._hold_position_until.get(v.id, 0.0):
+                continue
+
+            window = self._collision_window[v.id]
+            cutoff = t - self._collision_window_duration
+            self._collision_window[v.id] = [ts for ts in window if ts > cutoff]
+            window = self._collision_window[v.id]
+
+            if (len(window) >= self._collision_replan_threshold
+                    and t - self._last_replan_time[v.id] > self._replan_cooldown):
+
+                partners = self._collision_partners.get(v.id, {})
+                top_partner_id = max(partners, key=partners.get) if partners else None
+                top_partner_count = partners.get(top_partner_id, 0) if top_partner_id is not None else 0
+
+                if top_partner_count >= 5 and top_partner_id is not None:
+                    if v.id > top_partner_id:
+                        actions.append((v, "hold", top_partner_id))
+                    else:
+                        actions.append((v, "pair_replan", top_partner_id))
+                else:
+                    actions.append((v, "normal_replan", None))
+
+        # Second pass: execute actions (partner dicts are stable during iteration)
+        for v, action, partner_id in actions:
+            self._last_replan_time[v.id] = t
+            window = self._collision_window[v.id]
+
+            if action == "hold":
+                self._hold_position_until[v.id] = t + 8.0
+                # Set reverse target: move away from partner
+                partner_v = next((vv for vv in self.vehicles if vv.id == partner_id), None)
+                if partner_v is not None:
+                    dx = v.state.x - partner_v.state.x
+                    dy = v.state.y - partner_v.state.y
+                    d = math.hypot(dx, dy)
+                    if d > 0.1:
+                        # Move 60m away from partner, perpendicular to goal direction
+                        rev_x = v.state.x + (dx / d) * 60.0
+                        rev_y = v.state.y + (dy / d) * 60.0
+                    else:
+                        rev_x = v.state.x + 60.0
+                        rev_y = v.state.y
+                    # Clamp to world bounds
+                    rev_x = max(20.0, min(self.world.width - 20.0, rev_x))
+                    rev_y = max(20.0, min(self.world.height - 20.0, rev_y))
+                    self._hold_reverse_target[v.id] = (rev_x, rev_y)
+                    # Also replan route for after the reverse
+                    route = plan_route(
+                        self.world, rev_x, rev_y,
+                        v.assigned_destination[0], v.assigned_destination[1],
+                        objective=self.config.planning,
+                    )
+                    v.waypoints = [(rev_x, rev_y)] + route
+                    v.current_waypoint_idx = 0
+                self._collision_window[v.id] = []
+                self._collision_partners[v.id] = {}
+                self.event_log.log(
+                    t, EventKind.ROUTE_REPLAN, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} reversing away from V{partner_id} for 8s",
+                )
+                continue
+
+            if action == "pair_replan":
+                dx = v.assigned_destination[0] - v.state.x
+                dy = v.assigned_destination[1] - v.state.y
+                d = math.hypot(dx, dy)
+                if d > 1.0:
+                    lateral_sign = 1.0 if v.id % 2 == 0 else -1.0
+                    offset_x = v.state.x + (-dy / d) * lateral_sign * 40.0
+                    offset_y = v.state.y + (dx / d) * lateral_sign * 40.0
+                else:
+                    offset_x = v.state.x + 40.0
+                    offset_y = v.state.y
+                self._collision_partners[v.id] = {}
+            else:
+                dx = v.assigned_destination[0] - v.state.x
+                dy = v.assigned_destination[1] - v.state.y
+                d = math.hypot(dx, dy)
+                if d > 1.0:
+                    lateral_sign = 1.0 if v.id % 2 == 0 else -1.0
+                    offset_x = v.state.x + (dx / d) * 5.0 + (-dy / d) * lateral_sign * 15.0
+                    offset_y = v.state.y + (dy / d) * 5.0 + (dx / d) * lateral_sign * 15.0
+                else:
+                    offset_x, offset_y = v.state.x, v.state.y
+
+            route = plan_route(
+                self.world,
+                offset_x, offset_y,
+                v.assigned_destination[0], v.assigned_destination[1],
+                objective=self.config.planning,
+            )
+            v.waypoints = route
+            v.current_waypoint_idx = 0
+            self._collision_window[v.id] = []
+            self.event_log.log(
+                t, EventKind.ROUTE_REPLAN, Severity.WARNING, vehicle_id=v.id,
+                message=f"Vehicle {v.id} {'pair' if action == 'pair_replan' else 'collision'}-triggered replan "
+                        f"({len(window)} collisions in {self._collision_window_duration}s)",
+            )
 
     def _track_spacing_errors(self, t: float) -> None:
         """Track per-vehicle spacing errors for string stability computation."""

@@ -142,6 +142,18 @@ class MultiConvoyRunner:
         self._near_miss_cooldown: dict[tuple[int, int], float] = {}
         self._near_miss_cooldown_s: float = 1.0
 
+        # Stuck timers and collision-triggered replan tracking
+        self._stuck_timers: dict[int, float] = {v.id: 0.0 for v in self.all_vehicles}
+        self._stuck_threshold: float = 5.0
+        self._collision_window: dict[int, list[float]] = {v.id: [] for v in self.all_vehicles}
+        self._collision_replan_threshold: int = 8
+        self._collision_window_duration: float = 3.0
+        self._last_replan_time: dict[int, float] = {v.id: -999.0 for v in self.all_vehicles}
+        self._replan_cooldown: float = 8.0
+        self._collision_partners: dict[int, dict[int, int]] = {v.id: {} for v in self.all_vehicles}
+        self._hold_position_until: dict[int, float] = {}
+        self._hold_reverse_target: dict[int, tuple[float, float]] = {}
+
         # Scenario event flags
         self._split_triggered = False
 
@@ -564,19 +576,41 @@ class MultiConvoyRunner:
             if not v.is_operational:
                 continue
 
+            # Hold/reverse: vehicle ordered to move away from collision partner
+            if t < self._hold_position_until.get(v.id, 0.0):
+                from convoy_commander.vehicles.vehicle import VehicleCommand as _VC
+                rev_target = self._hold_reverse_target.get(v.id)
+                if rev_target is not None:
+                    neighbors = [vv for vv in self.all_vehicles if vv.id != v.id]
+                    cmd = compute_command(v, rev_target, self.world, neighbors, dt,
+                                          stuck_time=self._stuck_timers.get(v.id, 0.0))
+                else:
+                    cmd = _VC(accel=-v.vcfg.max_decel * 0.5, turn_rate=0.0)
+                v.step(cmd, dt)
+                self._enforce_safety_envelope(v, t)
+                self._advance_waypoint(v)
+                if v.has_reached_destination() and v.status != VehicleStatus.ARRIVED:
+                    v.status = VehicleStatus.ARRIVED
+                    v.state.speed = 0.0
+                    group.collector.record_arrival(v.id, t)
+                continue
+
             # Get current waypoint target
             target = self._get_current_target(v)
             if target is None:
                 continue
 
-            # Formation correction
+            # Formation correction — suppress in scatter mode
+            recent_collisions = len(self._collision_window.get(v.id, []))
+            in_scatter_mode = recent_collisions >= 4
+
             if base.use_cbba and v.id in group.cbba_slots:
                 formation_idx = group.cbba_slots[v.id]
             else:
                 formation_idx = get_formation_index(
                     v.id, leader.id if leader else None, operational_ids,
                 )
-            if leader and not v.is_leader:
+            if leader and not v.is_leader and not in_scatter_mode:
                 correction = compute_formation_correction(
                     v, leader,
                     [vv for vv in group.vehicles if vv.id != v.id and vv.is_operational],
@@ -596,7 +630,8 @@ class MultiConvoyRunner:
 
             # Compute command
             neighbors = [vv for vv in self.all_vehicles if vv.id != v.id]
-            cmd = compute_command(v, target, self.world, neighbors, dt)
+            cmd = compute_command(v, target, self.world, neighbors, dt,
+                                  stuck_time=self._stuck_timers.get(v.id, 0.0))
 
             # Apply yield speed factor
             if yield_factor < 1.0 and cmd.accel > 0:
@@ -641,6 +676,17 @@ class MultiConvoyRunner:
 
             # Waypoint advance
             self._advance_waypoint(v)
+
+            # Stuck detection
+            if v.state.speed < 0.5 and v.status == VehicleStatus.ACTIVE:
+                self._stuck_timers[v.id] = self._stuck_timers.get(v.id, 0.0) + dt
+                if self._stuck_timers[v.id] >= self._stuck_threshold:
+                    if v.waypoints and v.current_waypoint_idx < len(v.waypoints) - 1:
+                        skip_count = min(3, len(v.waypoints) - 1 - v.current_waypoint_idx)
+                        v.current_waypoint_idx += skip_count
+                        self._stuck_timers[v.id] = 0.0
+            else:
+                self._stuck_timers[v.id] = 0.0
 
             # Check arrival
             if v.has_reached_destination() and v.status != VehicleStatus.ARRIVED:
@@ -704,6 +750,12 @@ class MultiConvoyRunner:
                 if dist < collision_r:
                     v.collision_count += 1
                     other.collision_count += 1
+                    self._collision_window.setdefault(v.id, []).append(t)
+                    self._collision_window.setdefault(other.id, []).append(t)
+                    vp = self._collision_partners.setdefault(v.id, {})
+                    vp[other.id] = vp.get(other.id, 0) + 1
+                    op = self._collision_partners.setdefault(other.id, {})
+                    op[v.id] = op.get(v.id, 0) + 1
                     if same_convoy:
                         kind = EventKind.COLLISION
                     else:
@@ -735,6 +787,102 @@ class MultiConvoyRunner:
                                     f"dist={dist:.2f}m",
                             vehicle_a=v.id, vehicle_b=other.id, distance=dist,
                         )
+
+        # Check collision-triggered replanning
+        self._check_collision_replan(t)
+
+    def _check_collision_replan(self, t: float) -> None:
+        """Replan route for vehicles with excessive recent collisions."""
+        actions: list[tuple] = []  # (vehicle, action_type, partner_id)
+
+        for v in self.all_vehicles:
+            if not v.is_operational or v.assigned_destination is None:
+                continue
+            if t < self._hold_position_until.get(v.id, 0.0):
+                continue
+            window = self._collision_window.get(v.id, [])
+            cutoff = t - self._collision_window_duration
+            self._collision_window[v.id] = [ts for ts in window if ts > cutoff]
+            window = self._collision_window[v.id]
+
+            if (len(window) >= self._collision_replan_threshold
+                    and t - self._last_replan_time.get(v.id, -999.0) > self._replan_cooldown):
+
+                partners = self._collision_partners.get(v.id, {})
+                top_partner_id = max(partners, key=partners.get) if partners else None
+                top_partner_count = partners.get(top_partner_id, 0) if top_partner_id is not None else 0
+
+                if top_partner_count >= 5 and top_partner_id is not None:
+                    if v.id > top_partner_id:
+                        actions.append((v, "hold", top_partner_id))
+                    else:
+                        actions.append((v, "pair_replan", top_partner_id))
+                else:
+                    actions.append((v, "normal_replan", None))
+
+        for v, action, partner_id in actions:
+            self._last_replan_time[v.id] = t
+            window = self._collision_window[v.id]
+
+            if action == "hold":
+                self._hold_position_until[v.id] = t + 8.0
+                partner_v = next((vv for vv in self.all_vehicles if vv.id == partner_id), None)
+                if partner_v is not None:
+                    dx = v.state.x - partner_v.state.x
+                    dy = v.state.y - partner_v.state.y
+                    d = math.hypot(dx, dy)
+                    if d > 0.1:
+                        rev_x = v.state.x + (dx / d) * 60.0
+                        rev_y = v.state.y + (dy / d) * 60.0
+                    else:
+                        rev_x = v.state.x + 60.0
+                        rev_y = v.state.y
+                    rev_x = max(20.0, min(self.world.width - 20.0, rev_x))
+                    rev_y = max(20.0, min(self.world.height - 20.0, rev_y))
+                    self._hold_reverse_target[v.id] = (rev_x, rev_y)
+                    route = plan_route(
+                        self.world, rev_x, rev_y,
+                        v.assigned_destination[0], v.assigned_destination[1],
+                        objective=self.config.base.planning,
+                    )
+                    v.waypoints = [(rev_x, rev_y)] + route
+                    v.current_waypoint_idx = 0
+                self._collision_window[v.id] = []
+                self._collision_partners[v.id] = {}
+                continue
+
+            if action == "pair_replan":
+                dx = v.assigned_destination[0] - v.state.x
+                dy = v.assigned_destination[1] - v.state.y
+                d = math.hypot(dx, dy)
+                if d > 1.0:
+                    lateral_sign = 1.0 if v.id % 2 == 0 else -1.0
+                    offset_x = v.state.x + (-dy / d) * lateral_sign * 40.0
+                    offset_y = v.state.y + (dx / d) * lateral_sign * 40.0
+                else:
+                    offset_x = v.state.x + 40.0
+                    offset_y = v.state.y
+                self._collision_partners[v.id] = {}
+            else:
+                dx = v.assigned_destination[0] - v.state.x
+                dy = v.assigned_destination[1] - v.state.y
+                d = math.hypot(dx, dy)
+                if d > 1.0:
+                    lateral_sign = 1.0 if v.id % 2 == 0 else -1.0
+                    offset_x = v.state.x + (dx / d) * 5.0 + (-dy / d) * lateral_sign * 15.0
+                    offset_y = v.state.y + (dy / d) * 5.0 + (dx / d) * lateral_sign * 15.0
+                else:
+                    offset_x, offset_y = v.state.x, v.state.y
+
+            route = plan_route(
+                self.world,
+                offset_x, offset_y,
+                v.assigned_destination[0], v.assigned_destination[1],
+                objective=self.config.base.planning,
+            )
+            v.waypoints = route
+            v.current_waypoint_idx = 0
+            self._collision_window[v.id] = []
 
     # ------------------------------------------------------------------
     # Safety helpers

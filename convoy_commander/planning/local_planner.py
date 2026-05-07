@@ -52,6 +52,7 @@ def compute_command(
     world: World,
     neighbors: list[Vehicle],
     dt: float,
+    stuck_time: float = 0.0,
 ) -> VehicleCommand:
     """Compute a control command (DWA-lite with potential-field fallback).
 
@@ -75,6 +76,12 @@ def compute_command(
     max_decel = vehicle.vcfg.max_decel
     max_omega = vehicle.vcfg.max_turn_rate
     dwa_dt = _DWA_HORIZON / _DWA_SIM_STEPS
+
+    # When stuck for a while, progressively relax clearance to escape traps
+    effective_min_clearance = _DWA_MIN_CLEARANCE
+    if stuck_time > 2.0:
+        relax_factor = min(0.7, (stuck_time - 2.0) / 8.0)
+        effective_min_clearance = _DWA_MIN_CLEARANCE * (1.0 - relax_factor)
 
     # Dynamic window: reachable speeds over the planning horizon.
     # Using the full horizon (not just one dt) prevents deadlock when
@@ -101,7 +108,7 @@ def compute_command(
 
                 # Check clearance
                 clr = _min_clearance(sx, sy, world, neighbors, vehicle.id)
-                if clr < _DWA_MIN_CLEARANCE:
+                if clr < effective_min_clearance:
                     valid = False
                     break
                 min_clearance = min(min_clearance, clr)
@@ -148,7 +155,7 @@ def compute_command(
 
     # --- Potential-field fallback ---
     used_fallback = True
-    return _potential_field_command(vehicle, target, target_dist, world, neighbors, dt)
+    return _potential_field_command(vehicle, target, target_dist, world, neighbors, dt, stuck_time)
 
 
 def _min_clearance(
@@ -183,6 +190,7 @@ def _potential_field_command(
     world: World,
     neighbors: list[Vehicle],
     dt: float,
+    stuck_time: float = 0.0,
 ) -> VehicleCommand:
     """Pure potential-field command (fallback when DWA finds no valid path)."""
     est = vehicle.estimator.state
@@ -264,11 +272,13 @@ def _potential_field_command(
 
     # Stuck escape: when force nearly cancels out (local minimum) and vehicle
     # is slow, add a lateral perturbation to break the deadlock.
+    # Uses time-varying angle so the vehicle explores different directions.
     if force_mag < 0.5 and vehicle.state.speed < 1.0:
-        # Perpendicular to goal direction — deterministic based on vehicle id
-        perp_sign = 1.0 if vehicle.id % 2 == 0 else -1.0
-        perp = np.array([-attract[1], attract[0]]) * perp_sign
-        total_force += perp * 3.0
+        escape_strength = min(8.0, 3.0 + stuck_time * 1.0)
+        # Rotate escape direction over time to explore multiple escape routes
+        phase = (vehicle.id * 1.7 + stuck_time * 0.8) % (2.0 * math.pi)
+        escape_dir = np.array([math.cos(phase), math.sin(phase)])
+        total_force += escape_dir * escape_strength
         force_mag = float(np.linalg.norm(total_force))
 
     if force_mag > 0:
