@@ -10,18 +10,36 @@ from convoy_commander.vehicles.vehicle import Vehicle
 def allocate_waypoints_greedy(
     vehicles: list[Vehicle],
     destination: tuple[float, float],
+    *,
+    formation_radius: float = 42.0,
+    formation_spacing: float = 30.0,
 ) -> None:
-    """Simple distributed greedy allocation.
+    """Distributed greedy allocation with per-vehicle goal offsets.
 
-    All vehicles share the same destination (convoy mission).
-    Each vehicle gets the destination as its assigned goal.
-    In a more complex version, intermediate waypoints would be distributed
-    using CBBA-lite auction, but for convoy operations, all vehicles
-    share the same destination with formation offsets handled by coordination.
+    All vehicles share a high-level convoy destination, but each gets its
+    own arrival point in a deterministic NxN grid centred on ``destination``.
+    Spreading goals avoids the convergence pile-up at the 15m arrival
+    radius when many vehicles target the same point.
+
+    Slot assignment is by vehicle id so runs are reproducible.
     """
-    for v in vehicles:
-        if v.is_operational:
-            v.assigned_destination = destination
+    op = sorted(
+        [v for v in vehicles if v.is_operational],
+        key=lambda v: v.id,
+    )
+    if not op:
+        return
+    cols = max(1, int(math.ceil(math.sqrt(len(op)))))
+    half = (cols - 1) / 2.0
+    for k, v in enumerate(op):
+        ox = (k % cols - half) * formation_spacing
+        oy = (k // cols - half) * formation_spacing
+        mag = math.hypot(ox, oy)
+        if mag > formation_radius:
+            scale = formation_radius / mag
+            ox *= scale
+            oy *= scale
+        v.assigned_destination = (destination[0] + ox, destination[1] + oy)
 
 
 def allocate_multi_waypoints_greedy(

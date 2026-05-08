@@ -812,9 +812,19 @@ class MultiConvoyRunner:
                 top_partner_id = max(partners, key=partners.get) if partners else None
                 top_partner_count = partners.get(top_partner_id, 0) if top_partner_id is not None else 0
 
+                d_goal = float("inf")
+                if v.assigned_destination is not None:
+                    d_goal = math.hypot(
+                        v.state.x - v.assigned_destination[0],
+                        v.state.y - v.assigned_destination[1],
+                    )
+
                 if top_partner_count >= 5 and top_partner_id is not None:
                     if v.id > top_partner_id:
-                        actions.append((v, "hold", top_partner_id))
+                        if d_goal < 150.0:
+                            actions.append((v, "brake_hold", top_partner_id))
+                        else:
+                            actions.append((v, "hold", top_partner_id))
                     else:
                         actions.append((v, "pair_replan", top_partner_id))
                 else:
@@ -823,6 +833,15 @@ class MultiConvoyRunner:
         for v, action, partner_id in actions:
             self._last_replan_time[v.id] = t
             window = self._collision_window[v.id]
+
+            if action == "brake_hold":
+                self._hold_position_until[v.id] = t + 3.0
+                self._hold_reverse_target.pop(v.id, None)
+                self._collision_window[v.id] = []
+                self._collision_partners[v.id] = {}
+                if partner_id is not None:
+                    self._last_replan_time[partner_id] = -999.0
+                continue
 
             if action == "hold":
                 self._hold_position_until[v.id] = t + 8.0

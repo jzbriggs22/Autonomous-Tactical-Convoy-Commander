@@ -168,6 +168,10 @@ class WorldConfig(BaseModel):
         default=(30.0, 60.0), description="Min/max no-go zone radius m"
     )
     landmark_count: int = Field(default=8, ge=0, description="Number of landmarks for position fixes")
+    landmark_detection_range: float = Field(
+        default=50.0, gt=0,
+        description="Per-landmark detection range (m) used at world generation",
+    )
     spoof_region_count: int = Field(default=0, ge=0, description="Number of GPS spoofing regions")
     spoof_offset_max: float = Field(default=50.0, gt=0, description="Max GPS spoof offset magnitude m")
     poly_obstacle_count: int = Field(default=3, ge=0, description="Number of axis-aligned rectangle obstacles")

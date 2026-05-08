@@ -109,13 +109,21 @@ def _baseline(**overrides: object) -> SimConfig:
 
 
 def _gps_denied(**overrides: object) -> SimConfig:
-    """GPS denied: no GPS, IMU drift present."""
+    """GPS denied: no GPS, IMU drift, denser landmark net.
+
+    Compensates for GPS loss with higher landmark density and a more
+    permissive uncertainty threshold so vehicles keep moving while drift
+    accumulates between landmark fixes.
+    """
     config = SimConfig(
         gps_available=False,
         gps_intermittent_prob=0.0,
     )
     config.estimator.drift_rate = 0.08
     config.estimator.drift_bias_rate = 0.004
+    config.estimator.uncertainty_safe_threshold = 25.0
+    config.world.landmark_count = 24
+    config.world.landmark_detection_range = 75.0
     return _apply_overrides(config, **overrides)
 
 

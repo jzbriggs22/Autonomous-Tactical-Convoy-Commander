@@ -1316,9 +1316,21 @@ class SimRunner:
                 top_partner_id = max(partners, key=partners.get) if partners else None
                 top_partner_count = partners.get(top_partner_id, 0) if top_partner_id is not None else 0
 
+                # Distance to goal — drives near-goal yield behaviour
+                d_goal = float("inf")
+                if v.assigned_destination is not None:
+                    d_goal = math.hypot(
+                        v.state.x - v.assigned_destination[0],
+                        v.state.y - v.assigned_destination[1],
+                    )
+
                 if top_partner_count >= 5 and top_partner_id is not None:
                     if v.id > top_partner_id:
-                        actions.append((v, "hold", top_partner_id))
+                        # Near goal: brief brake-only freeze (no 60m reverse).
+                        if d_goal < 150.0:
+                            actions.append((v, "brake_hold", top_partner_id))
+                        else:
+                            actions.append((v, "hold", top_partner_id))
                     else:
                         actions.append((v, "pair_replan", top_partner_id))
                 else:
@@ -1328,6 +1340,23 @@ class SimRunner:
         for v, action, partner_id in actions:
             self._last_replan_time[v.id] = t
             window = self._collision_window[v.id]
+
+            if action == "brake_hold":
+                # Near goal: short freeze, no reverse.  Existing hold loop
+                # uses brake when no reverse target is set.
+                self._hold_position_until[v.id] = t + 3.0
+                self._hold_reverse_target.pop(v.id, None)
+                self._collision_window[v.id] = []
+                self._collision_partners[v.id] = {}
+                # Allow partner to lateral-replan immediately on next tick.
+                if partner_id is not None:
+                    self._last_replan_time[partner_id] = -999.0
+                self.event_log.log(
+                    t, EventKind.ROUTE_REPLAN, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} brake-holding near goal "
+                            f"(partner V{partner_id} will lateral-replan)",
+                )
+                continue
 
             if action == "hold":
                 self._hold_position_until[v.id] = t + 8.0

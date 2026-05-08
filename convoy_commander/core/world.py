@@ -320,7 +320,9 @@ class World:
         for _ in range(self.config.landmark_count):
             x = rng.uniform(50, self.width - 50)
             y = rng.uniform(50, self.height - 50)
-            self.landmarks.append(Landmark(x=x, y=y))
+            self.landmarks.append(
+                Landmark(x=x, y=y, detection_range=self.config.landmark_detection_range)
+            )
 
         # Spoof regions
         for _ in range(self.config.spoof_region_count):
@@ -532,7 +534,9 @@ class World:
         for _ in range(self.config.landmark_count):
             x = rng.uniform(50, self.width - 50)
             y = rng.uniform(50, self.height - 50)
-            self.landmarks.append(Landmark(x=x, y=y))
+            self.landmarks.append(
+                Landmark(x=x, y=y, detection_range=self.config.landmark_detection_range)
+            )
 
         # Annotate edges with risk score [0,1] based on proximity to hazards
         self._annotate_edge_risk()
