@@ -20,12 +20,13 @@ SCENARIOS = [
 ]
 MULTI_SCENARIOS = ["two_convoy_crossing", "convoy_merge"]
 SEEDS = [42, 7]
-DURATION = 60.0
+DURATION = 180.0
 NUM_VEHICLES = 8
 
 
 def run_single(scenario, seed):
-    config = get_scenario(scenario, seed=seed, vehicles=NUM_VEHICLES, duration=DURATION)
+    config = get_scenario(scenario, seed=seed, vehicles=NUM_VEHICLES)
+    config.duration = max(config.duration, DURATION)
     runner = SimRunner(config)
     t0 = time.time()
     result = runner.run()

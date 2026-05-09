@@ -179,7 +179,7 @@ def _min_clearance(
         if other.id == own_id or not other.is_operational:
             continue
         d = math.hypot(x - other.estimator.state.x, y - other.estimator.state.y)
-        clr = min(clr, max(0.0, d - 4.0))  # 4m buffer (vehicle half-diagonal ~3.25m)
+        clr = min(clr, max(0.0, d - 4.5))
     return clr
 
 
@@ -273,9 +273,8 @@ def _potential_field_command(
     # Stuck escape: when force nearly cancels out (local minimum) and vehicle
     # is slow, add a lateral perturbation to break the deadlock.
     # Uses time-varying angle so the vehicle explores different directions.
-    if force_mag < 0.5 and vehicle.state.speed < 1.0:
-        escape_strength = min(8.0, 3.0 + stuck_time * 1.0)
-        # Rotate escape direction over time to explore multiple escape routes
+    if vehicle.state.speed < 1.0 and stuck_time > 0.5:
+        escape_strength = min(12.0, 3.0 + stuck_time * 1.5)
         phase = (vehicle.id * 1.7 + stuck_time * 0.8) % (2.0 * math.pi)
         escape_dir = np.array([math.cos(phase), math.sin(phase)])
         total_force += escape_dir * escape_strength
@@ -308,7 +307,7 @@ def _potential_field_command(
             continue
         d = math.hypot(est.x - other.estimator.state.x, est.y - other.estimator.state.y)
         if d < min_sep * 2.0:
-            neighbor_factor = min(neighbor_factor, max(0.05, (d - collision_r) / (min_sep * 2.0 - collision_r)))
+            neighbor_factor = min(neighbor_factor, max(0.15, (d - collision_r) / (min_sep * 2.0 - collision_r)))
 
     desired_speed = max_speed * heading_factor * approach_factor * obstacle_factor * neighbor_factor
     speed_error = desired_speed - vehicle.state.speed

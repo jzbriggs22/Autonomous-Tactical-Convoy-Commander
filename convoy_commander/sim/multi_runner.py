@@ -142,11 +142,14 @@ class MultiConvoyRunner:
         self._near_miss_cooldown: dict[tuple[int, int], float] = {}
         self._near_miss_cooldown_s: float = 1.0
 
+        # Per-pair collision cooldown: one overlap = one event
+        self._collision_cooldown: dict[tuple[int, int], float] = {}
+        self._collision_cooldown_s: float = 0.5
         # Stuck timers and collision-triggered replan tracking
         self._stuck_timers: dict[int, float] = {v.id: 0.0 for v in self.all_vehicles}
         self._stuck_threshold: float = 5.0
         self._collision_window: dict[int, list[float]] = {v.id: [] for v in self.all_vehicles}
-        self._collision_replan_threshold: int = 8
+        self._collision_replan_threshold: int = 4
         self._collision_window_duration: float = 3.0
         self._last_replan_time: dict[int, float] = {v.id: -999.0 for v in self.all_vehicles}
         self._replan_cooldown: float = 8.0
@@ -663,6 +666,11 @@ class MultiConvoyRunner:
 
                     if d < collision_r * 1.3:
                         cmd.accel = -v.vcfg.max_decel * 0.8
+                        away_angle = math.atan2(-dy, -dx)
+                        steer_err = away_angle - v.state.heading
+                        steer_err = math.atan2(math.sin(steer_err), math.cos(steer_err))
+                        cmd.turn_rate = max(-v.vcfg.max_turn_rate,
+                                            min(v.vcfg.max_turn_rate, steer_err * 3.0))
                         break
                     elif d < collision_r * 2.0 and v_rel > 0.5:
                         cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.4)
@@ -748,27 +756,30 @@ class MultiConvoyRunner:
                 same_convoy = v.convoy_id == other.convoy_id
 
                 if dist < collision_r:
-                    v.collision_count += 1
-                    other.collision_count += 1
-                    self._collision_window.setdefault(v.id, []).append(t)
-                    self._collision_window.setdefault(other.id, []).append(t)
-                    vp = self._collision_partners.setdefault(v.id, {})
-                    vp[other.id] = vp.get(other.id, 0) + 1
-                    op = self._collision_partners.setdefault(other.id, {})
-                    op[v.id] = op.get(v.id, 0) + 1
-                    if same_convoy:
-                        kind = EventKind.COLLISION
-                    else:
-                        kind = EventKind.INTER_CONVOY_COLLISION
-                        self._inter_convoy_collisions += 1
-                    self.event_log.log(
-                        t, kind, Severity.CRITICAL,
-                        message=f"{'INTER-CONVOY ' if not same_convoy else ''}"
-                                f"COLLISION V{v.id}(c{v.convoy_id})–"
-                                f"V{other.id}(c{other.convoy_id}) "
-                                f"dist={dist:.2f}m",
-                        vehicle_a=v.id, vehicle_b=other.id, distance=dist,
-                    )
+                    last_col = self._collision_cooldown.get(pair, -999.0)
+                    if t - last_col >= self._collision_cooldown_s:
+                        v.collision_count += 1
+                        other.collision_count += 1
+                        self._collision_window.setdefault(v.id, []).append(t)
+                        self._collision_window.setdefault(other.id, []).append(t)
+                        vp = self._collision_partners.setdefault(v.id, {})
+                        vp[other.id] = vp.get(other.id, 0) + 1
+                        op = self._collision_partners.setdefault(other.id, {})
+                        op[v.id] = op.get(v.id, 0) + 1
+                        self._collision_cooldown[pair] = t
+                        if same_convoy:
+                            kind = EventKind.COLLISION
+                        else:
+                            kind = EventKind.INTER_CONVOY_COLLISION
+                            self._inter_convoy_collisions += 1
+                        self.event_log.log(
+                            t, kind, Severity.CRITICAL,
+                            message=f"{'INTER-CONVOY ' if not same_convoy else ''}"
+                                    f"COLLISION V{v.id}(c{v.convoy_id})–"
+                                    f"V{other.id}(c{other.convoy_id}) "
+                                    f"dist={dist:.2f}m",
+                            vehicle_a=v.id, vehicle_b=other.id, distance=dist,
+                        )
                 elif dist < min_sep:
                     # Cooldown: only count once per pair per cooldown window
                     last_logged = self._near_miss_cooldown.get(pair, -999.0)
@@ -819,7 +830,7 @@ class MultiConvoyRunner:
                         v.state.y - v.assigned_destination[1],
                     )
 
-                if top_partner_count >= 5 and top_partner_id is not None:
+                if top_partner_count >= 3 and top_partner_id is not None:
                     if v.id > top_partner_id:
                         if d_goal < 150.0:
                             actions.append((v, "brake_hold", top_partner_id))

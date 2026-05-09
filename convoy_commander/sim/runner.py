@@ -155,12 +155,15 @@ class SimRunner:
         # Only count a near miss once per pair per cooldown window (1s)
         self._near_miss_cooldown: dict[tuple[int, int], float] = {}
         self._near_miss_cooldown_s: float = 1.0
+        # Per-pair collision cooldown: one overlap = one event, not one per timestep
+        self._collision_cooldown: dict[tuple[int, int], float] = {}
+        self._collision_cooldown_s: float = 0.5
         # Stuck detection: track how long each vehicle has been near-zero speed
         self._stuck_timers: dict[int, float] = {v.id: 0.0 for v in self.vehicles}
         self._stuck_threshold: float = 5.0  # seconds at near-zero before waypoint skip
         # Collision-triggered replanning: track recent collisions per vehicle
         self._collision_window: dict[int, list[float]] = {v.id: [] for v in self.vehicles}
-        self._collision_replan_threshold: int = 8  # collisions in window triggers replan
+        self._collision_replan_threshold: int = 4  # collisions in window triggers replan
         self._collision_window_duration: float = 3.0  # seconds
         self._last_replan_time: dict[int, float] = {v.id: -999.0 for v in self.vehicles}
         self._replan_cooldown: float = 8.0  # min seconds between replans per vehicle
@@ -451,8 +454,12 @@ class SimRunner:
                             v_rel = v.state.speed  # very close: treat as converging
 
                         if d < collision_r * 1.3:
-                            # Imminent collision: always brake hard
                             cmd.accel = -v.vcfg.max_decel * 0.8
+                            away_angle = math.atan2(-dy, -dx)
+                            steer_err = away_angle - v.state.heading
+                            steer_err = math.atan2(math.sin(steer_err), math.cos(steer_err))
+                            cmd.turn_rate = max(-v.vcfg.max_turn_rate,
+                                                min(v.vcfg.max_turn_rate, steer_err * 3.0))
                             break
                         elif d < collision_r * 2.0 and v_rel > 0.5:
                             # Close and converging: moderate brake
@@ -1256,21 +1263,23 @@ class SimRunner:
                 other = self.vehicles[nid]
                 dist = v.state.distance_to(other.state)
                 if dist < collision_r:
-                    v.collision_count += 1
-                    other.collision_count += 1
-                    self._collision_window[v.id].append(t)
-                    self._collision_window[other.id].append(t)
-                    # Track collision partners
-                    vp = self._collision_partners.setdefault(v.id, {})
-                    vp[other.id] = vp.get(other.id, 0) + 1
-                    op = self._collision_partners.setdefault(other.id, {})
-                    op[v.id] = op.get(v.id, 0) + 1
-                    self.event_log.log(
-                        t, EventKind.COLLISION, Severity.CRITICAL,
-                        message=f"COLLISION between V{v.id} and V{other.id} "
-                                f"(dist={dist:.2f}m < {collision_r:.1f}m)",
-                        vehicle_a=v.id, vehicle_b=other.id, distance=dist,
-                    )
+                    last_col = self._collision_cooldown.get(pair, -999.0)
+                    if t - last_col >= self._collision_cooldown_s:
+                        v.collision_count += 1
+                        other.collision_count += 1
+                        self._collision_window[v.id].append(t)
+                        self._collision_window[other.id].append(t)
+                        vp = self._collision_partners.setdefault(v.id, {})
+                        vp[other.id] = vp.get(other.id, 0) + 1
+                        op = self._collision_partners.setdefault(other.id, {})
+                        op[v.id] = op.get(v.id, 0) + 1
+                        self._collision_cooldown[pair] = t
+                        self.event_log.log(
+                            t, EventKind.COLLISION, Severity.CRITICAL,
+                            message=f"COLLISION between V{v.id} and V{other.id} "
+                                    f"(dist={dist:.2f}m < {collision_r:.1f}m)",
+                            vehicle_a=v.id, vehicle_b=other.id, distance=dist,
+                        )
                 elif dist < min_sep:
                     # Cooldown: only count once per pair per cooldown window
                     last_logged = self._near_miss_cooldown.get(pair, -999.0)
@@ -1324,7 +1333,7 @@ class SimRunner:
                         v.state.y - v.assigned_destination[1],
                     )
 
-                if top_partner_count >= 5 and top_partner_id is not None:
+                if top_partner_count >= 3 and top_partner_id is not None:
                     if v.id > top_partner_id:
                         # Near goal: brief brake-only freeze (no 60m reverse).
                         if d_goal < 150.0:

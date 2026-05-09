@@ -306,7 +306,7 @@ def _heavy_rain(**overrides: object) -> SimConfig:
     Tests convoy behaviour under wet-road conditions with reduced
     traction and increased stopping distances.
     """
-    config = SimConfig(duration=300.0)
+    config = SimConfig(duration=400.0)
     config.weather.enabled = True
     config.weather.static_precipitation_mm_h = 8.0
     config.weather.static_visibility_m = 500.0
@@ -322,7 +322,7 @@ def _winter_storm(**overrides: object) -> SimConfig:
     create icy roads, high crosswind disturbs heading, and low visibility
     degrades sensors and may trigger safe mode.
     """
-    config = SimConfig(duration=300.0)
+    config = SimConfig(duration=400.0)
     config.weather.enabled = True
     config.weather.static_precipitation_mm_h = 5.0
     config.weather.static_temperature_c = -5.0
