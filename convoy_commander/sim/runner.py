@@ -362,7 +362,7 @@ class SimRunner:
                 if current_time < self._hold_position_until.get(v.id, 0.0):
                     rev_target = self._hold_reverse_target.get(v.id)
                     if rev_target is not None:
-                        neighbors = [vv for vv in self.vehicles if vv.id != v.id]
+                        neighbors = [vv for vv in self.vehicles if vv.id != v.id and vv.is_operational]
                         cmd = compute_command(v, rev_target, self.world, neighbors, dt,
                                               stuck_time=self._stuck_timers[v.id])
                     else:
@@ -382,8 +382,7 @@ class SimRunner:
                     continue
 
                 # Formation correction — use CBBA slot if available
-                # Suppress formation correction entirely when vehicle is
-                # accumulating collisions (scatter mode)
+                # Suppress formation correction when accumulating collisions
                 recent_collisions = len(self._collision_window.get(v.id, []))
                 in_scatter_mode = recent_collisions >= 4
 
@@ -408,8 +407,8 @@ class SimRunner:
                                 break
                     target = (target[0] + correction[0] * corr_scale, target[1] + correction[1] * corr_scale)
 
-                # Compute and apply command
-                neighbors = [vv for vv in self.vehicles if vv.id != v.id]
+                # Compute and apply command — pre-filter operational neighbors
+                neighbors = [vv for vv in self.vehicles if vv.id != v.id and vv.is_operational]
                 cmd = compute_command(v, target, self.world, neighbors, dt,
                                       stuck_time=self._stuck_timers[v.id])
 
@@ -1336,7 +1335,7 @@ class SimRunner:
                 if top_partner_count >= 3 and top_partner_id is not None:
                     if v.id > top_partner_id:
                         # Near goal: brief brake-only freeze (no 60m reverse).
-                        if d_goal < 150.0:
+                        if d_goal < 80.0:
                             actions.append((v, "brake_hold", top_partner_id))
                         else:
                             actions.append((v, "hold", top_partner_id))

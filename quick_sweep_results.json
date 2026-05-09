@@ -2,7 +2,7 @@
   {
     "scenario": "baseline",
     "seed": 42,
-    "wall": 99.1,
+    "wall": 100.8,
     "success": true,
     "arrived": "5/8",
     "collisions": 0,
@@ -22,7 +22,7 @@
   {
     "scenario": "baseline",
     "seed": 7,
-    "wall": 103.5,
+    "wall": 105.8,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -42,7 +42,7 @@
   {
     "scenario": "gps_denied",
     "seed": 42,
-    "wall": 104.7,
+    "wall": 105.6,
     "success": true,
     "arrived": "6/8",
     "collisions": 0,
@@ -62,7 +62,7 @@
   {
     "scenario": "gps_denied",
     "seed": 7,
-    "wall": 99.7,
+    "wall": 101.4,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -82,7 +82,7 @@
   {
     "scenario": "comms_degraded",
     "seed": 42,
-    "wall": 102.0,
+    "wall": 101.0,
     "success": true,
     "arrived": "5/8",
     "collisions": 0,
@@ -102,7 +102,7 @@
   {
     "scenario": "comms_degraded",
     "seed": 7,
-    "wall": 102.5,
+    "wall": 104.0,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -122,7 +122,7 @@
   {
     "scenario": "leader_failure",
     "seed": 42,
-    "wall": 100.7,
+    "wall": 101.3,
     "success": true,
     "arrived": "4/8",
     "collisions": 0,
@@ -142,7 +142,7 @@
   {
     "scenario": "leader_failure",
     "seed": 7,
-    "wall": 101.9,
+    "wall": 102.8,
     "success": true,
     "arrived": "7/8",
     "collisions": 0,
@@ -162,7 +162,7 @@
   {
     "scenario": "platooning",
     "seed": 42,
-    "wall": 96.4,
+    "wall": 97.3,
     "success": true,
     "arrived": "5/8",
     "collisions": 26,
@@ -182,7 +182,7 @@
   {
     "scenario": "platooning",
     "seed": 7,
-    "wall": 101.7,
+    "wall": 102.9,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -202,7 +202,7 @@
   {
     "scenario": "mesh_relay",
     "seed": 42,
-    "wall": 102.9,
+    "wall": 103.4,
     "success": true,
     "arrived": "5/8",
     "collisions": 0,
@@ -222,7 +222,7 @@
   {
     "scenario": "mesh_relay",
     "seed": 7,
-    "wall": 102.4,
+    "wall": 104.5,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -242,7 +242,7 @@
   {
     "scenario": "heavy_rain",
     "seed": 42,
-    "wall": 143.5,
+    "wall": 143.0,
     "success": true,
     "arrived": "4/8",
     "collisions": 72,
@@ -262,7 +262,7 @@
   {
     "scenario": "heavy_rain",
     "seed": 7,
-    "wall": 111.7,
+    "wall": 114.2,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -282,7 +282,7 @@
   {
     "scenario": "winter_storm",
     "seed": 42,
-    "wall": 157.2,
+    "wall": 158.1,
     "success": true,
     "arrived": "4/8",
     "collisions": 10,
@@ -302,7 +302,7 @@
   {
     "scenario": "winter_storm",
     "seed": 7,
-    "wall": 156.9,
+    "wall": 159.5,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -322,7 +322,7 @@
   {
     "scenario": "jammed_corridor",
     "seed": 42,
-    "wall": 110.1,
+    "wall": 112.2,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -342,7 +342,7 @@
   {
     "scenario": "jammed_corridor",
     "seed": 7,
-    "wall": 102.3,
+    "wall": 104.7,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -362,7 +362,7 @@
   {
     "scenario": "multi_threat",
     "seed": 42,
-    "wall": 109.8,
+    "wall": 111.2,
     "success": true,
     "arrived": "6/8",
     "collisions": 78,
@@ -382,7 +382,7 @@
   {
     "scenario": "multi_threat",
     "seed": 7,
-    "wall": 101.6,
+    "wall": 104.0,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,
@@ -402,7 +402,7 @@
   {
     "scenario": "two_convoy_crossing",
     "seed": 42,
-    "wall": 110.0,
+    "wall": 109.8,
     "success": true,
     "arrived": "6/8",
     "collisions": 0,
@@ -417,22 +417,22 @@
   {
     "scenario": "two_convoy_crossing",
     "seed": 7,
-    "wall": 108.3,
+    "wall": 113.3,
     "success": true,
-    "arrived": "6/8",
-    "collisions": 176,
-    "near_misses": 26,
+    "arrived": "7/8",
+    "collisions": 14,
+    "near_misses": 34,
     "inter_convoy_col": 0,
     "merges": 0,
     "splits": 0,
     "yields": 2,
-    "critical": 88,
-    "warnings": 13
+    "critical": 7,
+    "warnings": 19
   },
   {
     "scenario": "convoy_merge",
     "seed": 42,
-    "wall": 89.2,
+    "wall": 89.4,
     "success": true,
     "arrived": "5/8",
     "collisions": 46,
@@ -447,7 +447,7 @@
   {
     "scenario": "convoy_merge",
     "seed": 7,
-    "wall": 102.2,
+    "wall": 111.4,
     "success": true,
     "arrived": "8/8",
     "collisions": 0,

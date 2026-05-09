@@ -631,8 +631,8 @@ class MultiConvoyRunner:
                     target[1] + correction[1] * corr_scale,
                 )
 
-            # Compute command
-            neighbors = [vv for vv in self.all_vehicles if vv.id != v.id]
+            # Compute command — pre-filter operational neighbors
+            neighbors = [vv for vv in self.all_vehicles if vv.id != v.id and vv.is_operational]
             cmd = compute_command(v, target, self.world, neighbors, dt,
                                   stuck_time=self._stuck_timers.get(v.id, 0.0))
 
@@ -832,7 +832,7 @@ class MultiConvoyRunner:
 
                 if top_partner_count >= 3 and top_partner_id is not None:
                     if v.id > top_partner_id:
-                        if d_goal < 150.0:
+                        if d_goal < 80.0:
                             actions.append((v, "brake_hold", top_partner_id))
                         else:
                             actions.append((v, "hold", top_partner_id))

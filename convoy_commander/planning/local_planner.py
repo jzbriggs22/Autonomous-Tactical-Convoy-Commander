@@ -169,17 +169,26 @@ def _min_clearance(
     clr = float("inf")
     for obs in world.obstacles:
         d = math.hypot(x - obs.x, y - obs.y) - obs.radius
-        clr = min(clr, max(0.0, d))
+        if d <= 0.0:
+            return 0.0
+        clr = min(clr, d)
     for po in world.poly_obstacles:
-        clr = min(clr, po.clearance_from(x, y))
+        d = po.clearance_from(x, y)
+        if d <= 0.0:
+            return 0.0
+        clr = min(clr, d)
     for nz in world.nogo_zones:
         d = math.hypot(x - nz.x, y - nz.y) - nz.radius
-        clr = min(clr, max(0.0, d * 0.5))  # No-go zones count as half clearance
+        if d <= 0.0:
+            return 0.0
+        clr = min(clr, d * 0.5)
     for other in neighbors:
-        if other.id == own_id or not other.is_operational:
+        if other.id == own_id:
             continue
-        d = math.hypot(x - other.estimator.state.x, y - other.estimator.state.y)
-        clr = min(clr, max(0.0, d - 4.5))
+        d = math.hypot(x - other.estimator.state.x, y - other.estimator.state.y) - 4.5
+        if d <= 0.0:
+            return 0.0
+        clr = min(clr, d)
     return clr
 
 
@@ -231,7 +240,7 @@ def _potential_field_command(
     min_sep = vehicle.config.coordination.min_separation
     collision_r = vehicle.config.coordination.collision_radius
     for other in neighbors:
-        if other.id == vehicle.id or not other.is_operational:
+        if other.id == vehicle.id:
             continue
         other_pos = np.array([other.estimator.state.x, other.estimator.state.y])
         sep_vec = pos - other_pos
@@ -303,7 +312,7 @@ def _potential_field_command(
     # Slow down near other vehicles to prevent collisions
     neighbor_factor = 1.0
     for other in neighbors:
-        if other.id == vehicle.id or not other.is_operational:
+        if other.id == vehicle.id:
             continue
         d = math.hypot(est.x - other.estimator.state.x, est.y - other.estimator.state.y)
         if d < min_sep * 2.0:
