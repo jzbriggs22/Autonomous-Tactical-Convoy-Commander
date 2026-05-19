@@ -187,6 +187,17 @@ class TestFullLifecycle:
         assert resolved["resolved_by"] == "pm@company.com"
         assert resolved["resolved_at"] is not None
 
+        # ── Step 9: Audit trail is intact ────────────────────────────────
+        audit = client.get("/audit?limit=200").json()
+        actions = [e["action"] for e in audit]
+        assert "decision.ingested" in actions
+        assert "baseline.computed" in actions
+        assert "drift.detected" in actions
+        assert "rollback.resolved" in actions
+
+        verify = client.get("/audit/verify").json()
+        assert verify["chain_valid"] is True
+
     def test_batch_ingest_and_ground_truth_flow(self, full_stack):
         client, _ = full_stack
 
