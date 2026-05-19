@@ -391,3 +391,108 @@ class TestMetricHistoryEndpoint:
         resp = drift_client.get("/metrics/history/billing_dispute/resolution_rate?limit=2")
         data = resp.json()
         assert len(data["history"]) <= 2
+
+
+# ── audit endpoints ─────────────────────────────────────────────────────────
+
+class TestAuditEndpoints:
+    def test_audit_empty(self, client):
+        resp = client.get("/audit")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_audit_records_ingestion(self, client):
+        client.post("/events", json={
+            "case_id": "aud-1",
+            "case_category": "billing_dispute",
+            "decision": "resolve",
+            "resolution_time_ms": 400,
+        })
+        entries = client.get("/audit").json()
+        assert len(entries) >= 1
+        actions = [e["action"] for e in entries]
+        assert "decision.ingested" in actions
+
+    def test_audit_records_baseline(self, client):
+        _post_events(client, 15, "billing_dispute", "resolve", ts_offset_hours=10)
+        client.post("/baseline/compute", json={})
+        entries = client.get("/audit").json()
+        actions = [e["action"] for e in entries]
+        assert "baseline.computed" in actions
+
+    def test_audit_records_drift_and_alerts(self, drift_client):
+        _post_events(drift_client, 15, "billing_dispute", "resolve", ts_offset_hours=30)
+        drift_client.post("/baseline/compute", json={})
+        _post_events(drift_client, 20, "billing_dispute", "escalate")
+        drift_client.get("/drift")
+
+        entries = drift_client.get("/audit").json()
+        actions = [e["action"] for e in entries]
+        assert "drift.detected" in actions
+        assert "alert.fired" in actions
+
+    def test_audit_records_alert_acknowledge(self, drift_client):
+        _post_events(drift_client, 15, "billing_dispute", "resolve", ts_offset_hours=30)
+        drift_client.post("/baseline/compute", json={})
+        _post_events(drift_client, 20, "billing_dispute", "escalate")
+        drift_client.get("/drift")
+
+        alerts = drift_client.get("/alerts").json()
+        alert_id = alerts[0]["alert_id"]
+        drift_client.post(f"/alerts/{alert_id}/acknowledge")
+
+        entries = drift_client.get("/audit").json()
+        actions = [e["action"] for e in entries]
+        assert "alert.acknowledged" in actions
+
+    def test_audit_records_rollback_resolve(self, drift_client):
+        _post_events(drift_client, 10, "fraud_claim", "resolve")
+        drift_client.get("/drift")
+
+        rollbacks = drift_client.get("/rollbacks").json()
+        rb_id = rollbacks[0]["rollback_id"]
+        drift_client.post(f"/rollbacks/{rb_id}/resolve",
+                          json={"resolved_by": "pm@test.com"})
+
+        entries = drift_client.get("/audit").json()
+        actions = [e["action"] for e in entries]
+        assert "rollback.resolved" in actions
+        resolve_entry = next(e for e in entries if e["action"] == "rollback.resolved")
+        assert resolve_entry["actor"] == "pm@test.com"
+
+    def test_audit_filter_by_action(self, client):
+        _post_events(client, 15, "billing_dispute", "resolve", ts_offset_hours=10)
+        client.post("/baseline/compute", json={})
+
+        entries = client.get("/audit?action=baseline.computed").json()
+        assert len(entries) >= 1
+        assert all(e["action"] == "baseline.computed" for e in entries)
+
+    def test_audit_respects_limit(self, client):
+        for i in range(10):
+            client.post("/events", json={
+                "case_id": f"lim-{i}",
+                "case_category": "returns",
+                "decision": "resolve",
+                "resolution_time_ms": 200,
+            })
+        entries = client.get("/audit?limit=3").json()
+        assert len(entries) == 3
+
+    def test_audit_verify_valid_chain(self, client):
+        client.post("/events", json={
+            "case_id": "v1",
+            "case_category": "returns",
+            "decision": "resolve",
+            "resolution_time_ms": 200,
+        })
+        resp = client.get("/audit/verify")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["chain_valid"] is True
+        assert data["first_broken_seq"] is None
+
+    def test_audit_verify_empty_chain(self, client):
+        resp = client.get("/audit/verify")
+        data = resp.json()
+        assert data["chain_valid"] is True

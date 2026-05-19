@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 from .alerts import AlertEngine
+from .audit import AuditLog
 from .config import GovernanceConfig
 from .dashboard import DashboardBuilder
 from .drift import DriftDetector
@@ -39,6 +40,7 @@ class _Services:
     engine: AlertEngine
     dashboard: DashboardBuilder
     webhooks: WebhookDispatcher
+    audit: AuditLog
 
 
 _svc: Optional[_Services] = None
@@ -57,6 +59,7 @@ def _get_svc() -> _Services:
             _svc.config, _svc.db, _svc.detector, _svc.engine
         )
         _svc.webhooks = WebhookDispatcher()
+        _svc.audit = AuditLog(_svc.db)
     return _svc
 
 
@@ -73,6 +76,7 @@ def init_services(
     _svc.engine = AlertEngine(config, db)
     _svc.dashboard = DashboardBuilder(config, db, _svc.detector, _svc.engine)
     _svc.webhooks = webhooks or WebhookDispatcher()
+    _svc.audit = AuditLog(db)
     return _svc
 
 
@@ -124,6 +128,12 @@ def ingest_event(body: DecisionRequest):
         result = svc.ingestion.ingest(req)
     except ValidationError as exc:
         raise HTTPException(422, str(exc))
+    svc.audit.append(
+        svc.config.agent_id, "decision.ingested", "system", "event",
+        resource_id=result.event_id,
+        detail={"category": body.case_category, "decision": body.decision,
+                "is_high_risk": result.is_high_risk},
+    )
     return {
         "event_id": result.event_id,
         "is_high_risk": result.is_high_risk,
@@ -189,6 +199,18 @@ def get_drift():
             "triggered_rollback": f.triggered_rollback,
             "agent_id": svc.config.agent_id,
         })
+        action = "rollback.triggered" if f.triggered_rollback else "alert.fired"
+        svc.audit.append(
+            svc.config.agent_id, action, "system", "alert",
+            resource_id=f.alert_id,
+            detail={"rule": f.rule_name, "severity": f.severity,
+                    "triggered_rollback": f.triggered_rollback},
+        )
+    svc.audit.append(
+        svc.config.agent_id, "drift.detected", "system", "drift",
+        detail={"overall_score": round(report.overall_drift_score, 4),
+                "violations": len(report.violations), "alerts_fired": len(fired)},
+    )
     return {
         "agent_id": report.agent_id,
         "overall_drift_score": round(report.overall_drift_score, 4),
@@ -241,6 +263,10 @@ def acknowledge_alert(alert_id: str):
     found = svc.db.acknowledge_alert(svc.config.agent_id, alert_id)
     if not found:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Alert {alert_id!r} not found")
+    svc.audit.append(
+        svc.config.agent_id, "alert.acknowledged", "pm", "alert",
+        resource_id=alert_id,
+    )
     return {"status": "acknowledged", "alert_id": alert_id}
 
 
@@ -278,6 +304,10 @@ def resolve_rollback(rollback_id: str, body: ResolveRollbackRequest):
             status.HTTP_404_NOT_FOUND,
             f"Rollback {rollback_id!r} not found or already resolved",
         )
+    svc.audit.append(
+        svc.config.agent_id, "rollback.resolved", body.resolved_by, "rollback",
+        resource_id=rollback_id,
+    )
     return {"status": "resolved", "rollback_id": rollback_id, "resolved_by": body.resolved_by}
 
 
@@ -285,6 +315,11 @@ def resolve_rollback(rollback_id: str, body: ResolveRollbackRequest):
 def resolve_all_rollbacks(body: ResolveRollbackRequest):
     svc = _get_svc()
     count = svc.db.resolve_all_rollbacks(svc.config.agent_id, body.resolved_by)
+    if count > 0:
+        svc.audit.append(
+            svc.config.agent_id, "rollback.resolved", body.resolved_by, "rollback",
+            detail={"resolve_all": True, "count": count},
+        )
     return {"status": "resolved", "count": count, "resolved_by": body.resolved_by}
 
 
@@ -293,6 +328,11 @@ def compute_baseline(body: BaselineRequest = None):
     svc = _get_svc()
     categories = body.categories if body else None
     results = svc.detector.compute_baseline(categories)
+    svc.audit.append(
+        svc.config.agent_id, "baseline.computed", "system", "baseline",
+        detail={"categories": list(results.keys()),
+                "event_counts": {cat: m.total_events for cat, m in results.items()}},
+    )
     return {
         "categories_computed": list(results.keys()),
         "event_counts": {cat: m.total_events for cat, m in results.items()},
@@ -319,6 +359,38 @@ def get_metric_history(category: str, metric: str, limit: int = 50):
             }
             for ts, val, sc in history
         ],
+    }
+
+
+@app.get("/audit")
+def get_audit(action: Optional[str] = None, limit: int = 50):
+    svc = _get_svc()
+    entries = svc.audit.get_entries(
+        svc.config.agent_id, action=action, limit=min(limit, 200)
+    )
+    return [
+        {
+            "seq": e.seq,
+            "timestamp": e.timestamp.isoformat(),
+            "action": e.action,
+            "actor": e.actor,
+            "resource_type": e.resource_type,
+            "resource_id": e.resource_id,
+            "detail": e.detail,
+            "entry_hash": e.entry_hash,
+        }
+        for e in entries
+    ]
+
+
+@app.get("/audit/verify")
+def verify_audit():
+    svc = _get_svc()
+    valid, broken_seq = svc.audit.verify_chain(svc.config.agent_id)
+    return {
+        "agent_id": svc.config.agent_id,
+        "chain_valid": valid,
+        "first_broken_seq": broken_seq,
     }
 
 
