@@ -10,6 +10,7 @@ from typing import Optional
 
 from .config import GovernanceConfig, HighRiskPattern
 from .storage import DecisionRecord, GovernanceDB
+from .structured import GovernanceDecision
 
 VALID_DECISIONS = frozenset({"resolve", "escalate", "deny", "defer", "partial_resolve"})
 
@@ -80,6 +81,34 @@ class IngestionLayer:
             high_risk_score=score,
             matched_patterns=matched,
         )
+
+    def ingest_structured(
+        self,
+        decision: GovernanceDecision,
+        case_id: Optional[str] = None,
+        resolution_time_ms: int = 0,
+        ground_truth: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> IngestResult:
+        """Ingest a structured GovernanceDecision (from outlines/instructor/Pydantic).
+
+        Maps GovernanceDecision fields to IngestRequest, storing risk_level,
+        confidence, and flags in metadata for downstream inspection.
+        """
+        req = IngestRequest(
+            case_id=case_id or str(uuid.uuid4()),
+            case_category=decision.case_category,
+            decision=decision.decision,
+            resolution_time_ms=resolution_time_ms,
+            metadata={
+                "risk_level": decision.risk_level,
+                "confidence": decision.confidence,
+                "flags": decision.flags,
+            },
+            ground_truth=ground_truth,
+            timestamp=timestamp,
+        )
+        return self.ingest(req)
 
     def ingest_batch(self, requests: list[IngestRequest]) -> list[IngestResult]:
         return [self.ingest(r) for r in requests]

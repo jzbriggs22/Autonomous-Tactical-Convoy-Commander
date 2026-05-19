@@ -21,6 +21,7 @@ from .dashboard import DashboardBuilder
 from .drift import DriftDetector
 from .ingestion import IngestRequest, IngestionLayer, ValidationError
 from .storage import GovernanceDB
+from .structured import DecodeError, DecisionDecoder, GovernanceDecision
 from .webhooks import WebhookDispatcher
 
 # ── app + lazy singleton wiring ──────────────────────────────────────────────
@@ -109,6 +110,19 @@ class AcknowledgeAlertRequest(BaseModel):
     pass  # presence of the POST is the ack
 
 
+class StructuredDecisionRequest(BaseModel):
+    """Wrapper for a GovernanceDecision submitted as structured JSON.
+
+    Accepts either a pre-formed GovernanceDecision payload (nested under
+    ``decision``) or raw JSON text in ``raw`` — the decoder validates both.
+    """
+    decision: Optional[GovernanceDecision] = None
+    raw: Optional[str] = None
+    case_id: Optional[str] = None
+    resolution_time_ms: int = Field(default=0, ge=0)
+    ground_truth: Optional[str] = None
+
+
 # ── endpoints ────────────────────────────────────────────────────────────────
 
 @app.post("/events", status_code=status.HTTP_201_CREATED)
@@ -140,6 +154,60 @@ def ingest_event(body: DecisionRequest):
         "high_risk_score": result.high_risk_score,
         "matched_patterns": result.matched_patterns,
     }
+
+
+@app.post("/events/structured", status_code=status.HTTP_201_CREATED)
+def ingest_structured_event(body: StructuredDecisionRequest):
+    """Ingest a GovernanceDecision — the constrained-output path.
+
+    Accepts either ``decision`` (pre-validated Pydantic object) or
+    ``raw`` (JSON string validated via outlines_core regex before Pydantic).
+    """
+    svc = _get_svc()
+    _dec = DecisionDecoder()
+    if body.decision is not None:
+        gov_decision = body.decision
+    elif body.raw is not None:
+        try:
+            gov_decision = _dec.decode(body.raw)
+        except DecodeError as exc:
+            raise HTTPException(422, str(exc))
+    else:
+        raise HTTPException(422, "Provide either 'decision' or 'raw'")
+
+    try:
+        result = svc.ingestion.ingest_structured(
+            gov_decision,
+            case_id=body.case_id,
+            resolution_time_ms=body.resolution_time_ms,
+            ground_truth=body.ground_truth,
+        )
+    except ValidationError as exc:
+        raise HTTPException(422, str(exc))
+
+    svc.audit.append(
+        svc.config.agent_id, "decision.ingested", "system", "event",
+        resource_id=result.event_id,
+        detail={"category": gov_decision.case_category,
+                "decision": gov_decision.decision,
+                "risk_level": gov_decision.risk_level,
+                "is_high_risk": result.is_high_risk,
+                "structured": True},
+    )
+    return {
+        "event_id": result.event_id,
+        "is_high_risk": result.is_high_risk,
+        "high_risk_score": result.high_risk_score,
+        "matched_patterns": result.matched_patterns,
+        "risk_level": gov_decision.risk_level,
+        "confidence": gov_decision.confidence,
+    }
+
+
+@app.get("/events/schema")
+def get_decision_schema():
+    """Return the GovernanceDecision JSON schema for use in LLM prompts."""
+    return GovernanceDecision.model_json_schema()
 
 
 @app.post("/events/batch", status_code=status.HTTP_201_CREATED)
