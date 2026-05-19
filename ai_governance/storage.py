@@ -70,6 +70,17 @@ CREATE TABLE IF NOT EXISTS rollbacks (
     resolved_by     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rb_agent_ts ON rollbacks (agent_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS metric_snapshots (
+    snapshot_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id        TEXT NOT NULL,
+    timestamp       TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    metric          TEXT NOT NULL,
+    value           REAL NOT NULL,
+    sample_count    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snap_agent_cat ON metric_snapshots (agent_id, category, metric, timestamp);
 """
 
 
@@ -373,6 +384,39 @@ class GovernanceDB:
                 (alert_id, agent_id),
             )
             return cur.rowcount > 0
+
+    # ── metric snapshots (history tracking) ────────────────────────────────
+
+    def insert_metric_snapshot(
+        self, agent_id: str, category: str, metric: str,
+        value: float, sample_count: int,
+    ) -> None:
+        with self._tx() as c:
+            c.execute(
+                """INSERT INTO metric_snapshots
+                   (agent_id, timestamp, category, metric, value, sample_count)
+                   VALUES (?,?,?,?,?,?)""",
+                (
+                    agent_id, datetime.now(timezone.utc).isoformat(),
+                    category, metric, value, sample_count,
+                ),
+            )
+
+    def get_metric_history(
+        self, agent_id: str, category: str, metric: str, limit: int = 100
+    ) -> list[tuple[datetime, float, int]]:
+        """Returns (timestamp, value, sample_count) tuples, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT timestamp, value, sample_count FROM metric_snapshots
+                   WHERE agent_id=? AND category=? AND metric=?
+                   ORDER BY timestamp DESC LIMIT ?""",
+                (agent_id, category, metric, limit),
+            ).fetchall()
+        return [
+            (datetime.fromisoformat(r["timestamp"]), r["value"], r["sample_count"])
+            for r in rows
+        ]
 
     def close(self) -> None:
         with self._lock:

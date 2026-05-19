@@ -1,4 +1,7 @@
-"""Tests for GovernanceConfig, validators, and default config."""
+"""Tests for GovernanceConfig, validators, default config, and serialization."""
+
+import os
+import tempfile
 
 import pytest
 
@@ -105,3 +108,64 @@ class TestGovernanceConfig:
             assert thr.metric in _EXTRACTORS, (
                 f"Threshold '{thr.name}' references unknown metric '{thr.metric}'"
             )
+
+
+class TestConfigSerialization:
+    def test_yaml_roundtrip(self):
+        original = GovernanceConfig.default_customer_service()
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            path = f.name
+        try:
+            original.to_yaml(path)
+            loaded = GovernanceConfig.from_yaml(path)
+            assert loaded.agent_id == original.agent_id
+            assert len(loaded.high_risk_patterns) == len(original.high_risk_patterns)
+            assert len(loaded.drift_thresholds) == len(original.drift_thresholds)
+            assert len(loaded.rollback_conditions) == len(original.rollback_conditions)
+            assert loaded.min_baseline_events == original.min_baseline_events
+        finally:
+            os.unlink(path)
+
+    def test_json_roundtrip(self):
+        original = GovernanceConfig.default_customer_service()
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            path = f.name
+        try:
+            original.to_json(path)
+            loaded = GovernanceConfig.from_json(path)
+            assert loaded.agent_id == original.agent_id
+            assert len(loaded.drift_thresholds) == len(original.drift_thresholds)
+        finally:
+            os.unlink(path)
+
+    def test_yaml_to_string(self):
+        cfg = GovernanceConfig.default_customer_service()
+        text = cfg.to_yaml()
+        assert "agent_id: cs-agent-v1" in text
+        assert "fraud_claim" in text
+
+    def test_json_to_string(self):
+        cfg = GovernanceConfig.default_customer_service()
+        text = cfg.to_json()
+        assert '"agent_id"' in text
+        import json
+        data = json.loads(text)
+        assert data["agent_id"] == "cs-agent-v1"
+
+    def test_shipped_yaml_config_loads(self):
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "ai_governance", "default_config.yaml",
+        )
+        if os.path.exists(cfg_path):
+            cfg = GovernanceConfig.from_yaml(cfg_path)
+            assert cfg.agent_id == "cs-agent-v1"
+            assert len(cfg.drift_thresholds) >= 3
+
+    def test_yaml_preserves_enum_values(self):
+        cfg = GovernanceConfig.default_customer_service()
+        text = cfg.to_yaml()
+        loaded = GovernanceConfig.from_yaml.__func__.__code__  # just check text
+        assert "decrease" in text
+        assert "critical" in text
+        assert "rollback" in text

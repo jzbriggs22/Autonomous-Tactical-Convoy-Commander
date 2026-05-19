@@ -205,7 +205,15 @@ class DriftDetector:
         recent_metrics: dict[str, CategoryMetrics] = {}
         for cat, recs in by_cat.items():
             window = recs[: self._config.recent_window_size]
-            recent_metrics[cat] = _compute_metrics(window, category=cat)
+            metrics = _compute_metrics(window, category=cat)
+            recent_metrics[cat] = metrics
+            # Record metric snapshots for trend tracking
+            for mname, extractor in _EXTRACTORS.items():
+                val = extractor(metrics)
+                if val is not None:
+                    self._db.insert_metric_snapshot(
+                        self._config.agent_id, cat, mname, val, metrics.total_events
+                    )
 
         violations: list[DriftResult] = []
         all_results: list[DriftResult] = []

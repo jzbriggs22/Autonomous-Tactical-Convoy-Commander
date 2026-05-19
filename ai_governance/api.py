@@ -299,6 +299,29 @@ def compute_baseline(body: BaselineRequest = None):
     }
 
 
+@app.get("/metrics/history/{category}/{metric}")
+def get_metric_history(category: str, metric: str, limit: int = 50):
+    svc = _get_svc()
+    history = svc.db.get_metric_history(
+        svc.config.agent_id, category, metric, limit=min(limit, 200)
+    )
+    baseline = svc.db.get_baseline(svc.config.agent_id, category, metric)
+    return {
+        "category": category,
+        "metric": metric,
+        "baseline_value": baseline[0] if baseline else None,
+        "baseline_samples": baseline[1] if baseline else None,
+        "history": [
+            {
+                "timestamp": ts.isoformat(),
+                "value": round(val, 4),
+                "sample_count": sc,
+            }
+            for ts, val, sc in history
+        ],
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))

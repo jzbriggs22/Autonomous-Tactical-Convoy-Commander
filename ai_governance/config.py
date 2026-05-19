@@ -6,10 +6,13 @@ Load this before the agent starts. It defines what "safe" means for this deploym
 from __future__ import annotations
 
 import ast
+import json
 import re
 from enum import Enum
-from typing import Literal
+from pathlib import Path
+from typing import Literal, Union
 
+import yaml
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -196,3 +199,32 @@ class GovernanceConfig(BaseModel):
                 ),
             ],
         )
+
+    @classmethod
+    def from_yaml(cls, path: Union[str, Path]) -> "GovernanceConfig":
+        """Load config from a YAML file."""
+        text = Path(path).read_text()
+        data = yaml.safe_load(text)
+        return cls.model_validate(data)
+
+    @classmethod
+    def from_json(cls, path: Union[str, Path]) -> "GovernanceConfig":
+        """Load config from a JSON file."""
+        text = Path(path).read_text()
+        data = json.loads(text)
+        return cls.model_validate(data)
+
+    def to_yaml(self, path: Union[str, Path] = None) -> str:
+        """Serialize to YAML. If path is given, writes to file."""
+        data = self.model_dump(mode="json")
+        text = yaml.dump(data, default_flow_style=False, sort_keys=False)
+        if path:
+            Path(path).write_text(text)
+        return text
+
+    def to_json(self, path: Union[str, Path] = None) -> str:
+        """Serialize to JSON. If path is given, writes to file."""
+        text = self.model_dump_json(indent=2)
+        if path:
+            Path(path).write_text(text)
+        return text

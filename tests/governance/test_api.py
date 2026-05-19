@@ -358,3 +358,36 @@ class TestRollbackEndpoints:
         resp = drift_client.post(f"/rollbacks/{rb_id}/resolve",
                                  json={"resolved_by": "admin"})
         assert resp.status_code == 404
+
+
+# ── metric history endpoint ──────────────────────────────────────────────────
+
+class TestMetricHistoryEndpoint:
+    def test_history_empty_when_no_drift_runs(self, client):
+        resp = client.get("/metrics/history/billing_dispute/resolution_rate")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["category"] == "billing_dispute"
+        assert data["metric"] == "resolution_rate"
+        assert data["history"] == []
+        assert data["baseline_value"] is None
+
+    def test_history_populated_after_drift_detection(self, drift_client):
+        _post_events(drift_client, 20, "billing_dispute", "resolve", ts_offset_hours=10)
+        drift_client.post("/baseline/compute", json={})
+        drift_client.get("/drift")  # triggers metric snapshot recording
+
+        resp = drift_client.get("/metrics/history/billing_dispute/resolution_rate")
+        data = resp.json()
+        assert len(data["history"]) >= 1
+        assert data["history"][0]["value"] == 1.0  # all resolve → 100% resolution
+        assert data["baseline_value"] is not None
+
+    def test_history_with_limit(self, drift_client):
+        _post_events(drift_client, 20, "billing_dispute", "resolve")
+        for _ in range(3):
+            drift_client.get("/drift")  # record multiple snapshots
+
+        resp = drift_client.get("/metrics/history/billing_dispute/resolution_rate?limit=2")
+        data = resp.json()
+        assert len(data["history"]) <= 2
