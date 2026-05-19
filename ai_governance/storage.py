@@ -64,7 +64,10 @@ CREATE TABLE IF NOT EXISTS rollbacks (
     timestamp       TEXT NOT NULL,
     trigger_rule    TEXT NOT NULL,
     reason          TEXT NOT NULL,
-    metrics_json    TEXT NOT NULL DEFAULT '{}'
+    metrics_json    TEXT NOT NULL DEFAULT '{}',
+    resolved        INTEGER NOT NULL DEFAULT 0,
+    resolved_at     TEXT,
+    resolved_by     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rb_agent_ts ON rollbacks (agent_id, timestamp);
 """
@@ -105,6 +108,9 @@ class RollbackRecord:
     trigger_rule: str
     reason: str
     metrics: dict = field(default_factory=dict)
+    resolved: bool = False
+    resolved_at: Optional[datetime] = None
+    resolved_by: Optional[str] = None
 
 
 class GovernanceDB:
@@ -318,6 +324,11 @@ class GovernanceDB:
                 trigger_rule=r["trigger_rule"],
                 reason=r["reason"],
                 metrics=json.loads(r["metrics_json"]),
+                resolved=bool(r["resolved"]),
+                resolved_at=(
+                    datetime.fromisoformat(r["resolved_at"]) if r["resolved_at"] else None
+                ),
+                resolved_by=r["resolved_by"],
             )
             for r in rows
         ]
@@ -325,9 +336,43 @@ class GovernanceDB:
     def has_active_rollback(self, agent_id: str) -> bool:
         with self._lock:
             count = self._conn.execute(
-                "SELECT COUNT(*) FROM rollbacks WHERE agent_id=?", (agent_id,)
+                "SELECT COUNT(*) FROM rollbacks WHERE agent_id=? AND resolved=0",
+                (agent_id,),
             ).fetchone()[0]
         return count > 0
+
+    def resolve_rollback(
+        self, agent_id: str, rollback_id: str, resolved_by: str
+    ) -> bool:
+        with self._tx() as c:
+            cur = c.execute(
+                """UPDATE rollbacks SET resolved=1, resolved_at=?, resolved_by=?
+                   WHERE rollback_id=? AND agent_id=? AND resolved=0""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    resolved_by,
+                    rollback_id,
+                    agent_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def resolve_all_rollbacks(self, agent_id: str, resolved_by: str) -> int:
+        with self._tx() as c:
+            cur = c.execute(
+                """UPDATE rollbacks SET resolved=1, resolved_at=?, resolved_by=?
+                   WHERE agent_id=? AND resolved=0""",
+                (datetime.now(timezone.utc).isoformat(), resolved_by, agent_id),
+            )
+            return cur.rowcount
+
+    def acknowledge_alert(self, agent_id: str, alert_id: str) -> bool:
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE alerts SET acknowledged=1 WHERE alert_id=? AND agent_id=?",
+                (alert_id, agent_id),
+            )
+            return cur.rowcount > 0
 
     def close(self) -> None:
         with self._lock:
