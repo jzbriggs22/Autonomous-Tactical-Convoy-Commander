@@ -136,3 +136,60 @@ class TestWebhookDispatcher:
         import time
         time.sleep(0.3)
         assert len(_CaptureHandler.received) == 1
+
+
+class TestWebhookRetry:
+    def test_retry_on_failure_records_attempts(self):
+        dispatcher = WebhookDispatcher([
+            WebhookTarget(
+                url="http://127.0.0.1:1/unreachable",
+                timeout_seconds=0.2,
+                max_retries=3,
+                backoff_base=0.05,
+            ),
+        ])
+        results = dispatcher.dispatch({"severity": "critical", "message": "retry-test"})
+        assert len(results) == 1
+        assert results[0].status == "failed"
+        assert results[0].attempts == 3
+        assert "3 attempts" in results[0].error
+
+    def test_no_retry_when_max_retries_is_1(self):
+        dispatcher = WebhookDispatcher([
+            WebhookTarget(
+                url="http://127.0.0.1:1/unreachable",
+                timeout_seconds=0.2,
+                max_retries=1,
+                backoff_base=0.05,
+            ),
+        ])
+        results = dispatcher.dispatch({"severity": "warn", "message": "once"})
+        assert results[0].attempts == 1
+        assert results[0].status == "failed"
+
+    def test_successful_on_first_attempt_records_one_attempt(self, capture_server):
+        dispatcher = WebhookDispatcher([
+            WebhookTarget(
+                url=f"{capture_server}/retry-ok",
+                max_retries=3,
+                backoff_base=0.05,
+            ),
+        ])
+        results = dispatcher.dispatch({"severity": "warn", "message": "ok"})
+        assert results[0].status == "sent"
+        assert results[0].attempts == 1
+
+    def test_delivery_log_records_retry_outcome(self):
+        dispatcher = WebhookDispatcher([
+            WebhookTarget(
+                url="http://127.0.0.1:1/unreachable",
+                timeout_seconds=0.2,
+                max_retries=2,
+                backoff_base=0.05,
+            ),
+        ])
+        dispatcher.dispatch({"severity": "critical", "message": "log-test"})
+        log = dispatcher.delivery_log
+        assert len(log) == 1
+        assert log[0].attempts == 2
+        assert log[0].status == "failed"

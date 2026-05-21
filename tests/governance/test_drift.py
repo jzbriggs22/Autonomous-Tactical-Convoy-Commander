@@ -301,6 +301,78 @@ class TestDriftDetection:
         report = detector.detect()
         assert report.overall_drift_score == 0.0
 
+    def test_small_category_metrics_computed(self, config, db):
+        cfg = GovernanceConfig(
+            agent_id="small-agent",
+            min_baseline_events=5,
+            recent_window_size=10,
+            drift_thresholds=[
+                DriftThreshold(
+                    name="small",
+                    category="rare",
+                    metric="resolution_rate",
+                    max_delta=0.1,
+                    direction=MetricDirection.DECREASE,
+                    min_baseline_samples=5,
+                    recent_window=10,
+                    severity=AlertSeverity.WARN,
+                )
+            ],
+        )
+        ing = IngestionLayer(cfg, db)
+        det = DriftDetector(cfg, db)
+        now = datetime.now(timezone.utc)
+
+        for i in range(6):
+            ing.ingest(IngestRequest(
+                case_id=f"rare-baseline-{i}",
+                case_category="rare",
+                decision="resolve",
+                resolution_time_ms=100,
+                timestamp=now - timedelta(hours=50 - i),
+            ))
+        det.compute_baseline()
+
+        for i in range(12):
+            ing.ingest(IngestRequest(
+                case_id=f"rare-recent-{i}",
+                case_category="rare",
+                decision="deny",
+                resolution_time_ms=100,
+                timestamp=now - timedelta(minutes=12 - i),
+            ))
+        report = det.detect()
+        assert "rare" in report.recent_metrics
+        viols = [v for v in report.violations if v.category == "rare"]
+        assert len(viols) >= 1
+
+    def test_all_denied_category_metrics(self):
+        records = _make_records(10, decision="deny")
+        m = _compute_metrics(records)
+        assert m.denial_rate == 1.0
+        assert m.resolution_rate == 0.0
+        assert m.escalation_rate == 0.0
+
+    def test_no_high_risk_events(self):
+        records = _make_records(10, decision="resolve", is_high_risk=False)
+        m = _compute_metrics(records)
+        assert m.high_risk_count == 0
+        assert m.high_risk_escalation_rate == 0.0
+        assert m.high_risk_accuracy is None
+
+    def test_all_high_risk_no_escalations(self):
+        records = _make_records(10, decision="resolve", is_high_risk=True)
+        m = _compute_metrics(records)
+        assert m.high_risk_count == 10
+        assert m.high_risk_escalation_rate == 0.0
+
+    def test_mixed_ground_truth_accuracy(self):
+        correct = _make_records(6, decision="resolve", ground_truth="resolve")
+        wrong = _make_records(4, decision="resolve", ground_truth="escalate")
+        m = _compute_metrics(correct + wrong)
+        assert m.accuracy is not None
+        assert abs(m.accuracy - 0.6) < 0.01
+
     def test_overall_drift_score_increases_with_violations(self, config, db):
         cfg = GovernanceConfig(
             agent_id="score-agent",

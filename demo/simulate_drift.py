@@ -35,8 +35,9 @@ from ai_governance.alerts import AlertEngine
 from ai_governance.config import GovernanceConfig
 from ai_governance.dashboard import DashboardBuilder, TerminalDashboard
 from ai_governance.drift import DriftDetector
-from ai_governance.ingestion import IngestRequest, IngestionLayer
+from ai_governance.ingestion import IngestionLayer
 from ai_governance.storage import GovernanceDB
+from ai_governance.structured import GovernanceDecision
 
 console = Console()
 rng = random.Random(42)
@@ -47,43 +48,56 @@ CATEGORIES = ["billing_dispute", "fraud_claim", "policy_question", "returns", "s
 CATEGORY_WEIGHTS = [0.25, 0.20, 0.15, 0.25, 0.15]
 
 
-def _healthy_decision(category: str) -> str:
+RISK_MAP = {
+    "fraud_claim": "critical",
+    "billing_dispute": "high",
+    "policy_question": "high",
+    "returns": "low",
+    "shipping": "low",
+}
+
+RISK_MAP_DRIFTED = {
+    "fraud_claim": "medium",  # drift: agent stops treating fraud as critical
+    "billing_dispute": "medium",
+    "policy_question": "high",
+    "returns": "low",
+    "shipping": "low",
+}
+
+
+def _healthy_decision(category: str) -> GovernanceDecision:
     """Simulate a well-calibrated agent: escalates fraud, resolves billing."""
     if category == "fraud_claim":
-        return rng.choices(["escalate", "resolve", "defer"], weights=[85, 10, 5])[0]
-    if category == "billing_dispute":
-        return rng.choices(["resolve", "escalate", "deny", "partial_resolve"], weights=[65, 15, 10, 10])[0]
-    if category == "policy_question":
-        return rng.choices(["resolve", "escalate", "defer"], weights=[60, 25, 15])[0]
-    return rng.choices(["resolve", "deny", "defer"], weights=[75, 15, 10])[0]
+        dec = rng.choices(["escalate", "resolve", "defer"], weights=[85, 10, 5])[0]
+    elif category == "billing_dispute":
+        dec = rng.choices(["resolve", "escalate", "deny", "partial_resolve"], weights=[65, 15, 10, 10])[0]
+    elif category == "policy_question":
+        dec = rng.choices(["resolve", "escalate", "defer"], weights=[60, 25, 15])[0]
+    else:
+        dec = rng.choices(["resolve", "deny", "defer"], weights=[75, 15, 10])[0]
+    return GovernanceDecision(
+        case_category=category,
+        risk_level=RISK_MAP.get(category, "low"),
+        decision=dec,
+        confidence=round(rng.uniform(0.65, 0.99), 2),
+        flags=[],
+    )
 
 
-def _drifted_decision(category: str) -> str:
+def _drifted_decision(category: str) -> GovernanceDecision:
     """Simulate an agent that has drifted: stops escalating fraud."""
     if category == "fraud_claim":
-        # Escalation drops from 85% to ~20% — the dangerous drift
-        return rng.choices(["escalate", "resolve", "deny"], weights=[20, 70, 10])[0]
-    if category == "billing_dispute":
-        # Resolution rate slightly improves (looks healthy on normal metrics!)
-        return rng.choices(["resolve", "escalate", "deny", "partial_resolve"], weights=[72, 10, 8, 10])[0]
-    return _healthy_decision(category)
-
-
-def _make_event(
-    category: str,
-    decision: str,
-    ts: datetime,
-    ground_truth: str = None,
-    metadata: dict = None,
-) -> IngestRequest:
-    return IngestRequest(
-        case_id=str(uuid.uuid4()),
+        dec = rng.choices(["escalate", "resolve", "deny"], weights=[20, 70, 10])[0]
+    elif category == "billing_dispute":
+        dec = rng.choices(["resolve", "escalate", "deny", "partial_resolve"], weights=[72, 10, 8, 10])[0]
+    else:
+        return _healthy_decision(category)
+    return GovernanceDecision(
         case_category=category,
-        decision=decision,
-        resolution_time_ms=rng.randint(200, 2000),
-        ground_truth=ground_truth,
-        timestamp=ts,
-        metadata=metadata or {},
+        risk_level=RISK_MAP_DRIFTED.get(category, "low"),
+        decision=dec,
+        confidence=round(rng.uniform(0.50, 0.85), 2),
+        flags=["drift_suspect"] if category == "fraud_claim" else [],
     )
 
 
@@ -133,10 +147,14 @@ def simulate(
         task = progress.add_task("Warmup events", total=n_warmup)
         for i in range(n_warmup):
             cat = rng.choices(CATEGORIES, weights=CATEGORY_WEIGHTS)[0]
-            decision = _healthy_decision(cat)
-            gt = decision if rng.random() < 0.6 else None  # 60% have ground truth
+            gov = _healthy_decision(cat)
+            gt = gov.decision if rng.random() < 0.6 else None
             ts = now - timedelta(hours=48 - (i * 48 / n_warmup))
-            ingestion.ingest(_make_event(cat, decision, ts, ground_truth=gt))
+            ingestion.ingest_structured(
+                gov, case_id=str(uuid.uuid4()),
+                resolution_time_ms=rng.randint(200, 2000),
+                ground_truth=gt, timestamp=ts,
+            )
             progress.advance(task)
 
     baseline_results = detector.compute_baseline()
@@ -165,10 +183,14 @@ def simulate(
         task = progress.add_task("Healthy events", total=n_healthy)
         for i in range(n_healthy):
             cat = rng.choices(CATEGORIES, weights=CATEGORY_WEIGHTS)[0]
-            decision = _healthy_decision(cat)
-            gt = decision if rng.random() < 0.5 else None
+            gov = _healthy_decision(cat)
+            gt = gov.decision if rng.random() < 0.5 else None
             ts = now - timedelta(hours=24 - (i * 24 / n_healthy))
-            ingestion.ingest(_make_event(cat, decision, ts, ground_truth=gt))
+            ingestion.ingest_structured(
+                gov, case_id=str(uuid.uuid4()),
+                resolution_time_ms=rng.randint(200, 2000),
+                ground_truth=gt, timestamp=ts,
+            )
             progress.advance(task)
 
     console.print("[dim]Running drift detection on healthy window...[/dim]")
@@ -199,11 +221,14 @@ def simulate(
         task = progress.add_task("Drifted events", total=n_drift)
         for i in range(n_drift):
             cat = rng.choices(CATEGORIES, weights=CATEGORY_WEIGHTS)[0]
-            decision = _drifted_decision(cat)
-            gt = decision if rng.random() < 0.5 else None
-            # Recent: all events in the last hour
+            gov = _drifted_decision(cat)
+            gt = gov.decision if rng.random() < 0.5 else None
             ts = now - timedelta(minutes=60 - (i * 60 / n_drift))
-            ingestion.ingest(_make_event(cat, decision, ts, ground_truth=gt))
+            ingestion.ingest_structured(
+                gov, case_id=str(uuid.uuid4()),
+                resolution_time_ms=rng.randint(200, 2000),
+                ground_truth=gt, timestamp=ts,
+            )
             progress.advance(task)
 
     # ── Phase 4: Detection ────────────────────────────────────────────────────

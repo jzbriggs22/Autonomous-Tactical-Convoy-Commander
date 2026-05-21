@@ -1,7 +1,8 @@
 """Webhook alert dispatcher.
 
 Sends alert payloads to configured HTTP endpoints on each alert fire.
-Failures are logged and never block the alert pipeline.
+Retries with exponential backoff on transient failures.
+Permanent failures are logged and never block the alert pipeline.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -17,6 +19,9 @@ from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MAX_RETRIES = 3
+_DEFAULT_BACKOFF_BASE = 1.0  # seconds
+
 
 @dataclass
 class WebhookTarget:
@@ -24,6 +29,8 @@ class WebhookTarget:
     headers: dict = field(default_factory=dict)
     timeout_seconds: float = 5.0
     severity_filter: Optional[set[str]] = None  # None = all severities
+    max_retries: int = _DEFAULT_MAX_RETRIES
+    backoff_base: float = _DEFAULT_BACKOFF_BASE
 
 
 @dataclass
@@ -32,14 +39,15 @@ class WebhookDelivery:
     status: str  # "sent" | "failed"
     status_code: Optional[int] = None
     error: Optional[str] = None
+    attempts: int = 1
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class WebhookDispatcher:
     """Fire-and-forget webhook delivery for governance alerts.
 
-    Dispatches to all registered targets in a background thread.
-    Delivery failures are returned in the result list but never raise.
+    Dispatches to all registered targets. Retries failed deliveries
+    with exponential backoff (1s, 2s, 4s by default).
     """
 
     def __init__(self, targets: list[WebhookTarget] = None) -> None:
@@ -67,7 +75,7 @@ class WebhookDispatcher:
         for target in self._targets:
             if target.severity_filter and severity not in target.severity_filter:
                 continue
-            delivery = self._send(target, alert_payload)
+            delivery = self._send_with_retry(target, alert_payload)
             results.append(delivery)
             with self._lock:
                 self._delivery_log.append(delivery)
@@ -78,6 +86,25 @@ class WebhookDispatcher:
         """Non-blocking dispatch in a daemon thread."""
         t = threading.Thread(target=self.dispatch, args=(alert_payload,), daemon=True)
         t.start()
+
+    def _send_with_retry(self, target: WebhookTarget, payload: dict) -> WebhookDelivery:
+        last_error = None
+        for attempt in range(1, target.max_retries + 1):
+            delivery = self._send(target, payload)
+            if delivery.status == "sent":
+                delivery.attempts = attempt
+                return delivery
+            last_error = delivery.error
+            if attempt < target.max_retries:
+                backoff = target.backoff_base * (2 ** (attempt - 1))
+                time.sleep(backoff)
+
+        return WebhookDelivery(
+            url=target.url,
+            status="failed",
+            error=f"Failed after {target.max_retries} attempts: {last_error}",
+            attempts=target.max_retries,
+        )
 
     def _send(self, target: WebhookTarget, payload: dict) -> WebhookDelivery:
         body = json.dumps(payload).encode("utf-8")
