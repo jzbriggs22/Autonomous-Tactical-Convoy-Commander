@@ -22,10 +22,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,governance]"
 
-      - name: Run tests with coverage
-        run: python -m pytest -q --tb=short --cov=convoy_commander --cov-report=term-missing --cov-report=xml
+      - name: Run convoy commander tests
+        run: python -m pytest tests/ -q --tb=short --timeout=60 --ignore=tests/governance --cov=convoy_commander --cov-report=term-missing --cov-report=xml
+
+      - name: Run governance unit tests
+        run: python -m pytest tests/governance/ -q --tb=short --timeout=60 --ignore=tests/governance/test_behavioral.py --cov=ai_governance --cov-report=term-missing --cov-append
+
+      - name: Run governance behavioral regression suite
+        run: python -m pytest tests/governance/test_behavioral.py -v --tb=short --timeout=60
 
       - name: Type check
         run: python -m mypy convoy_commander/ --ignore-missing-imports

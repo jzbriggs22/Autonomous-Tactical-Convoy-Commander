@@ -12,6 +12,8 @@ from .drift import DriftDetector
 from .ingestion import IngestionLayer
 from .storage import GovernanceDB
 from .structured import DecisionDecoder, DecodeError, GovernanceDecision
+from .test_runner import GovernanceTestRunner
+from .webhooks import WebhookDispatcher
 
 __all__ = [
     "AlertEngine",
@@ -23,5 +25,7 @@ __all__ = [
     "GovernanceConfig",
     "GovernanceDB",
     "GovernanceDecision",
+    "GovernanceTestRunner",
     "IngestionLayer",
+    "WebhookDispatcher",
 ]
