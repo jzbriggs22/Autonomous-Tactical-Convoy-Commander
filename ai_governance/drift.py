@@ -28,9 +28,12 @@ class CategoryMetrics:
     avg_response_time_ms: float
     high_risk_count: int
     high_risk_escalation_rate: float
-    accuracy: Optional[float]         # None when <5 ground-truth events available
+    accuracy: Optional[float]               # None when <5 ground-truth events available
     high_risk_accuracy: Optional[float]
-    decision_entropy: float           # Shannon entropy across decision classes
+    decision_entropy: float                 # Shannon entropy across decision classes
+    # Structured-decision metrics (None when metadata not present)
+    agent_risk_calibration: Optional[float] = None  # agreement: agent risk_level vs governance
+    avg_confidence: Optional[float] = None          # mean confidence from GovernanceDecision
 
 
 @dataclass
@@ -73,6 +76,8 @@ def _compute_metrics(records: list[DecisionRecord], category: str = "") -> Categ
     total_time = 0
     correct = gt_total = 0
     hr_correct = hr_gt_total = hr_escalated = hr_total = 0
+    calibration_agree = calibration_total = 0
+    confidence_sum = confidence_count = 0
 
     for r in records:
         counts[r.decision] = counts.get(r.decision, 0) + 1
@@ -89,6 +94,17 @@ def _compute_metrics(records: list[DecisionRecord], category: str = "") -> Categ
                 hr_gt_total += 1
                 if r.decision == r.ground_truth:
                     hr_correct += 1
+        # Structured-decision metadata
+        risk_level = r.metadata.get("risk_level") if r.metadata else None
+        if risk_level is not None:
+            calibration_total += 1
+            agent_says_hr = risk_level in ("high", "critical")
+            if agent_says_hr == r.is_high_risk:
+                calibration_agree += 1
+        confidence = r.metadata.get("confidence") if r.metadata else None
+        if isinstance(confidence, (int, float)):
+            confidence_sum += float(confidence)
+            confidence_count += 1
 
     entropy = -sum(
         (c / n) * math.log2(c / n)
@@ -108,19 +124,28 @@ def _compute_metrics(records: list[DecisionRecord], category: str = "") -> Categ
         accuracy=correct / gt_total if gt_total >= 5 else None,
         high_risk_accuracy=hr_correct / hr_gt_total if hr_gt_total >= 5 else None,
         decision_entropy=entropy,
+        agent_risk_calibration=(
+            calibration_agree / calibration_total if calibration_total >= 5 else None
+        ),
+        avg_confidence=(
+            confidence_sum / confidence_count if confidence_count >= 5 else None
+        ),
     )
 
 
 # Maps metric name → getter from CategoryMetrics
 _EXTRACTORS: dict[str, Callable[[CategoryMetrics], Optional[float]]] = {
-    "resolution_rate":          lambda m: m.resolution_rate,
-    "escalation_rate":          lambda m: m.escalation_rate,
-    "denial_rate":              lambda m: m.denial_rate,
-    "avg_response_time_ms":     lambda m: m.avg_response_time_ms,
+    "resolution_rate":           lambda m: m.resolution_rate,
+    "escalation_rate":           lambda m: m.escalation_rate,
+    "denial_rate":               lambda m: m.denial_rate,
+    "avg_response_time_ms":      lambda m: m.avg_response_time_ms,
     "high_risk_escalation_rate": lambda m: m.high_risk_escalation_rate,
-    "accuracy":                 lambda m: m.accuracy,
-    "high_risk_accuracy":       lambda m: m.high_risk_accuracy,
-    "decision_entropy":         lambda m: m.decision_entropy,
+    "accuracy":                  lambda m: m.accuracy,
+    "high_risk_accuracy":        lambda m: m.high_risk_accuracy,
+    "decision_entropy":          lambda m: m.decision_entropy,
+    # Structured-decision metrics (require GovernanceDecision metadata)
+    "agent_risk_calibration":    lambda m: m.agent_risk_calibration,
+    "avg_confidence":            lambda m: m.avg_confidence,
 }
 
 

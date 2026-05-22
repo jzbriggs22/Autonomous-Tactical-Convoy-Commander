@@ -61,6 +61,8 @@ class CategoryRow:
     drift_score: float
     violations: int
     severity: str  # "ok" | "warn" | "critical" | "rollback"
+    agent_risk_calibration: Optional[float] = None
+    avg_confidence: Optional[float] = None
 
 
 @dataclass
@@ -112,6 +114,14 @@ class DashboardSnapshot:
                     "drift_score": round(r.drift_score, 4),
                     "violations": r.violations,
                     "severity": r.severity,
+                    "agent_risk_calibration": (
+                        round(r.agent_risk_calibration, 4)
+                        if r.agent_risk_calibration is not None else None
+                    ),
+                    "avg_confidence": (
+                        round(r.avg_confidence, 4)
+                        if r.avg_confidence is not None else None
+                    ),
                 }
                 for r in self.category_breakdown
             ],
@@ -241,6 +251,8 @@ class DashboardBuilder:
                 drift_score=drift.category_drift_scores.get(cat, 0.0),
                 violations=len(viols),
                 severity=severity,
+                agent_risk_calibration=m.agent_risk_calibration,
+                avg_confidence=m.avg_confidence,
             ))
         return sorted(rows, key=lambda r: r.drift_score, reverse=True)
 
