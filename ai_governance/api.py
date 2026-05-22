@@ -31,6 +31,7 @@ from .ingestion import IngestRequest, IngestionLayer, ValidationError
 from .storage import GovernanceDB
 from .structured import DecodeError, DecisionDecoder, GovernanceDecision
 from .webhooks import WebhookDispatcher
+from .correlation import CorrelationMiddleware
 from .ui import DASHBOARD_HTML
 from . import metrics as _m
 
@@ -42,6 +43,7 @@ app = FastAPI(
     description="Observability and drift detection for AI agents",
 )
 app.add_middleware(AuthMiddleware)
+app.add_middleware(CorrelationMiddleware)
 configure_from_env()
 
 
@@ -762,6 +764,95 @@ def prometheus_metrics():
     from starlette.responses import Response as StarletteResponse
     body, content_type = _m.metrics_response()
     return StarletteResponse(content=body, media_type=content_type)
+
+
+# ── scheduler endpoints ─────────────────────────────────────────────────────
+
+_scheduler = None
+
+
+@app.post("/admin/scheduler/start")
+def start_scheduler(interval_seconds: float = 300.0):
+    """Start the background drift detection scheduler."""
+    global _scheduler
+    from .scheduler import DriftScheduler
+    svc = _get_svc()
+    if _scheduler is not None and _scheduler.is_running:
+        return {"status": "already_running", "interval": _scheduler.interval}
+    _scheduler = DriftScheduler(
+        svc.config, svc.db,
+        interval_seconds=interval_seconds,
+        webhooks=svc.webhooks,
+    )
+    _scheduler.start()
+    return {"status": "started", "interval": interval_seconds}
+
+
+@app.post("/admin/scheduler/stop")
+def stop_scheduler():
+    """Stop the background drift detection scheduler."""
+    global _scheduler
+    if _scheduler is None or not _scheduler.is_running:
+        return {"status": "not_running"}
+    _scheduler.stop()
+    return {"status": "stopped"}
+
+
+@app.get("/admin/scheduler/status")
+def scheduler_status():
+    """Return scheduler status and run statistics."""
+    if _scheduler is None:
+        return {"running": False}
+    stats = _scheduler.stats
+    return {
+        "running": _scheduler.is_running,
+        "interval": _scheduler.interval,
+        "total_runs": stats.total_runs,
+        "total_violations_found": stats.total_violations_found,
+        "total_alerts_fired": stats.total_alerts_fired,
+        "total_rollbacks_triggered": stats.total_rollbacks_triggered,
+        "last_run_at": stats.last_run_at.isoformat() if stats.last_run_at else None,
+        "last_drift_score": stats.last_drift_score,
+        "last_run_duration_ms": stats.last_run_duration_ms,
+        "consecutive_failures": stats.consecutive_failures,
+        "total_failures": stats.total_failures,
+    }
+
+
+@app.get("/admin/scheduler/history")
+def scheduler_history(limit: int = 20):
+    """Return recent scheduler run results."""
+    if _scheduler is None:
+        return []
+    history = _scheduler.history
+    return history[-min(limit, len(history)):]
+
+
+# ── compliance report endpoint ──────────────────────────────────────────────
+
+@app.get("/admin/report")
+def compliance_report(since: Optional[str] = None):
+    """Generate a governance compliance report."""
+    from .reports import ReportGenerator
+    svc = _get_svc()
+    audit = AuditLog(svc.db)
+    gen = ReportGenerator(svc.config, svc.db, svc.detector, svc.engine, audit)
+    since_dt = datetime.fromisoformat(since.replace(" ", "+")) if since else None
+    report = gen.generate(since=since_dt)
+    return json.loads(report.to_json())
+
+
+@app.get("/admin/report/text")
+def compliance_report_text(since: Optional[str] = None):
+    """Generate a human-readable governance compliance report."""
+    from starlette.responses import Response as StarletteResponse
+    from .reports import ReportGenerator
+    svc = _get_svc()
+    audit = AuditLog(svc.db)
+    gen = ReportGenerator(svc.config, svc.db, svc.detector, svc.engine, audit)
+    since_dt = datetime.fromisoformat(since.replace(" ", "+")) if since else None
+    report = gen.generate(since=since_dt)
+    return StarletteResponse(content=report.to_text(), media_type="text/plain")
 
 
 if __name__ == "__main__":

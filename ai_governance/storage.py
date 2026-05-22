@@ -144,6 +144,13 @@ class GovernanceDB:
         with self._lock:
             return self._conn.execute(q, params).fetchone()[0]
 
+    def count_high_risk_decisions(self, agent_id: str) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM decisions WHERE agent_id=? AND is_high_risk=1",
+                (agent_id,),
+            ).fetchone()[0]
+
     def _to_decision(self, row: sqlite3.Row) -> DecisionRecord:
         return DecisionRecord(
             event_id=row["event_id"],

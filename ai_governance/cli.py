@@ -184,6 +184,22 @@ def cmd_migrate(_args) -> int:
     return 0
 
 
+def cmd_report(args) -> int:
+    from .alerts import AlertEngine
+    from .audit import AuditLog
+    from .drift import DriftDetector
+    from .reports import ReportGenerator
+
+    cfg, db, det, eng, audit, _ = _get_services()
+    gen = ReportGenerator(cfg, db, det, eng, audit)
+    report = gen.generate()
+    if args.json:
+        print(report.to_json())
+    else:
+        print(report.to_text())
+    return 0
+
+
 def cmd_serve(_args) -> int:
     import uvicorn
     from .api import app
@@ -214,6 +230,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("config", help="Show active governance config")
     sub.add_parser("test", help="Run behavioral regression tests")
     sub.add_parser("migrate", help="Show schema migration status")
+
+    report_p = sub.add_parser("report", help="Generate compliance report")
+    report_p.add_argument("--json", action="store_true", help="JSON format")
+
     sub.add_parser("serve", help="Start HTTP API server")
 
     args = parser.parse_args(argv)
@@ -230,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         "config": cmd_config,
         "test": cmd_test,
         "migrate": cmd_migrate,
+        "report": cmd_report,
         "serve": cmd_serve,
     }
     return commands[args.command](args)
