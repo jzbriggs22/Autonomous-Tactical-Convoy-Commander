@@ -969,6 +969,108 @@ def replay_with_config(body: dict, limit: int = 10000, category: Optional[str] =
     }
 
 
+# ── trend analysis endpoints ─────────────────────────────────────────────────
+
+@app.get("/trends")
+def get_trends(category: Optional[str] = None, limit: int = 30):
+    """Analyze metric trends to detect drift acceleration before thresholds breach."""
+    from .trend import TrendAnalyzer
+    svc = _get_svc()
+    analyzer = TrendAnalyzer(svc.config, svc.db, history_limit=min(limit, 200))
+    report = analyzer.analyze(category=category)
+    return {
+        "agent_id": report.agent_id,
+        "generated_at": report.generated_at,
+        "overall_trajectory": report.overall_trajectory,
+        "has_concerns": report.has_concerns,
+        "accelerating": [_trend_to_dict(t) for t in report.accelerating],
+        "rising": [_trend_to_dict(t) for t in report.rising],
+        "recovering": [_trend_to_dict(t) for t in report.recovering],
+        "stable": [_trend_to_dict(t) for t in report.stable],
+        "summary": report.summary(),
+    }
+
+
+def _trend_to_dict(t) -> dict:
+    return {
+        "category": t.category,
+        "metric": t.metric,
+        "direction": t.direction,
+        "slope_per_run": round(t.slope_per_run, 6),
+        "acceleration": round(t.slope_per_run_squared, 6),
+        "current_value": round(t.current_value, 4),
+        "baseline_value": round(t.baseline_value, 4) if t.baseline_value is not None else None,
+        "pct_of_threshold": round(t.pct_of_threshold, 4) if t.pct_of_threshold is not None else None,
+        "data_points": t.data_points,
+    }
+
+
+# ── readiness check endpoint ─────────────────────────────────────────────────
+
+@app.get("/admin/readiness")
+def deployment_readiness(required_categories: Optional[str] = None):
+    """Run pre-deployment governance readiness checks.
+
+    Returns a structured report indicating whether the agent is safe to deploy.
+    Blockers prevent deployment; warnings are advisory. Suitable for CI/CD gating.
+    """
+    from .readiness import ReadinessChecker
+    svc = _get_svc()
+    required = [c.strip() for c in required_categories.split(",")] if required_categories else []
+    checker = ReadinessChecker(svc.config, svc.db, required_categories=required)
+    report = checker.check()
+    svc.audit.append(
+        svc.config.agent_id, "readiness.checked", "system", "deployment",
+        detail={
+            "ready": report.ready,
+            "blockers": len(report.blockers),
+            "warnings": len(report.warnings),
+        },
+    )
+    return {
+        "agent_id": report.agent_id,
+        "config_version": report.config_version,
+        "config_fingerprint": report.config_fingerprint,
+        "checked_at": report.checked_at,
+        "ready": report.ready,
+        "total_checks": report.total_checks,
+        "blockers": [_check_to_dict(c) for c in report.blockers],
+        "warnings": [_check_to_dict(c) for c in report.warnings],
+        "passed": [_check_to_dict(c) for c in report.passed],
+        "summary": report.summary(),
+    }
+
+
+def _check_to_dict(c) -> dict:
+    return {
+        "name": c.name,
+        "passed": c.passed,
+        "severity": c.severity,
+        "message": c.message,
+        "detail": c.detail,
+    }
+
+
+# ── multi-agent listing endpoint ─────────────────────────────────────────────
+
+@app.get("/agents")
+def list_agents():
+    """List all agent IDs present in the database with their summary stats."""
+    svc = _get_svc()
+    agents = svc.db.list_agents()
+    result = []
+    for agent_id in agents:
+        counts = svc.db.get_table_counts(agent_id)
+        result.append({
+            "agent_id": agent_id,
+            "is_current": agent_id == svc.config.agent_id,
+            "decision_count": counts.get("decisions", 0),
+            "alert_count": counts.get("alerts", 0),
+            "rollback_count": counts.get("rollbacks", 0),
+        })
+    return result
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))

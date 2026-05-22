@@ -413,6 +413,14 @@ class GovernanceDB:
                 counts[name] = self._conn.execute(sql, (agent_id,)).fetchone()[0]
         return counts
 
+    def list_agents(self) -> list[str]:
+        """Return all distinct agent IDs present in the database."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT agent_id FROM decisions ORDER BY agent_id"
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def export_decisions(
         self,
         agent_id: str,

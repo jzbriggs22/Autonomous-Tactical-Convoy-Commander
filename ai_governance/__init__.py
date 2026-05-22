@@ -12,11 +12,13 @@ from .correlation import CorrelationMiddleware, get_correlation_id
 from .dashboard import DashboardBuilder
 from .drift import DriftDetector
 from .ingestion import IngestionLayer
+from .readiness import ReadinessChecker, ReadinessReport
 from .reports import ComplianceReport, ReportGenerator
 from .scheduler import DriftScheduler
 from .storage import GovernanceDB
 from .structured import DecisionDecoder, DecodeError, GovernanceDecision
 from .test_runner import GovernanceTestRunner
+from .trend import TrendAnalyzer, TrendReport
 from .webhooks import WebhookDispatcher
 
 __all__ = [
@@ -38,6 +40,10 @@ __all__ = [
     "GovernanceDecision",
     "GovernanceTestRunner",
     "IngestionLayer",
+    "ReadinessChecker",
+    "ReadinessReport",
     "ReportGenerator",
+    "TrendAnalyzer",
+    "TrendReport",
     "WebhookDispatcher",
 ]
