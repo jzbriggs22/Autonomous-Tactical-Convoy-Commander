@@ -682,6 +682,17 @@ def web_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
 
+@app.get("/admin/migrations")
+def get_migration_status():
+    """Return schema migration status — applied versions and any pending migrations."""
+    from .migrations import migration_status, current_version
+    svc = _get_svc()
+    with svc.db._lock:
+        status = migration_status(svc.db._conn)
+        version = current_version(svc.db._conn)
+    return {"schema_version": version, "migrations": status}
+
+
 @app.get("/metrics")
 def prometheus_metrics():
     """Prometheus metrics endpoint for scraping."""

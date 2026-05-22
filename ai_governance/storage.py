@@ -15,74 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-_SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-
-CREATE TABLE IF NOT EXISTS decisions (
-    event_id            TEXT PRIMARY KEY,
-    agent_id            TEXT NOT NULL,
-    timestamp           TEXT NOT NULL,
-    case_id             TEXT NOT NULL,
-    case_category       TEXT NOT NULL,
-    is_high_risk        INTEGER NOT NULL DEFAULT 0,
-    high_risk_score     REAL    NOT NULL DEFAULT 0.0,
-    decision            TEXT NOT NULL,
-    resolution_time_ms  INTEGER NOT NULL,
-    ground_truth        TEXT,
-    metadata_json       TEXT NOT NULL DEFAULT '{}',
-    config_version      TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_dec_agent_ts  ON decisions (agent_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_dec_cat       ON decisions (agent_id, case_category, timestamp);
-CREATE INDEX IF NOT EXISTS idx_dec_hr        ON decisions (agent_id, is_high_risk, timestamp);
-
-CREATE TABLE IF NOT EXISTS baselines (
-    agent_id        TEXT NOT NULL,
-    category        TEXT NOT NULL,
-    metric          TEXT NOT NULL,
-    computed_at     TEXT NOT NULL,
-    value           REAL NOT NULL,
-    sample_count    INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, category, metric)
-);
-
-CREATE TABLE IF NOT EXISTS alerts (
-    alert_id        TEXT PRIMARY KEY,
-    agent_id        TEXT NOT NULL,
-    timestamp       TEXT NOT NULL,
-    rule_name       TEXT NOT NULL,
-    severity        TEXT NOT NULL,
-    message         TEXT NOT NULL,
-    metrics_json    TEXT NOT NULL DEFAULT '{}',
-    acknowledged    INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_alert_agent_ts ON alerts (agent_id, timestamp);
-
-CREATE TABLE IF NOT EXISTS rollbacks (
-    rollback_id     TEXT PRIMARY KEY,
-    agent_id        TEXT NOT NULL,
-    timestamp       TEXT NOT NULL,
-    trigger_rule    TEXT NOT NULL,
-    reason          TEXT NOT NULL,
-    metrics_json    TEXT NOT NULL DEFAULT '{}',
-    resolved        INTEGER NOT NULL DEFAULT 0,
-    resolved_at     TEXT,
-    resolved_by     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_rb_agent_ts ON rollbacks (agent_id, timestamp);
-
-CREATE TABLE IF NOT EXISTS metric_snapshots (
-    snapshot_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id        TEXT NOT NULL,
-    timestamp       TEXT NOT NULL,
-    category        TEXT NOT NULL,
-    metric          TEXT NOT NULL,
-    value           REAL NOT NULL,
-    sample_count    INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_snap_agent_cat ON metric_snapshots (agent_id, category, metric, timestamp);
-"""
+from .migrations import apply_migrations
 
 
 @dataclass
@@ -139,8 +72,7 @@ class GovernanceDB:
         with self._lock:
             self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
-            self._conn.executescript(_SCHEMA)
-            self._conn.commit()
+            apply_migrations(self._conn)
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
