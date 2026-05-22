@@ -607,6 +607,41 @@ def purge_old_data(
     }
 
 
+@app.post("/admin/reload-config")
+def reload_config(body: dict):
+    """Hot-reload governance config without restarting the server.
+
+    Accepts a full GovernanceConfig JSON body. Validates before swapping.
+    Preserves DB, audit log, and webhook dispatcher across reloads.
+    """
+    svc = _get_svc()
+    old_version = svc.config.version
+    old_fingerprint = svc.config.fingerprint
+    try:
+        new_config = GovernanceConfig.model_validate(body)
+    except Exception as exc:
+        raise HTTPException(422, f"Invalid config: {exc}")
+    svc.config = new_config
+    svc.ingestion = IngestionLayer(new_config, svc.db)
+    svc.detector = DriftDetector(new_config, svc.db)
+    svc.engine = AlertEngine(new_config, svc.db)
+    svc.dashboard = DashboardBuilder(new_config, svc.db, svc.detector, svc.engine)
+    svc.audit.append(
+        new_config.agent_id, "config.reloaded", "admin", "config",
+        detail={
+            "old_version": old_version,
+            "old_fingerprint": old_fingerprint,
+            "new_version": new_config.version,
+            "new_fingerprint": new_config.fingerprint,
+        },
+    )
+    return {
+        "status": "reloaded",
+        "old_version": f"{old_version}:{old_fingerprint}",
+        "new_version": f"{new_config.version}:{new_config.fingerprint}",
+    }
+
+
 @app.get("/audit")
 def get_audit(action: Optional[str] = None, limit: int = 50):
     svc = _get_svc()
