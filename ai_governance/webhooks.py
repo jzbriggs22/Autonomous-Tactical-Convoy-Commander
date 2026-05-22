@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -50,10 +51,24 @@ class WebhookDispatcher:
     with exponential backoff (1s, 2s, 4s by default).
     """
 
-    def __init__(self, targets: list[WebhookTarget] = None) -> None:
+    def __init__(
+        self,
+        targets: list[WebhookTarget] = None,
+        *,
+        queue_size: int = 1000,
+        worker_count: int = 2,
+    ) -> None:
         self._targets = list(targets or [])
         self._delivery_log: list[WebhookDelivery] = []
         self._lock = threading.Lock()
+        self._queue: queue.Queue[Optional[dict]] = queue.Queue(maxsize=queue_size)
+        self._queue_size = queue_size
+        self._dropped = 0
+        self._workers: list[threading.Thread] = []
+        for i in range(worker_count):
+            w = threading.Thread(target=self._worker_loop, daemon=True, name=f"webhook-worker-{i}")
+            w.start()
+            self._workers.append(w)
 
     def add_target(self, target: WebhookTarget) -> None:
         self._targets.append(target)
@@ -82,10 +97,45 @@ class WebhookDispatcher:
 
         return results
 
-    def dispatch_async(self, alert_payload: dict) -> None:
-        """Non-blocking dispatch in a daemon thread."""
-        t = threading.Thread(target=self.dispatch, args=(alert_payload,), daemon=True)
-        t.start()
+    @property
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped
+
+    def dispatch_async(self, alert_payload: dict) -> bool:
+        """Enqueue payload for async delivery. Returns False if queue is full (backpressure)."""
+        try:
+            self._queue.put_nowait(alert_payload)
+            return True
+        except queue.Full:
+            self._dropped += 1
+            logger.warning("Webhook queue full (max %d), dropping payload", self._queue_size)
+            return False
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Signal workers to stop and wait for drain."""
+        for _ in self._workers:
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+        for w in self._workers:
+            w.join(timeout=timeout)
+
+    def _worker_loop(self) -> None:
+        while True:
+            payload = self._queue.get()
+            if payload is None:
+                break
+            try:
+                self.dispatch(payload)
+            except Exception:
+                logger.exception("Webhook worker error")
+            finally:
+                self._queue.task_done()
 
     def _send_with_retry(self, target: WebhookTarget, payload: dict) -> WebhookDelivery:
         last_error = None

@@ -137,6 +137,42 @@ class TestWebhookDispatcher:
         time.sleep(0.3)
         assert len(_CaptureHandler.received) == 1
 
+    def test_queue_backpressure_drops_when_full(self):
+        dispatcher = WebhookDispatcher(queue_size=2, worker_count=0)
+        assert dispatcher.dispatch_async({"severity": "info", "message": "1"}) is True
+        assert dispatcher.dispatch_async({"severity": "info", "message": "2"}) is True
+        assert dispatcher.dispatch_async({"severity": "info", "message": "3"}) is False
+        assert dispatcher.dropped_count == 1
+
+    def test_queue_depth_tracks_pending(self):
+        dispatcher = WebhookDispatcher(queue_size=10, worker_count=0)
+        assert dispatcher.queue_depth == 0
+        dispatcher.dispatch_async({"severity": "info", "message": "pending"})
+        assert dispatcher.queue_depth == 1
+
+    def test_worker_processes_queue(self, capture_server):
+        dispatcher = WebhookDispatcher(
+            [WebhookTarget(url=f"{capture_server}/worker")],
+            queue_size=10,
+            worker_count=1,
+        )
+        dispatcher.dispatch_async({"severity": "info", "message": "queued"})
+        import time
+        time.sleep(0.5)
+        assert len(_CaptureHandler.received) == 1
+        assert _CaptureHandler.received[0]["body"]["message"] == "queued"
+
+    def test_shutdown_drains_queue(self, capture_server):
+        dispatcher = WebhookDispatcher(
+            [WebhookTarget(url=f"{capture_server}/drain")],
+            queue_size=10,
+            worker_count=1,
+        )
+        for i in range(3):
+            dispatcher.dispatch_async({"severity": "info", "message": f"drain-{i}"})
+        dispatcher.shutdown(timeout=5.0)
+        assert len(_CaptureHandler.received) == 3
+
 
 class TestWebhookRetry:
     def test_retry_on_failure_records_attempts(self):
