@@ -7,6 +7,7 @@ Start with:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime
@@ -653,6 +654,55 @@ def reload_config(body: dict):
         "status": "reloaded",
         "old_version": f"{old_version}:{old_fingerprint}",
         "new_version": f"{new_config.version}:{new_config.fingerprint}",
+    }
+
+
+_last_snapshot: Optional[dict] = None
+
+
+@app.post("/admin/snapshot")
+def take_snapshot():
+    """Capture current governance state for later comparison."""
+    global _last_snapshot
+    from .snapshots import StateSnapshot
+    svc = _get_svc()
+    snap = svc.dashboard.build()
+    state = StateSnapshot.from_dashboard(snap, svc.config)
+    _last_snapshot = json.loads(state.to_json())
+    return _last_snapshot
+
+
+@app.post("/admin/diff")
+def diff_snapshot(body: dict = None):
+    """Compare current state against the last saved snapshot (or a provided one)."""
+    from .snapshots import StateSnapshot, diff_snapshots
+    svc = _get_svc()
+    snap = svc.dashboard.build()
+    current = StateSnapshot.from_dashboard(snap, svc.config)
+
+    old_data = body or _last_snapshot
+    if old_data is None:
+        raise HTTPException(400, "No previous snapshot. POST /admin/snapshot first, or provide one in the body.")
+    old = StateSnapshot.from_json(json.dumps(old_data))
+    result = diff_snapshots(old, current)
+    return {
+        "old_timestamp": result.old_timestamp,
+        "new_timestamp": result.new_timestamp,
+        "safety_changed": result.safety_changed,
+        "config_changed": result.config_changed,
+        "has_regressions": result.has_regressions,
+        "items": [
+            {
+                "field": d.field,
+                "category": d.category,
+                "old_value": d.old_value,
+                "new_value": d.new_value,
+                "delta": d.delta,
+                "severity": d.severity,
+            }
+            for d in result.items
+        ],
+        "summary": result.summary(),
     }
 
 
