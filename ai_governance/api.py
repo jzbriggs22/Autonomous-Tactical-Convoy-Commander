@@ -855,6 +855,120 @@ def compliance_report_text(since: Optional[str] = None):
     return StarletteResponse(content=report.to_text(), media_type="text/plain")
 
 
+# ── retention endpoint ───────────────────────────────────────────────────────
+
+@app.post("/admin/retention")
+def apply_retention(
+    decisions_days: int = 90,
+    alerts_days: int = 180,
+    snapshots_days: int = 90,
+):
+    """Apply data retention policy — delete old data beyond the configured TTL."""
+    from .retention import RetentionManager, RetentionPolicy
+    svc = _get_svc()
+    policy = RetentionPolicy(
+        decisions_days=decisions_days,
+        alerts_days=alerts_days,
+        metric_snapshots_days=snapshots_days,
+    )
+    mgr = RetentionManager(svc.db, policy)
+    result = mgr.apply(svc.config.agent_id)
+    if result.total_deleted > 0:
+        svc.audit.append(
+            svc.config.agent_id, "retention.applied", "admin", "system",
+            detail={
+                "decisions_deleted": result.decisions_deleted,
+                "alerts_deleted": result.alerts_deleted,
+                "snapshots_deleted": result.snapshots_deleted,
+                "policy": {
+                    "decisions_days": decisions_days,
+                    "alerts_days": alerts_days,
+                    "snapshots_days": snapshots_days,
+                },
+            },
+        )
+    return {
+        "decisions_deleted": result.decisions_deleted,
+        "alerts_deleted": result.alerts_deleted,
+        "snapshots_deleted": result.snapshots_deleted,
+        "total_deleted": result.total_deleted,
+    }
+
+
+@app.get("/admin/retention/preview")
+def preview_retention():
+    """Preview what retention would delete without actually deleting."""
+    from .retention import RetentionManager
+    svc = _get_svc()
+    mgr = RetentionManager(svc.db)
+    return mgr.dry_run(svc.config.agent_id)
+
+
+# ── replay endpoint ──────────────────────────────────────────────────────────
+
+@app.post("/admin/replay")
+def replay_with_config(body: dict, limit: int = 10000, category: Optional[str] = None):
+    """Replay historical events against a candidate config to preview policy impact.
+
+    POST body is the candidate GovernanceConfig JSON. Returns a comparison
+    of drift scores, alert counts, and risk classification changes.
+    """
+    from .replay import EventReplayer
+    svc = _get_svc()
+    try:
+        candidate = GovernanceConfig.model_validate(body)
+    except Exception as exc:
+        raise HTTPException(422, f"Invalid candidate config: {exc}")
+
+    replayer = EventReplayer(svc.config, candidate, svc.db)
+    result = replayer.replay(limit=min(limit, 50000), category=category)
+
+    svc.audit.append(
+        svc.config.agent_id, "replay.executed", "admin", "config",
+        detail={
+            "events_replayed": result.events_replayed,
+            "candidate_version": result.candidate_config_version,
+            "risk_reclassified": result.risk_reclassified_count,
+        },
+    )
+
+    return {
+        "events_replayed": result.events_replayed,
+        "live_config_version": result.live_config_version,
+        "candidate_config_version": result.candidate_config_version,
+        "high_risk": {
+            "live": result.live_high_risk_count,
+            "candidate": result.candidate_high_risk_count,
+            "newly_classified": result.new_high_risk_count,
+            "no_longer_flagged": result.no_longer_high_risk_count,
+            "total_reclassified": result.risk_reclassified_count,
+        },
+        "drift": {
+            "live_score": result.live_drift_score,
+            "candidate_score": result.candidate_drift_score,
+            "live_violations": result.live_violations,
+            "candidate_violations": result.candidate_violations,
+        },
+        "alerts": {
+            "live_would_fire": result.live_alerts_would_fire,
+            "candidate_would_fire": result.candidate_alerts_would_fire,
+        },
+        "diffs_count": len(result.diffs),
+        "diffs": [
+            {
+                "event_id": d.event_id,
+                "category": d.case_category,
+                "live_high_risk": d.live_is_high_risk,
+                "candidate_high_risk": d.candidate_is_high_risk,
+                "live_patterns": d.live_patterns,
+                "candidate_patterns": d.candidate_patterns,
+            }
+            for d in result.diffs[:100]
+        ],
+        "summary": result.summary(),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
