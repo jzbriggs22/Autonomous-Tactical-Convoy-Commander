@@ -73,6 +73,7 @@ class IngestionLayer:
             resolution_time_ms=req.resolution_time_ms,
             ground_truth=req.ground_truth,
             metadata=req.metadata,
+            config_version=f"{self._config.version}:{self._config.fingerprint}",
         )
         self._db.insert_decision(rec)
         return IngestResult(

@@ -92,6 +92,13 @@ class GovernanceConfig(BaseModel):
     agent_id: str = "default-agent"
     version: str = "1.0.0"
 
+    @property
+    def fingerprint(self) -> str:
+        """Stable short hash of this config for version tracking across decisions."""
+        import hashlib
+        canon = self.model_dump_json(exclude={"agent_id"})
+        return hashlib.sha256(canon.encode()).hexdigest()[:12]
+
     high_risk_patterns: list[HighRiskPattern] = Field(default_factory=list)
     drift_thresholds: list[DriftThreshold] = Field(default_factory=list)
     rollback_conditions: list[RollbackCondition] = Field(default_factory=list)

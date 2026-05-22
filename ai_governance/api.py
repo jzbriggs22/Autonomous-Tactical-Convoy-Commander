@@ -430,6 +430,153 @@ def get_metric_history(category: str, metric: str, limit: int = 50):
     }
 
 
+@app.get("/health")
+def health_check():
+    """Health check endpoint — verifies DB is responsive and returns system stats."""
+    svc = _get_svc()
+    try:
+        counts = svc.db.get_table_counts(svc.config.agent_id)
+        is_safe, reason = svc.engine.is_agent_safe()
+        valid, broken_seq = svc.audit.verify_chain(svc.config.agent_id)
+        return {
+            "status": "healthy",
+            "agent_id": svc.config.agent_id,
+            "config_version": svc.config.version,
+            "is_safe": is_safe,
+            "audit_chain_valid": valid,
+            "table_counts": counts,
+        }
+    except Exception as exc:
+        return {"status": "unhealthy", "error": str(exc)}
+
+
+@app.get("/config")
+def get_config():
+    """Return the active governance configuration (read-only)."""
+    svc = _get_svc()
+    return {
+        "agent_id": svc.config.agent_id,
+        "version": svc.config.version,
+        "min_baseline_events": svc.config.min_baseline_events,
+        "recent_window_size": svc.config.recent_window_size,
+        "high_risk_patterns": [
+            {"name": p.name, "field": p.field, "pattern": p.pattern, "weight": p.weight}
+            for p in svc.config.high_risk_patterns
+        ],
+        "drift_thresholds": [
+            {
+                "name": t.name, "category": t.category, "metric": t.metric,
+                "max_delta": t.max_delta, "direction": t.direction.value,
+                "severity": t.severity.value,
+            }
+            for t in svc.config.drift_thresholds
+        ],
+        "rollback_conditions": [
+            {"name": c.name, "description": c.description, "expression": c.expression}
+            for c in svc.config.rollback_conditions
+        ],
+    }
+
+
+@app.get("/export/decisions")
+def export_decisions(
+    category: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 10000,
+    format: str = "json",
+):
+    """Export decisions for compliance/audit. Supports JSON and CSV formats."""
+    svc = _get_svc()
+    since_dt = datetime.fromisoformat(since.replace(" ", "+")) if since else None
+    until_dt = datetime.fromisoformat(until.replace(" ", "+")) if until else None
+    records = svc.db.export_decisions(
+        svc.config.agent_id,
+        category=category,
+        since=since_dt,
+        until=until_dt,
+        limit=min(limit, 50000),
+    )
+    if format == "csv":
+        import csv
+        import io
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=[
+            "event_id", "timestamp", "case_id", "case_category", "is_high_risk",
+            "high_risk_score", "decision", "resolution_time_ms", "ground_truth",
+        ])
+        writer.writeheader()
+        for r in records:
+            writer.writerow({
+                "event_id": r.event_id,
+                "timestamp": r.timestamp.isoformat(),
+                "case_id": r.case_id,
+                "case_category": r.case_category,
+                "is_high_risk": r.is_high_risk,
+                "high_risk_score": round(r.high_risk_score, 4),
+                "decision": r.decision,
+                "resolution_time_ms": r.resolution_time_ms,
+                "ground_truth": r.ground_truth or "",
+            })
+        from fastapi.responses import Response
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=decisions_export.csv"},
+        )
+    return {
+        "count": len(records),
+        "records": [
+            {
+                "event_id": r.event_id,
+                "timestamp": r.timestamp.isoformat(),
+                "case_id": r.case_id,
+                "case_category": r.case_category,
+                "is_high_risk": r.is_high_risk,
+                "high_risk_score": round(r.high_risk_score, 4),
+                "decision": r.decision,
+                "resolution_time_ms": r.resolution_time_ms,
+                "ground_truth": r.ground_truth,
+                "metadata": r.metadata,
+            }
+            for r in records
+        ],
+    }
+
+
+@app.post("/admin/purge")
+def purge_old_data(
+    decisions_days: int = 90,
+    snapshots_days: int = 90,
+    alerts_days: int = 180,
+):
+    """Purge old data to prevent unbounded DB growth. Only deletes acknowledged alerts."""
+    svc = _get_svc()
+    deleted_decisions = svc.db.purge_old_decisions(svc.config.agent_id, keep_days=decisions_days)
+    deleted_snapshots = svc.db.purge_old_snapshots(svc.config.agent_id, keep_days=snapshots_days)
+    deleted_alerts = svc.db.purge_old_alerts(svc.config.agent_id, keep_days=alerts_days)
+    total = deleted_decisions + deleted_snapshots + deleted_alerts
+    if total > 0:
+        svc.audit.append(
+            svc.config.agent_id, "data.purged", "admin", "system",
+            detail={
+                "decisions_deleted": deleted_decisions,
+                "snapshots_deleted": deleted_snapshots,
+                "alerts_deleted": deleted_alerts,
+                "retention_days": {
+                    "decisions": decisions_days,
+                    "snapshots": snapshots_days,
+                    "alerts": alerts_days,
+                },
+            },
+        )
+    return {
+        "decisions_deleted": deleted_decisions,
+        "snapshots_deleted": deleted_snapshots,
+        "alerts_deleted": deleted_alerts,
+    }
+
+
 @app.get("/audit")
 def get_audit(action: Optional[str] = None, limit: int = 50):
     svc = _get_svc()

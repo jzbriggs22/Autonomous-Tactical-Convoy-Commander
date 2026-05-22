@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     decision            TEXT NOT NULL,
     resolution_time_ms  INTEGER NOT NULL,
     ground_truth        TEXT,
-    metadata_json       TEXT NOT NULL DEFAULT '{}'
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    config_version      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_dec_agent_ts  ON decisions (agent_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_dec_cat       ON decisions (agent_id, case_category, timestamp);
@@ -97,6 +98,7 @@ class DecisionRecord:
     resolution_time_ms: int
     ground_truth: Optional[str] = None
     metadata: dict = field(default_factory=dict)
+    config_version: str = ""
 
 
 @dataclass
@@ -159,14 +161,14 @@ class GovernanceDB:
                 INSERT OR REPLACE INTO decisions
                   (event_id, agent_id, timestamp, case_id, case_category,
                    is_high_risk, high_risk_score, decision, resolution_time_ms,
-                   ground_truth, metadata_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                   ground_truth, metadata_json, config_version)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rec.event_id, rec.agent_id, rec.timestamp.isoformat(),
                     rec.case_id, rec.case_category, int(rec.is_high_risk),
                     rec.high_risk_score, rec.decision, rec.resolution_time_ms,
-                    rec.ground_truth, json.dumps(rec.metadata),
+                    rec.ground_truth, json.dumps(rec.metadata), rec.config_version,
                 ),
             )
 
@@ -223,6 +225,7 @@ class GovernanceDB:
             resolution_time_ms=row["resolution_time_ms"],
             ground_truth=row["ground_truth"],
             metadata=json.loads(row["metadata_json"]),
+            config_version=row["config_version"] if "config_version" in row.keys() else "",
         )
 
     # ── baselines ────────────────────────────────────────────────────────────
@@ -423,3 +426,77 @@ class GovernanceDB:
             if self._conn:
                 self._conn.close()
                 self._conn = None
+
+    # ── data retention ──────────────────────────────────────────────────────
+
+    def purge_old_decisions(self, agent_id: str, keep_days: int = 90) -> int:
+        """Delete decisions older than keep_days. Returns count deleted."""
+        cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=keep_days)
+        with self._tx() as c:
+            cur = c.execute(
+                "DELETE FROM decisions WHERE agent_id=? AND timestamp < ?",
+                (agent_id, cutoff.isoformat()),
+            )
+            return cur.rowcount
+
+    def purge_old_snapshots(self, agent_id: str, keep_days: int = 90) -> int:
+        """Delete metric snapshots older than keep_days."""
+        cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=keep_days)
+        with self._tx() as c:
+            cur = c.execute(
+                "DELETE FROM metric_snapshots WHERE agent_id=? AND timestamp < ?",
+                (agent_id, cutoff.isoformat()),
+            )
+            return cur.rowcount
+
+    def purge_old_alerts(self, agent_id: str, keep_days: int = 180) -> int:
+        """Delete acknowledged alerts older than keep_days."""
+        cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=keep_days)
+        with self._tx() as c:
+            cur = c.execute(
+                "DELETE FROM alerts WHERE agent_id=? AND acknowledged=1 AND timestamp < ?",
+                (agent_id, cutoff.isoformat()),
+            )
+            return cur.rowcount
+
+    def get_table_counts(self, agent_id: str) -> dict[str, int]:
+        """Return row counts per table for this agent (for health monitoring)."""
+        tables = {
+            "decisions": "SELECT COUNT(*) FROM decisions WHERE agent_id=?",
+            "baselines": "SELECT COUNT(*) FROM baselines WHERE agent_id=?",
+            "alerts": "SELECT COUNT(*) FROM alerts WHERE agent_id=?",
+            "rollbacks": "SELECT COUNT(*) FROM rollbacks WHERE agent_id=?",
+            "metric_snapshots": "SELECT COUNT(*) FROM metric_snapshots WHERE agent_id=?",
+        }
+        counts = {}
+        with self._lock:
+            for name, sql in tables.items():
+                counts[name] = self._conn.execute(sql, (agent_id,)).fetchone()[0]
+        return counts
+
+    def export_decisions(
+        self,
+        agent_id: str,
+        *,
+        category: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        limit: int = 10000,
+    ) -> list[DecisionRecord]:
+        """Export decisions matching filters (for compliance/audit)."""
+        q = "SELECT * FROM decisions WHERE agent_id=?"
+        params: list = [agent_id]
+        if category and category != "*":
+            q += " AND case_category=?"
+            params.append(category)
+        if since:
+            q += " AND timestamp >= ?"
+            params.append(since.isoformat())
+        if until:
+            q += " AND timestamp <= ?"
+            params.append(until.isoformat())
+        q += " ORDER BY timestamp ASC LIMIT ?"
+        params.append(min(limit, 50000))
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        return [self._to_decision(r) for r in rows]
