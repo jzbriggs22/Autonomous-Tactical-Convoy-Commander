@@ -14,6 +14,8 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
+import time as _time
+
 from .alerts import AlertEngine
 from .audit import AuditLog
 from .auth import AuthMiddleware, configure_from_env
@@ -24,6 +26,7 @@ from .ingestion import IngestRequest, IngestionLayer, ValidationError
 from .storage import GovernanceDB
 from .structured import DecodeError, DecisionDecoder, GovernanceDecision
 from .webhooks import WebhookDispatcher
+from . import metrics as _m
 
 # ── app + lazy singleton wiring ──────────────────────────────────────────────
 
@@ -141,10 +144,21 @@ def ingest_event(body: DecisionRequest):
         timestamp=body.timestamp,
         event_id=body.event_id,
     )
+    t0 = _time.monotonic()
     try:
         result = svc.ingestion.ingest(req)
     except ValidationError as exc:
         raise HTTPException(422, str(exc))
+    _m.ingestion_duration.labels(agent_id=svc.config.agent_id).observe(_time.monotonic() - t0)
+    _m.events_ingested.labels(
+        agent_id=svc.config.agent_id,
+        case_category=body.case_category,
+        decision=body.decision,
+    ).inc()
+    if result.is_high_risk:
+        _m.high_risk_events.labels(
+            agent_id=svc.config.agent_id, case_category=body.case_category,
+        ).inc()
     svc.audit.append(
         svc.config.agent_id, "decision.ingested", "system", "event",
         resource_id=result.event_id,
@@ -260,8 +274,21 @@ def add_ground_truth(event_id: str, body: GroundTruthRequest):
 def get_drift():
     svc = _get_svc()
     report = svc.detector.detect()
+    _m.drift_checks.labels(agent_id=svc.config.agent_id).inc()
+    _m.drift_score.labels(agent_id=svc.config.agent_id).set(report.overall_drift_score)
+    is_safe, _ = svc.engine.is_agent_safe()
+    _m.agent_safe.labels(agent_id=svc.config.agent_id).set(1 if is_safe else 0)
     fired = svc.engine.evaluate(report)
     for f in fired:
+        _m.alerts_fired.labels(
+            agent_id=svc.config.agent_id,
+            severity=f.severity,
+            rule_name=f.rule_name,
+        ).inc()
+        if f.triggered_rollback:
+            _m.rollbacks_triggered.labels(
+                agent_id=svc.config.agent_id, trigger_rule=f.rule_name,
+            ).inc()
         svc.webhooks.dispatch_async({
             "alert_id": f.alert_id,
             "rule_name": f.rule_name,
@@ -610,6 +637,14 @@ def verify_audit():
         "chain_valid": valid,
         "first_broken_seq": broken_seq,
     }
+
+
+@app.get("/metrics")
+def prometheus_metrics():
+    """Prometheus metrics endpoint for scraping."""
+    from starlette.responses import Response as StarletteResponse
+    body, content_type = _m.metrics_response()
+    return StarletteResponse(content=body, media_type=content_type)
 
 
 if __name__ == "__main__":
