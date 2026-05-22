@@ -48,7 +48,7 @@ class TokenBucket:
 
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _INGESTION_PATHS = {"/events", "/events/structured", "/events/batch"}
-_PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+_PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/ui"}
 
 _keys: dict[str, APIKey] = {}
 _buckets: dict[str, TokenBucket] = {}

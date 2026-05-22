@@ -26,6 +26,7 @@ from .ingestion import IngestRequest, IngestionLayer, ValidationError
 from .storage import GovernanceDB
 from .structured import DecodeError, DecisionDecoder, GovernanceDecision
 from .webhooks import WebhookDispatcher
+from .ui import DASHBOARD_HTML
 from . import metrics as _m
 
 # ── app + lazy singleton wiring ──────────────────────────────────────────────
@@ -672,6 +673,13 @@ def verify_audit():
         "chain_valid": valid,
         "first_broken_seq": broken_seq,
     }
+
+
+@app.get("/ui", include_in_schema=False)
+def web_dashboard():
+    """PM-facing web dashboard — auto-refreshing browser UI."""
+    from starlette.responses import HTMLResponse
+    return HTMLResponse(content=DASHBOARD_HTML)
 
 
 @app.get("/metrics")
