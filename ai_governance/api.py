@@ -1097,6 +1097,39 @@ def explain_decision(event_id: str):
     }
 
 
+@app.post("/admin/escalate")
+def run_escalation():
+    """Run the alert escalation check: escalate unacknowledged alerts past their timeout."""
+    from .escalation import AlertEscalator
+    svc = _get_svc()
+    escalator = AlertEscalator(
+        svc.db, svc.config.agent_id, webhooks=svc.webhooks
+    )
+    events = escalator.run()
+    if events:
+        svc.audit.append(
+            svc.config.agent_id, "alerts.escalated", "system", "alert",
+            detail={"count": len(events), "escalations": [
+                {"from": e.from_severity, "to": e.to_severity, "rule": e.rule_name}
+                for e in events
+            ]},
+        )
+    return {
+        "escalated": len(events),
+        "events": [
+            {
+                "original_alert_id": e.original_alert_id,
+                "new_alert_id": e.new_alert_id,
+                "from_severity": e.from_severity,
+                "to_severity": e.to_severity,
+                "rule_name": e.rule_name,
+                "escalated_at": e.escalated_at,
+            }
+            for e in events
+        ],
+    }
+
+
 @app.get("/agents")
 def list_agents():
     """List all agent IDs present in the database with their summary stats."""

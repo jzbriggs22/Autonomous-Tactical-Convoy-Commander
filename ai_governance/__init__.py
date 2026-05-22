@@ -11,6 +11,8 @@ from .config import GovernanceConfig
 from .correlation import CorrelationMiddleware, get_correlation_id
 from .dashboard import DashboardBuilder
 from .drift import DriftDetector
+from .escalation import AlertEscalator, EscalationRule
+from .explainer import DecisionExplainer
 from .ingestion import IngestionLayer
 from .readiness import ReadinessChecker, ReadinessReport
 from .reports import ComplianceReport, ReportGenerator
@@ -23,6 +25,7 @@ from .webhooks import WebhookDispatcher
 
 __all__ = [
     "AlertEngine",
+    "AlertEscalator",
     "APIKey",
     "AuditLog",
     "AuthMiddleware",
@@ -31,9 +34,11 @@ __all__ = [
     "CorrelationMiddleware",
     "DashboardBuilder",
     "DecisionDecoder",
+    "DecisionExplainer",
     "DecodeError",
     "DriftDetector",
     "DriftScheduler",
+    "EscalationRule",
     "get_correlation_id",
     "GovernanceConfig",
     "GovernanceDB",

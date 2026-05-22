@@ -335,6 +335,29 @@ class GovernanceDB:
             )
             return cur.rowcount > 0
 
+    def get_unacknowledged_alerts_older_than(
+        self, agent_id: str, cutoff: datetime
+    ) -> list[AlertRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM alerts WHERE agent_id=? AND acknowledged=0 AND timestamp < ? "
+                "ORDER BY timestamp ASC",
+                (agent_id, cutoff.isoformat()),
+            ).fetchall()
+        return [
+            AlertRecord(
+                alert_id=r["alert_id"],
+                agent_id=r["agent_id"],
+                timestamp=datetime.fromisoformat(r["timestamp"]),
+                rule_name=r["rule_name"],
+                severity=r["severity"],
+                message=r["message"],
+                metrics=json.loads(r["metrics_json"]),
+                acknowledged=False,
+            )
+            for r in rows
+        ]
+
     # ── metric snapshots (history tracking) ────────────────────────────────
 
     def insert_metric_snapshot(
