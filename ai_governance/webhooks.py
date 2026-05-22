@@ -3,11 +3,15 @@
 Sends alert payloads to configured HTTP endpoints on each alert fire.
 Retries with exponential backoff on transient failures.
 Permanent failures are logged and never block the alert pipeline.
+
+Supports HMAC-SHA256 request signing when a target has a secret configured.
 """
 
 from __future__ import annotations
 
 import collections
+import hashlib
+import hmac
 import json
 import logging
 import queue
@@ -33,6 +37,7 @@ class WebhookTarget:
     severity_filter: Optional[set[str]] = None  # None = all severities
     max_retries: int = _DEFAULT_MAX_RETRIES
     backoff_base: float = _DEFAULT_BACKOFF_BASE
+    signing_secret: Optional[str] = None
 
 
 @dataclass
@@ -163,6 +168,9 @@ class WebhookDispatcher:
     def _send(self, target: WebhookTarget, payload: dict) -> WebhookDelivery:
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", **target.headers}
+        if target.signing_secret:
+            sig = compute_signature(body, target.signing_secret)
+            headers["X-Governance-Signature"] = sig
         req = Request(target.url, data=body, headers=headers, method="POST")
         try:
             with urlopen(req, timeout=target.timeout_seconds) as resp:
@@ -185,3 +193,13 @@ class WebhookDispatcher:
                 status="failed",
                 error=str(exc),
             )
+
+
+def compute_signature(body: bytes, secret: str) -> str:
+    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
+    return f"sha256={mac.hexdigest()}"
+
+
+def verify_signature(body: bytes, secret: str, signature: str) -> bool:
+    expected = compute_signature(body, secret)
+    return hmac.compare_digest(expected, signature)
