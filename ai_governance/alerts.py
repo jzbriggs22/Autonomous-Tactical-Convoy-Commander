@@ -6,6 +6,7 @@ Fires alerts, writes rollback records, and exposes the `is_agent_safe` gate.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,7 +14,10 @@ from typing import Optional
 
 from .config import AlertSeverity, GovernanceConfig, RollbackCondition
 from .drift import DriftReport
+from .safe_eval import SafeExprError, safe_eval
 from .storage import AlertRecord, GovernanceDB, RollbackRecord
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,8 +48,9 @@ class AlertEngine:
             if not self._cooldown_ok(condition):
                 continue
             try:
-                triggered = bool(eval(condition.expression, {"__builtins__": {}}, ctx))  # noqa: S307
-            except Exception:
+                triggered = safe_eval(condition.expression, ctx)
+            except (SafeExprError, ArithmeticError) as exc:
+                logger.warning("Rollback condition %r failed: %s", condition.name, exc)
                 triggered = False
             if triggered:
                 fired.append(self._fire_rollback(condition, ctx))

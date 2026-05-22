@@ -7,14 +7,18 @@ Start with:
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import time as _time
+
+logger = logging.getLogger(__name__)
 
 from .alerts import AlertEngine
 from .audit import AuditLog
@@ -38,6 +42,15 @@ app = FastAPI(
 )
 app.add_middleware(AuthMiddleware)
 configure_from_env()
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+    )
 
 
 class _Services:

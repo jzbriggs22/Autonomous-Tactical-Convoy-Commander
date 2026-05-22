@@ -7,6 +7,7 @@ Permanent failures are logged and never block the alert pipeline.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import queue
@@ -51,15 +52,18 @@ class WebhookDispatcher:
     with exponential backoff (1s, 2s, 4s by default).
     """
 
+    _MAX_DELIVERY_LOG = 10000
+
     def __init__(
         self,
         targets: list[WebhookTarget] = None,
         *,
         queue_size: int = 1000,
         worker_count: int = 2,
+        max_log_size: int = _MAX_DELIVERY_LOG,
     ) -> None:
         self._targets = list(targets or [])
-        self._delivery_log: list[WebhookDelivery] = []
+        self._delivery_log: collections.deque[WebhookDelivery] = collections.deque(maxlen=max_log_size)
         self._lock = threading.Lock()
         self._queue: queue.Queue[Optional[dict]] = queue.Queue(maxsize=queue_size)
         self._queue_size = queue_size
