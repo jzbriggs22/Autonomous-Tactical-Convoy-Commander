@@ -13,6 +13,7 @@ from typing import Callable, Optional
 
 from .config import GovernanceConfig, MetricDirection
 from .storage import DecisionRecord, GovernanceDB
+from . import tracing
 
 
 @dataclass
@@ -186,12 +187,14 @@ class DriftDetector:
         return results
 
     def detect(self) -> DriftReport:
-        """
-        Run drift detection against all stored thresholds.
+        with tracing.span("governance.drift.detect", agent_id=self._config.agent_id) as s:
+            report = self._detect_inner()
+            s.set_attribute("violations", len(report.violations))
+            s.set_attribute("overall_drift_score", report.overall_drift_score)
+            s.set_attribute("categories_checked", len(report.category_drift_scores))
+            return report
 
-        Returns a DriftReport with violations, drift scores per category,
-        and the overall drift score.
-        """
+    def _detect_inner(self) -> DriftReport:
         recent_all = self._db.get_recent_decisions(
             self._config.agent_id,
             limit=self._config.recent_window_size * 6,  # fetch extra so each cat has enough

@@ -11,6 +11,7 @@ from typing import Optional
 from .config import GovernanceConfig, HighRiskPattern
 from .storage import DecisionRecord, GovernanceDB
 from .structured import GovernanceDecision
+from . import tracing
 
 VALID_DECISIONS = frozenset({"resolve", "escalate", "deny", "defer", "partial_resolve"})
 
@@ -59,8 +60,19 @@ class IngestionLayer:
         ]
 
     def ingest(self, req: IngestRequest) -> IngestResult:
+        with tracing.span(
+            "governance.ingest",
+            agent_id=self._config.agent_id,
+            case_category=req.case_category,
+            decision=req.decision,
+        ) as s:
+            return self._ingest_inner(req, s)
+
+    def _ingest_inner(self, req: IngestRequest, span) -> IngestResult:
         self._validate(req)
         is_high_risk, score, matched = self._classify_risk(req)
+        span.set_attribute("is_high_risk", is_high_risk)
+        span.set_attribute("high_risk_score", score)
         rec = DecisionRecord(
             event_id=req.event_id or str(uuid.uuid4()),
             agent_id=self._config.agent_id,
