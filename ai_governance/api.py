@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .alerts import AlertEngine
 from .audit import AuditLog
+from .auth import AuthMiddleware, configure_from_env
 from .config import GovernanceConfig
 from .dashboard import DashboardBuilder
 from .drift import DriftDetector
@@ -31,6 +32,8 @@ app = FastAPI(
     version="1.0.0",
     description="Observability and drift detection for AI agents",
 )
+app.add_middleware(AuthMiddleware)
+configure_from_env()
 
 
 class _Services:

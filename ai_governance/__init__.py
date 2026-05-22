@@ -6,6 +6,7 @@ even when aggregate metrics look healthy.
 
 from .alerts import AlertEngine
 from .audit import AuditLog
+from .auth import APIKey, AuthMiddleware, configure as configure_auth
 from .config import GovernanceConfig
 from .dashboard import DashboardBuilder
 from .drift import DriftDetector
@@ -17,7 +18,10 @@ from .webhooks import WebhookDispatcher
 
 __all__ = [
     "AlertEngine",
+    "APIKey",
     "AuditLog",
+    "AuthMiddleware",
+    "configure_auth",
     "DashboardBuilder",
     "DecisionDecoder",
     "DecodeError",
