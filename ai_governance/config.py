@@ -86,6 +86,9 @@ class RollbackCondition(BaseModel):
         return v
 
 
+_MAX_CONFIG_FILE_SIZE = 1_048_576  # 1 MB
+
+
 class GovernanceConfig(BaseModel):
     """Top-level governance configuration. Load this file before the agent starts."""
 
@@ -209,16 +212,28 @@ class GovernanceConfig(BaseModel):
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "GovernanceConfig":
-        """Load config from a YAML file."""
-        text = Path(path).read_text()
+        """Load config from a YAML file. Rejects files over 1 MB."""
+        p = Path(path)
+        size = p.stat().st_size
+        if size > _MAX_CONFIG_FILE_SIZE:
+            raise ValueError(f"Config file too large ({size} bytes, max {_MAX_CONFIG_FILE_SIZE})")
+        text = p.read_text()
         data = yaml.safe_load(text)
+        if not isinstance(data, dict):
+            raise ValueError(f"Config must be a YAML mapping, got {type(data).__name__}")
         return cls.model_validate(data)
 
     @classmethod
     def from_json(cls, path: Union[str, Path]) -> "GovernanceConfig":
-        """Load config from a JSON file."""
-        text = Path(path).read_text()
+        """Load config from a JSON file. Rejects files over 1 MB."""
+        p = Path(path)
+        size = p.stat().st_size
+        if size > _MAX_CONFIG_FILE_SIZE:
+            raise ValueError(f"Config file too large ({size} bytes, max {_MAX_CONFIG_FILE_SIZE})")
+        text = p.read_text()
         data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError(f"Config must be a JSON object, got {type(data).__name__}")
         return cls.model_validate(data)
 
     def to_yaml(self, path: Union[str, Path] = None) -> str:

@@ -169,3 +169,54 @@ class TestConfigSerialization:
         assert "decrease" in text
         assert "critical" in text
         assert "rollback" in text
+
+
+class TestConfigInputValidation:
+    def test_yaml_rejects_non_mapping(self, tmp_path):
+        f = tmp_path / "bad.yaml"
+        f.write_text("- just a list\n- not a mapping\n")
+        with pytest.raises(ValueError, match="YAML mapping"):
+            GovernanceConfig.from_yaml(f)
+
+    def test_json_rejects_non_object(self, tmp_path):
+        f = tmp_path / "bad.json"
+        f.write_text("[1, 2, 3]")
+        with pytest.raises(ValueError, match="JSON object"):
+            GovernanceConfig.from_json(f)
+
+    def test_yaml_rejects_oversized_file(self, tmp_path):
+        f = tmp_path / "huge.yaml"
+        f.write_text("x: " + "a" * 2_000_000)
+        with pytest.raises(ValueError, match="too large"):
+            GovernanceConfig.from_yaml(f)
+
+    def test_json_rejects_oversized_file(self, tmp_path):
+        f = tmp_path / "huge.json"
+        f.write_text('{"x": "' + "a" * 2_000_000 + '"}')
+        with pytest.raises(ValueError, match="too large"):
+            GovernanceConfig.from_json(f)
+
+    def test_yaml_rejects_invalid_yaml(self, tmp_path):
+        f = tmp_path / "invalid.yaml"
+        f.write_text("}{not yaml at all")
+        with pytest.raises(Exception):
+            GovernanceConfig.from_yaml(f)
+
+    def test_json_rejects_invalid_json(self, tmp_path):
+        f = tmp_path / "invalid.json"
+        f.write_text("}{not json")
+        with pytest.raises(Exception):
+            GovernanceConfig.from_json(f)
+
+    def test_yaml_empty_dict_uses_defaults(self, tmp_path):
+        f = tmp_path / "empty.yaml"
+        f.write_text("{}")
+        cfg = GovernanceConfig.from_yaml(f)
+        assert cfg.agent_id == "default-agent"
+
+    def test_json_empty_dict_uses_defaults(self, tmp_path):
+        import json
+        f = tmp_path / "empty.json"
+        f.write_text(json.dumps({}))
+        cfg = GovernanceConfig.from_json(f)
+        assert cfg.agent_id == "default-agent"
