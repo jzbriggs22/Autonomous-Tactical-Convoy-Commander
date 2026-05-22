@@ -1148,6 +1148,90 @@ def list_agents():
     return result
 
 
+# ── policy version store endpoints ──────────────────────────────────────────
+
+class PolicyCommitRequest(BaseModel):
+    changed_by: str = "admin"
+    description: str = "Config update"
+
+
+@app.post("/admin/policy/commit")
+def commit_policy(body: PolicyCommitRequest):
+    """Save the current active config as a named policy version."""
+    from .policy_store import PolicyStore
+    svc = _get_svc()
+    store = PolicyStore(svc.db)
+    version = store.commit(svc.config, body.changed_by, body.description)
+    svc.audit.append(
+        svc.config.agent_id, "policy.committed", body.changed_by, "policy",
+        resource_id=version.policy_id,
+        detail={"version": version.config_version, "fingerprint": version.config_fingerprint},
+    )
+    return _policy_to_dict(version)
+
+
+@app.get("/admin/policy/versions")
+def list_policy_versions(limit: int = 20):
+    """List all committed policy versions for this agent."""
+    from .policy_store import PolicyStore
+    svc = _get_svc()
+    store = PolicyStore(svc.db)
+    versions = store.list_versions(svc.config.agent_id, limit=min(limit, 100))
+    return [_policy_to_dict(v) for v in versions]
+
+
+@app.get("/admin/policy/active")
+def get_active_policy():
+    """Return the currently active policy version."""
+    from .policy_store import PolicyStore
+    svc = _get_svc()
+    store = PolicyStore(svc.db)
+    version = store.get_active(svc.config.agent_id)
+    if version is None:
+        return {"active": None, "message": "No policy version committed yet"}
+    return _policy_to_dict(version)
+
+
+@app.post("/admin/policy/{policy_id}/rollback")
+def rollback_policy(policy_id: str):
+    """Roll back to a previous policy version."""
+    from .policy_store import PolicyStore
+    svc = _get_svc()
+    store = PolicyStore(svc.db)
+    version = store.rollback_to(policy_id)
+    if version is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Policy version {policy_id!r} not found")
+    try:
+        new_config = version.to_config()
+    except Exception as exc:
+        raise HTTPException(422, f"Stored config is invalid: {exc}")
+    old_version = svc.config.version
+    svc.config = new_config
+    svc.ingestion = IngestionLayer(new_config, svc.db)
+    svc.detector = DriftDetector(new_config, svc.db)
+    svc.engine = AlertEngine(new_config, svc.db)
+    svc.dashboard = DashboardBuilder(new_config, svc.db, svc.detector, svc.engine)
+    svc.audit.append(
+        new_config.agent_id, "policy.rolled_back", "admin", "policy",
+        resource_id=policy_id,
+        detail={"rolled_back_to_version": version.config_version, "from_version": old_version},
+    )
+    return {"status": "rolled_back", "policy_id": policy_id, "version": _policy_to_dict(version)}
+
+
+def _policy_to_dict(v) -> dict:
+    return {
+        "policy_id": v.policy_id,
+        "agent_id": v.agent_id,
+        "created_at": v.created_at,
+        "config_version": v.config_version,
+        "config_fingerprint": v.config_fingerprint,
+        "changed_by": v.changed_by,
+        "change_description": v.change_description,
+        "is_active": v.is_active,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
