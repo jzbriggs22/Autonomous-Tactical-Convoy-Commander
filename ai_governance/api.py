@@ -1053,6 +1053,50 @@ def _check_to_dict(c) -> dict:
 
 # ── multi-agent listing endpoint ─────────────────────────────────────────────
 
+@app.get("/events/{event_id}/explain")
+def explain_decision(event_id: str):
+    """Explain why a specific event was (or was not) classified as high-risk.
+
+    Returns matched patterns, weights, score breakdown, applicable drift thresholds,
+    and a human-readable audit narrative.
+    """
+    from .explainer import DecisionExplainer
+    svc = _get_svc()
+    explainer = DecisionExplainer(svc.config, svc.db)
+    explanation = explainer.explain(event_id)
+    if explanation is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Event {event_id!r} not found")
+    return {
+        "event_id": explanation.event_id,
+        "timestamp": explanation.timestamp,
+        "case_id": explanation.case_id,
+        "case_category": explanation.case_category,
+        "decision": explanation.decision,
+        "is_high_risk": explanation.is_high_risk,
+        "high_risk_score": explanation.high_risk_score,
+        "config_version": explanation.config_version,
+        "dominant_pattern": explanation.dominant_pattern,
+        "matched_patterns": [
+            {
+                "name": m.pattern_name,
+                "field": m.field,
+                "pattern": m.pattern,
+                "matched_value": m.matched_value,
+                "weight": m.weight,
+                "contribution": round(m.contribution, 4),
+            }
+            for m in explanation.matched_patterns
+        ],
+        "unmatched_patterns": explanation.unmatched_patterns,
+        "category_thresholds": explanation.category_thresholds,
+        "baseline_metrics": {
+            k: round(v, 4) if v is not None else None
+            for k, v in explanation.baseline_metrics.items()
+        },
+        "audit_narrative": explanation.audit_narrative,
+    }
+
+
 @app.get("/agents")
 def list_agents():
     """List all agent IDs present in the database with their summary stats."""

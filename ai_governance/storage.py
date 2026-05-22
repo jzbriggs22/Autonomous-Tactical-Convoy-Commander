@@ -104,6 +104,14 @@ class GovernanceDB:
                 ),
             )
 
+    def get_decision_by_id(self, event_id: str, agent_id: str) -> Optional[DecisionRecord]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM decisions WHERE event_id=? AND agent_id=?",
+                (event_id, agent_id),
+            ).fetchone()
+        return self._to_decision(row) if row else None
+
     def set_ground_truth(self, event_id: str, agent_id: str, ground_truth: str) -> bool:
         with self._tx() as c:
             cur = c.execute(
