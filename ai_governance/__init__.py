@@ -20,10 +20,13 @@ from .scheduler import DriftScheduler
 from .storage import GovernanceDB
 from .structured import DecisionDecoder, DecodeError, GovernanceDecision
 from .test_runner import GovernanceTestRunner
+from .feedback import AccuracyReport, FeedbackPipeline
+from .forecast import DriftForecaster, ForecastReport
 from .trend import TrendAnalyzer, TrendReport
 from .webhooks import WebhookDispatcher
 
 __all__ = [
+    "AccuracyReport",
     "AlertEngine",
     "AlertEscalator",
     "APIKey",
@@ -37,8 +40,11 @@ __all__ = [
     "DecisionExplainer",
     "DecodeError",
     "DriftDetector",
+    "DriftForecaster",
     "DriftScheduler",
     "EscalationRule",
+    "FeedbackPipeline",
+    "ForecastReport",
     "get_correlation_id",
     "GovernanceConfig",
     "GovernanceDB",

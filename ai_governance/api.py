@@ -1232,6 +1232,115 @@ def _policy_to_dict(v) -> dict:
     }
 
 
+# ── forecast endpoint ───────────────────────────────────────────────────────
+
+@app.get("/forecast")
+def get_forecast(category: Optional[str] = None, horizon_hours: float = 24.0):
+    """Predictive drift alerts: forecast which metrics will breach thresholds."""
+    from .forecast import DriftForecaster
+    svc = _get_svc()
+    forecaster = DriftForecaster(
+        svc.config, svc.db, horizon_hours=min(horizon_hours, 168.0)
+    )
+    report = forecaster.forecast(category=category)
+    return {
+        "agent_id": report.agent_id,
+        "generated_at": report.generated_at,
+        "horizon_hours": report.horizon_hours,
+        "has_imminent": report.has_imminent,
+        "forecast_count": len(report.forecasts),
+        "forecasts": [
+            {
+                "category": f.category,
+                "metric": f.metric,
+                "current_value": round(f.current_value, 4),
+                "baseline_value": round(f.baseline_value, 4),
+                "threshold_delta": round(f.threshold_delta, 4),
+                "current_delta": round(f.current_delta, 6),
+                "remaining_delta": round(f.remaining_delta, 6),
+                "slope_per_hour": round(f.slope_per_hour, 8),
+                "hours_to_breach": f.hours_to_breach,
+                "severity": f.severity,
+                "confidence": f.confidence,
+                "data_points": f.data_points,
+                "message": f.message,
+            }
+            for f in report.forecasts
+        ],
+        "summary": report.summary(),
+    }
+
+
+# ── feedback endpoints ──────────────────────────────────────────────────────
+
+class BulkFeedbackRequest(BaseModel):
+    labels: list[dict] = Field(..., min_length=1, max_length=5000)
+
+
+@app.post("/feedback/labels")
+def apply_feedback_labels(body: BulkFeedbackRequest):
+    """Bulk import ground-truth labels for governance decisions."""
+    from .feedback import FeedbackLabel, FeedbackPipeline
+    svc = _get_svc()
+    pipeline = FeedbackPipeline(svc.config, svc.db)
+    labels = []
+    for item in body.labels:
+        eid = item.get("event_id")
+        gt = item.get("ground_truth")
+        if not eid or not gt:
+            raise HTTPException(422, "Each label must have 'event_id' and 'ground_truth'")
+        labels.append(FeedbackLabel(event_id=eid, ground_truth=gt))
+    result = pipeline.apply_labels(labels)
+    svc.audit.append(
+        svc.config.agent_id, "feedback.labels_applied", "system", "feedback",
+        detail={
+            "total_submitted": result.total_submitted,
+            "applied": result.applied,
+            "not_found": result.not_found,
+            "invalid": result.invalid,
+        },
+    )
+    return {
+        "total_submitted": result.total_submitted,
+        "applied": result.applied,
+        "not_found": result.not_found,
+        "invalid": result.invalid,
+        "errors": result.errors,
+    }
+
+
+@app.get("/feedback/accuracy")
+def get_accuracy_report(limit: int = 10000):
+    """Compute accuracy metrics from ground-truth labels."""
+    from .feedback import FeedbackPipeline
+    svc = _get_svc()
+    pipeline = FeedbackPipeline(svc.config, svc.db)
+    report = pipeline.compute_accuracy(limit=min(limit, 50000))
+    return {
+        "agent_id": report.agent_id,
+        "generated_at": report.generated_at,
+        "total_decisions": report.total_decisions,
+        "total_labeled": report.total_labeled,
+        "labeling_coverage": round(report.labeling_coverage, 4),
+        "overall_accuracy": round(report.overall_accuracy, 4) if report.overall_accuracy is not None else None,
+        "categories": [
+            {
+                "category": c.category,
+                "total_labeled": c.total_labeled,
+                "correct": c.correct,
+                "incorrect": c.incorrect,
+                "accuracy": round(c.accuracy, 4),
+                "high_risk_labeled": c.high_risk_labeled,
+                "high_risk_correct": c.high_risk_correct,
+                "high_risk_accuracy": round(c.high_risk_accuracy, 4) if c.high_risk_accuracy is not None else None,
+            }
+            for c in report.categories
+        ],
+        "unlabeled_categories": report.unlabeled_categories,
+        "summary": report.summary(),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
