@@ -18,5 +18,8 @@ COPY Makefile .
 # Install package with dev + geo dependencies
 RUN pip install --no-cache-dir -e ".[dev,geo,weather]"
 
+# The governance stack (ai_governance/ + the "governance" extra, which pulls
+# in torch via outlines) is intentionally not installed in this image, so the
+# default command must skip tests/governance or collection fails on import.
 ENTRYPOINT ["python", "-m"]
-CMD ["pytest", "-q"]
+CMD ["pytest", "tests/", "-q", "--ignore=tests/governance"]
