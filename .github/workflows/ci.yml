@@ -24,8 +24,11 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,governance]"
 
+      # Default per-test timeout is 120s: coverage instrumentation roughly
+      # doubles sim runtimes, and CI runners are slower than dev machines.
+      # The heaviest integration sims carry their own @pytest.mark.timeout(600).
       - name: Run convoy commander tests
-        run: python -m pytest tests/ -q --tb=short --timeout=60 --ignore=tests/governance --cov=convoy_commander --cov-report=term-missing --cov-report=xml
+        run: python -m pytest tests/ -q --tb=short --timeout=120 --ignore=tests/governance --cov=convoy_commander --cov-report=term-missing --cov-report=xml
 
       - name: Run governance unit tests
         run: python -m pytest tests/governance/ -q --tb=short --timeout=60 --ignore=tests/governance/test_behavioral.py --cov=ai_governance --cov-report=term-missing --cov-append

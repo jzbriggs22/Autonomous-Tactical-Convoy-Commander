@@ -249,6 +249,7 @@ class TestSimSafety:
                 assert 0 <= tx <= config.world.width, f"V{v.id} out of x bounds: {tx}"
                 assert 0 <= ty <= config.world.height, f"V{v.id} out of y bounds: {ty}"
 
+    @pytest.mark.timeout(600)  # long sim; coverage-instrumented CI runs exceed 60s
     def test_breakdown_is_irreversible(self):
         """Once a vehicle breaks down, it never becomes operational again."""
         config = get_scenario("leader_failure", seed=42, vehicles=4, duration=200.0)

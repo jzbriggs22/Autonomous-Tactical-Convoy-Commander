@@ -385,6 +385,7 @@ class TestScenarios:
             assert len(config.convoys) >= 1
             assert config.base.scenario == name
 
+    @pytest.mark.timeout(600)  # long sim; coverage-instrumented CI runs exceed 60s
     def test_convoy_merge_integration(self):
         """Run convoy_merge for 60s, verify merge event logged."""
         from convoy_commander.sim.scenarios import get_multi_convoy_scenario
@@ -405,6 +406,7 @@ class TestScenarios:
         total_in_groups = sum(len(g.vehicles) for g in result.groups.values())
         assert total_in_groups == 8
 
+    @pytest.mark.timeout(600)  # long sim; coverage-instrumented CI runs exceed 60s
     def test_convoy_split_reroute_integration(self):
         """Run convoy_split_reroute for 80s, verify split event logged
         and two convoys exist."""

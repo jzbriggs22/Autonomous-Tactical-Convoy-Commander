@@ -195,6 +195,7 @@ class TestSensorDriftSpikeScenario:
         spike_events = [e for e in scenario_events if "drift spike" in e.message.lower()]
         assert len(spike_events) >= 1
 
+    @pytest.mark.timeout(600)  # long sim; coverage-instrumented CI runs exceed 60s
     def test_drift_spike_increases_uncertainty_in_sim(self):
         """After t=60s, at least one vehicle should have entered safe mode."""
         config = get_scenario("sensor_drift_spike", seed=42, vehicles=4, duration=90.0)

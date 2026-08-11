@@ -455,6 +455,7 @@ class TestCentralSupervisor:
 class TestFormationRobustness:
     """Formation should degrade gracefully when leader is absent."""
 
+    @pytest.mark.timeout(600)  # long sim; coverage-instrumented CI runs exceed 60s
     def test_no_leader_logs_formation_degraded(self):
         """When no leader exists, FORMATION_DEGRADED events should be logged."""
         config = get_scenario("leader_failure", seed=42, vehicles=3, duration=200.0)
