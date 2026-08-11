@@ -168,6 +168,30 @@ class TestFuel:
         state = WeatherState(temperature_c=-15.0)
         assert effects.fuel_factor(state) > 1.15
 
+    def test_fuel_factor_depletes_actual_tank(self):
+        """The weather fuel penalty must drain the real tank, not just
+        inflate the reported consumption (regression: factor was applied
+        after FuelState.consume had already debited the unscaled amount)."""
+        import numpy as np
+        from convoy_commander.vehicles.vehicle import Vehicle, VehicleCommand
+
+        config = SimConfig()
+        normal = Vehicle(0, config, np.random.default_rng(0))
+        harsh = Vehicle(1, config, np.random.default_rng(0))
+        harsh.weather_fuel_factor = 2.0
+
+        for v in (normal, harsh):
+            v.state.speed = 5.0
+            for _ in range(50):
+                v.step(command=VehicleCommand(accel=1.0), dt=0.1)
+
+        assert harsh.fuel.fuel < normal.fuel.fuel
+        # Reported consumption must match the tank delta for both
+        for v in (normal, harsh):
+            assert v.total_fuel_consumed == pytest.approx(
+                v.fuel.capacity - v.fuel.fuel
+            )
+
 
 # ---------------------------------------------------------------------------
 # WeatherEffects — interpolation

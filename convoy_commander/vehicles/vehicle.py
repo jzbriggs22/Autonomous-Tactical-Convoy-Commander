@@ -203,8 +203,11 @@ class Vehicle:
             max_turn_rate=self.vcfg.max_turn_rate,
         )
 
-        # Consume fuel (weather increases consumption in adverse conditions)
-        consumed = self.fuel.consume(self.state.speed, dt) * self.weather_fuel_factor
+        # Consume fuel (weather increases consumption in adverse conditions).
+        # The factor is applied inside consume() so the tank is actually debited.
+        consumed = self.fuel.consume(
+            self.state.speed, dt, factor=self.weather_fuel_factor
+        )
         self.total_fuel_consumed += consumed
 
         # Track distance

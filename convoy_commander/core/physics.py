@@ -117,16 +117,22 @@ class FuelState:
     rate_idle: float = 0.01
     rate_per_speed: float = 0.005
 
-    def consume(self, speed: float, dt: float) -> float:
+    def consume(self, speed: float, dt: float, factor: float = 1.0) -> float:
         """Consume fuel for one timestep.  Returns fuel consumed.
 
-        Preconditions: speed >= 0, dt > 0.
+        ``factor`` scales consumption (e.g. adverse-weather penalty) and is
+        applied before the tank is debited, so the returned value and the
+        remaining fuel always agree.
+
+        Preconditions: speed >= 0, dt > 0, factor >= 0.
         """
         if speed < 0:
             speed = 0.0  # Defensive: negative speed should not generate fuel
         if dt <= 0:
             return 0.0
-        usage = (self.rate_idle + self.rate_per_speed * speed) * dt
+        if factor < 0:
+            factor = 0.0  # Defensive: a negative factor must not add fuel
+        usage = (self.rate_idle + self.rate_per_speed * speed) * dt * factor
         actual = min(usage, self.fuel)  # Cannot consume more than remaining
         self.fuel = max(0.0, self.fuel - actual)
         return actual
