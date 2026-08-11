@@ -9,6 +9,8 @@ Usage:
     python -m ai_governance.cli config          # show active config
     python -m ai_governance.cli test            # run behavioral tests
     python -m ai_governance.cli migrate         # show migration status
+    python -m ai_governance.cli forecast        # predict threshold breaches
+    python -m ai_governance.cli accuracy        # ground-truth accuracy report
     python -m ai_governance.cli serve           # start HTTP server
 """
 
@@ -200,6 +202,40 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_forecast(args) -> int:
+    from .forecast import DriftForecaster
+    cfg = _get_config()
+    db = GovernanceDB(_get_db_path())
+    forecaster = DriftForecaster(cfg, db, horizon_hours=args.horizon)
+    report = forecaster.forecast(category=args.category)
+    print(report.summary())
+    if not report.forecasts:
+        print("  No metrics projected to breach within the horizon.")
+    return 1 if report.has_imminent else 0
+
+
+def cmd_accuracy(args) -> int:
+    from .accuracy_guard import AccuracyGuard, AccuracyThresholds
+    from .feedback import FeedbackPipeline
+    cfg = _get_config()
+    db = GovernanceDB(_get_db_path())
+
+    pipeline = FeedbackPipeline(cfg, db)
+    report = pipeline.compute_accuracy()
+    print(report.summary())
+
+    if args.guard:
+        guard = AccuracyGuard(cfg, db, AccuracyThresholds(
+            min_overall_accuracy=args.min_accuracy,
+            min_high_risk_accuracy=args.min_high_risk_accuracy,
+        ))
+        result = guard.check(dry_run=args.dry_run)
+        print()
+        print(result.summary())
+        return 0 if (result.passed or not result.enforced) else 1
+    return 0
+
+
 def cmd_serve(_args) -> int:
     import uvicorn
     from .api import app
@@ -234,6 +270,22 @@ def main(argv: list[str] | None = None) -> int:
     report_p = sub.add_parser("report", help="Generate compliance report")
     report_p.add_argument("--json", action="store_true", help="JSON format")
 
+    forecast_p = sub.add_parser("forecast", help="Predict upcoming threshold breaches")
+    forecast_p.add_argument("--horizon", type=float, default=24.0,
+                            help="Forecast horizon in hours (default 24)")
+    forecast_p.add_argument("--category", default=None,
+                            help="Limit forecast to one case category")
+
+    accuracy_p = sub.add_parser("accuracy", help="Show ground-truth accuracy report")
+    accuracy_p.add_argument("--guard", action="store_true",
+                            help="Also run the accuracy guard (fires alerts on breach)")
+    accuracy_p.add_argument("--dry-run", action="store_true",
+                            help="Guard check without firing alerts/rollbacks")
+    accuracy_p.add_argument("--min-accuracy", type=float, default=0.85,
+                            help="Overall accuracy floor (default 0.85)")
+    accuracy_p.add_argument("--min-high-risk-accuracy", type=float, default=0.90,
+                            help="High-risk accuracy floor (default 0.90)")
+
     sub.add_parser("serve", help="Start HTTP API server")
 
     args = parser.parse_args(argv)
@@ -251,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         "test": cmd_test,
         "migrate": cmd_migrate,
         "report": cmd_report,
+        "forecast": cmd_forecast,
+        "accuracy": cmd_accuracy,
         "serve": cmd_serve,
     }
     return commands[args.command](args)

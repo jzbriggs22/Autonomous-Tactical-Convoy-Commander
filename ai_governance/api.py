@@ -811,6 +811,7 @@ def scheduler_status():
         "total_violations_found": stats.total_violations_found,
         "total_alerts_fired": stats.total_alerts_fired,
         "total_rollbacks_triggered": stats.total_rollbacks_triggered,
+        "total_forecasts_flagged": stats.total_forecasts_flagged,
         "last_run_at": stats.last_run_at.isoformat() if stats.last_run_at else None,
         "last_drift_score": stats.last_drift_score,
         "last_run_duration_ms": stats.last_run_duration_ms,
@@ -1338,6 +1339,68 @@ def get_accuracy_report(limit: int = 10000):
         ],
         "unlabeled_categories": report.unlabeled_categories,
         "summary": report.summary(),
+    }
+
+
+class AccuracyGuardRequest(BaseModel):
+    min_overall_accuracy: float = Field(default=0.85, ge=0.0, le=1.0)
+    min_high_risk_accuracy: float = Field(default=0.90, ge=0.0, le=1.0)
+    min_labels: int = Field(default=20, ge=1)
+    min_high_risk_labels: int = Field(default=5, ge=1)
+    rollback_on_high_risk_breach: bool = True
+    dry_run: bool = False
+
+
+@app.post("/feedback/guard")
+def run_accuracy_guard(body: AccuracyGuardRequest = None):
+    """Evaluate labeled accuracy against governance thresholds.
+
+    Fires alerts (and rollbacks for high-risk accuracy breaches) unless
+    dry_run is set. Not enforced until min_labels ground-truth labels exist.
+    """
+    from .accuracy_guard import AccuracyGuard, AccuracyThresholds
+    svc = _get_svc()
+    body = body or AccuracyGuardRequest()
+    thresholds = AccuracyThresholds(
+        min_overall_accuracy=body.min_overall_accuracy,
+        min_high_risk_accuracy=body.min_high_risk_accuracy,
+        min_labels=body.min_labels,
+        min_high_risk_labels=body.min_high_risk_labels,
+        rollback_on_high_risk_breach=body.rollback_on_high_risk_breach,
+    )
+    guard = AccuracyGuard(svc.config, svc.db, thresholds)
+    result = guard.check(dry_run=body.dry_run)
+    if result.enforced and not body.dry_run:
+        svc.audit.append(
+            svc.config.agent_id, "accuracy_guard.checked", "system", "feedback",
+            detail={
+                "passed": result.passed,
+                "violations": len(result.violations),
+                "alerts_fired": len(result.alerts_fired),
+                "rollback_triggered": result.rollback_triggered,
+            },
+        )
+    return {
+        "agent_id": result.agent_id,
+        "checked_at": result.checked_at,
+        "enforced": result.enforced,
+        "passed": result.passed,
+        "dry_run": body.dry_run,
+        "total_labeled": result.total_labeled,
+        "violations": [
+            {
+                "kind": v.kind,
+                "category": v.category,
+                "observed": round(v.observed, 4),
+                "threshold": v.threshold,
+                "labels": v.labels,
+                "message": v.message,
+            }
+            for v in result.violations
+        ],
+        "alerts_fired": result.alerts_fired,
+        "rollback_triggered": result.rollback_triggered,
+        "summary": result.summary(),
     }
 
 

@@ -20,13 +20,16 @@ from .scheduler import DriftScheduler
 from .storage import GovernanceDB
 from .structured import DecisionDecoder, DecodeError, GovernanceDecision
 from .test_runner import GovernanceTestRunner
+from .accuracy_guard import AccuracyGuard, AccuracyThresholds, GuardResult
 from .feedback import AccuracyReport, FeedbackPipeline
 from .forecast import DriftForecaster, ForecastReport
 from .trend import TrendAnalyzer, TrendReport
 from .webhooks import WebhookDispatcher
 
 __all__ = [
+    "AccuracyGuard",
     "AccuracyReport",
+    "AccuracyThresholds",
     "AlertEngine",
     "AlertEscalator",
     "APIKey",
@@ -50,6 +53,7 @@ __all__ = [
     "GovernanceDB",
     "GovernanceDecision",
     "GovernanceTestRunner",
+    "GuardResult",
     "IngestionLayer",
     "ReadinessChecker",
     "ReadinessReport",
