@@ -8,3 +8,6 @@ build/
 .pytest_cache/
 runs/
 *.png
+.coverage
+coverage.xml
+htmlcov/
