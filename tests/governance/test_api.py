@@ -114,6 +114,29 @@ class TestIngestEndpoint:
         })
         assert resp.status_code == 422
 
+    def test_ingest_rejects_invalid_inline_ground_truth(self, client):
+        resp = client.post("/events", json={
+            "case_id": "c-gt",
+            "case_category": "billing_dispute",
+            "decision": "resolve",
+            "resolution_time_ms": 100,
+            "ground_truth": "not_a_real_label",
+        })
+        assert resp.status_code == 422
+
+    def test_naive_timestamp_does_not_break_dashboard(self, client):
+        """Naive ISO timestamps must not poison /dashboard with TypeError."""
+        resp = client.post("/events", json={
+            "case_id": "c-naive",
+            "case_category": "billing_dispute",
+            "decision": "resolve",
+            "resolution_time_ms": 100,
+            "timestamp": "2026-08-11T12:00:00",  # no timezone offset
+        })
+        assert resp.status_code == 201
+        dash = client.get("/dashboard")
+        assert dash.status_code == 200
+
     def test_ingest_batch(self, client):
         events = [
             {

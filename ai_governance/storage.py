@@ -159,11 +159,23 @@ class GovernanceDB:
                 (agent_id,),
             ).fetchone()[0]
 
+    @staticmethod
+    def _parse_ts(value: str) -> datetime:
+        """Parse a stored ISO timestamp, treating legacy naive values as UTC.
+
+        Consumers subtract these from aware datetimes; a naive result would
+        raise TypeError deep inside dashboard/drift windowing.
+        """
+        ts = datetime.fromisoformat(value)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+
     def _to_decision(self, row: sqlite3.Row) -> DecisionRecord:
         return DecisionRecord(
             event_id=row["event_id"],
             agent_id=row["agent_id"],
-            timestamp=datetime.fromisoformat(row["timestamp"]),
+            timestamp=self._parse_ts(row["timestamp"]),
             case_id=row["case_id"],
             case_category=row["case_category"],
             is_high_risk=bool(row["is_high_risk"]),
@@ -236,7 +248,7 @@ class GovernanceDB:
             AlertRecord(
                 alert_id=r["alert_id"],
                 agent_id=r["agent_id"],
-                timestamp=datetime.fromisoformat(r["timestamp"]),
+                timestamp=self._parse_ts(r["timestamp"]),
                 rule_name=r["rule_name"],
                 severity=r["severity"],
                 message=r["message"],
@@ -253,7 +265,7 @@ class GovernanceDB:
                 "WHERE agent_id=? AND rule_name=? ORDER BY timestamp DESC LIMIT 1",
                 (agent_id, rule_name),
             ).fetchone()
-        return datetime.fromisoformat(row["timestamp"]) if row else None
+        return self._parse_ts(row["timestamp"]) if row else None
 
     # ── rollbacks ────────────────────────────────────────────────────────────
 
@@ -281,13 +293,13 @@ class GovernanceDB:
             RollbackRecord(
                 rollback_id=r["rollback_id"],
                 agent_id=r["agent_id"],
-                timestamp=datetime.fromisoformat(r["timestamp"]),
+                timestamp=self._parse_ts(r["timestamp"]),
                 trigger_rule=r["trigger_rule"],
                 reason=r["reason"],
                 metrics=json.loads(r["metrics_json"]),
                 resolved=bool(r["resolved"]),
                 resolved_at=(
-                    datetime.fromisoformat(r["resolved_at"]) if r["resolved_at"] else None
+                    self._parse_ts(r["resolved_at"]) if r["resolved_at"] else None
                 ),
                 resolved_by=r["resolved_by"],
             )
@@ -348,7 +360,7 @@ class GovernanceDB:
             AlertRecord(
                 alert_id=r["alert_id"],
                 agent_id=r["agent_id"],
-                timestamp=datetime.fromisoformat(r["timestamp"]),
+                timestamp=self._parse_ts(r["timestamp"]),
                 rule_name=r["rule_name"],
                 severity=r["severity"],
                 message=r["message"],
@@ -387,7 +399,7 @@ class GovernanceDB:
                 (agent_id, category, metric, limit),
             ).fetchall()
         return [
-            (datetime.fromisoformat(r["timestamp"]), r["value"], r["sample_count"])
+            (self._parse_ts(r["timestamp"]), r["value"], r["sample_count"])
             for r in rows
         ]
 

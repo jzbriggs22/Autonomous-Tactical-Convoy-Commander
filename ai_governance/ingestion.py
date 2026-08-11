@@ -73,10 +73,15 @@ class IngestionLayer:
         is_high_risk, score, matched = self._classify_risk(req)
         span.set_attribute("is_high_risk", is_high_risk)
         span.set_attribute("high_risk_score", score)
+        ts = req.timestamp or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            # Naive timestamps are taken as UTC — downstream windowing code
+            # subtracts them from aware datetimes and would raise otherwise.
+            ts = ts.replace(tzinfo=timezone.utc)
         rec = DecisionRecord(
             event_id=req.event_id or str(uuid.uuid4()),
             agent_id=self._config.agent_id,
-            timestamp=req.timestamp or datetime.now(timezone.utc),
+            timestamp=ts,
             case_id=req.case_id,
             case_category=req.case_category,
             is_high_risk=is_high_risk,
@@ -151,6 +156,11 @@ class IngestionLayer:
             raise ValidationError("resolution_time_ms must be non-negative")
         if req.event_id is not None and not req.event_id.strip():
             raise ValidationError("event_id must be non-empty if provided")
+        if req.ground_truth is not None and req.ground_truth not in VALID_DECISIONS:
+            raise ValidationError(
+                f"Invalid ground truth {req.ground_truth!r}. "
+                f"Must be one of: {sorted(VALID_DECISIONS)}"
+            )
 
     def _classify_risk(
         self, req: IngestRequest

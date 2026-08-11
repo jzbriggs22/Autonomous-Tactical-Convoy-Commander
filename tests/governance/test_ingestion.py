@@ -43,6 +43,29 @@ class TestValidation:
         with pytest.raises(ValidationError, match="event_id"):
             ingestion.ingest(req)
 
+    def test_rejects_invalid_inline_ground_truth(self, ingestion):
+        """ground_truth supplied at ingest time must pass the same validation
+        as add_ground_truth — arbitrary labels would corrupt accuracy metrics."""
+        req = make_request(ground_truth="definitely_not_a_decision")
+        with pytest.raises(ValidationError, match="ground truth"):
+            ingestion.ingest(req)
+
+    def test_accepts_valid_inline_ground_truth(self, ingestion, db, config):
+        r = ingestion.ingest(make_request(ground_truth="escalate"))
+        rec = db.get_decision_by_id(r.event_id, config.agent_id)
+        assert rec.ground_truth == "escalate"
+
+    def test_naive_timestamp_normalized_to_utc(self, ingestion, db, config):
+        """Naive ISO timestamps are common client input; they must come back
+        timezone-aware or dashboard windowing raises TypeError."""
+        req = make_request()
+        req.timestamp = datetime(2026, 8, 11, 12, 0, 0)  # no tzinfo
+        r = ingestion.ingest(req)
+        rec = db.get_decision_by_id(r.event_id, config.agent_id)
+        assert rec.timestamp.tzinfo is not None
+        # subtracting from an aware now must not raise
+        _ = datetime.now(timezone.utc) - rec.timestamp
+
 
 class TestRiskClassification:
     def test_fraud_category_is_high_risk(self, ingestion):
