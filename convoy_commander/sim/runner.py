@@ -1,0 +1,1549 @@
+"""Main simulation runner.
+
+SAFETY-CRITICAL DESIGN:
+  - Every safety-relevant state transition is logged to the EventLog.
+  - The sim loop enforces hard invariants *after* each step (boundary
+    clamping, speed capping, collision detection).  If an invariant is
+    violated the event is logged and corrective action is taken
+    (e.g., emergency stop).
+  - The runner never silently swallows errors: unexpected states are
+    logged at CRITICAL severity so they surface in the audit report.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+
+from convoy_commander.comms.messages import (
+    Message,
+    MessageType,
+    make_bearing_report,
+    make_hazard,
+    make_state_broadcast,
+)
+from convoy_commander.comms.network import CommsNetwork
+from convoy_commander.coordination.allocation import allocate_waypoints_greedy
+from convoy_commander.coordination.cbba import cbba_allocate, compute_formation_slots
+from convoy_commander.coordination.formation import (
+    compute_formation_correction,
+    get_formation_index,
+)
+from convoy_commander.coordination.leader_election import LeaderElection
+from convoy_commander.core.config import SimConfig
+from convoy_commander.core.event_log import EventKind, EventLog, Severity
+from convoy_commander.core.spatial import SpatialHash
+from convoy_commander.core.world import World
+from convoy_commander.metrics.collector import MetricsCollector
+from convoy_commander.planning.global_planner import plan_route
+from convoy_commander.stamp import ReproStamp, collect_stamp
+from convoy_commander.planning.local_planner import compute_command
+from convoy_commander.vehicles.vehicle import CommsMode, Vehicle, VehicleCommand, VehicleStatus
+from convoy_commander.ew.detection import BearingEstimate, ThreatDetector
+from convoy_commander.ew.ecm import ECMState
+from convoy_commander.ew.jammer import RFJammer
+from convoy_commander.weather.effects import WeatherEffects, WeatherState
+
+
+@dataclass
+class SimResult:
+    """Result of a simulation run."""
+
+    config: SimConfig
+    vehicles: list[Vehicle]
+    world: World
+    collector: MetricsCollector
+    comms: CommsNetwork
+    event_log: EventLog
+    stamp: ReproStamp | None = None
+
+
+class SimRunner:
+    """Orchestrates the simulation loop."""
+
+    def __init__(self, config: SimConfig) -> None:
+        self.config = config
+        self.rng = np.random.default_rng(config.seed)
+        self.world = World(config.world, self.rng)
+        self.comms = CommsNetwork(config.comms, self.rng)
+        self.collector = MetricsCollector()
+        self.event_log = EventLog()
+
+        # --- Log simulation start with full config ---
+        self.event_log.log(
+            0.0, EventKind.SIM_START, Severity.INFO,
+            message=f"Simulation starting: scenario={config.scenario} seed={config.seed} "
+                    f"vehicles={config.num_vehicles} duration={config.duration}s",
+            scenario=config.scenario, seed=config.seed, num_vehicles=config.num_vehicles,
+        )
+
+        # --- Log config validation warnings ---
+        for warning in config.safety_warnings():
+            self.event_log.log(
+                0.0, EventKind.CONFIG_WARNING, Severity.WARNING,
+                message=warning,
+            )
+
+        # Create vehicles in a staggered formation near bottom-left
+        self.vehicles: list[Vehicle] = []
+        for i in range(config.num_vehicles):
+            row = i // 2
+            col = i % 2
+            start_x = 50.0 + col * 25.0
+            start_y = 50.0 + row * 25.0
+            v = Vehicle(
+                vehicle_id=i,
+                config=config,
+                rng=np.random.default_rng(config.seed + i + 1),
+                start_x=start_x,
+                start_y=start_y,
+                start_heading=0.3,  # roughly northeast
+            )
+            self.vehicles.append(v)
+            self.event_log.log(
+                0.0, EventKind.VEHICLE_SPAWNED, Severity.INFO, vehicle_id=i,
+                message=f"Vehicle {i} spawned at ({start_x:.1f}, {start_y:.1f})",
+                x=start_x, y=start_y,
+            )
+
+        # Leader election per vehicle
+        self.elections: dict[int, LeaderElection] = {}
+        for v in self.vehicles:
+            self.elections[v.id] = LeaderElection(
+                v, config.coordination.leader_heartbeat_timeout
+            )
+
+        # Set initial leader (vehicle 0)
+        self.vehicles[0].is_leader = True
+        self.vehicles[0].leader_id = 0
+        for v in self.vehicles:
+            v.leader_id = 0
+            self.elections[v.id].last_heartbeat_time = 0.0
+        self.event_log.log(
+            0.0, EventKind.LEADER_ELECTED, Severity.INFO, vehicle_id=0,
+            message="Vehicle 0 designated as initial leader",
+        )
+
+        # Convoy destination: upper-right area
+        self.destination = (
+            config.world.width - 80.0,
+            config.world.height - 80.0,
+        )
+
+        # Plan initial routes
+        allocate_waypoints_greedy(self.vehicles, self.destination)
+        self._plan_all_routes()
+
+        # Scenario event flags
+        self._leader_failed = False
+        self._obstacle_popped = False
+        self._drift_spike_applied = False
+        self._platooning_brake_active = False
+        self._platooning_brake_done = False
+
+        # String stability tracking (Phase 6)
+        self._spacing_errors: dict[int, list[float]] = {}  # vehicle_id -> list of errors
+        self._string_stability_window: tuple[float, float] = (40.0, 60.0)
+
+        # Per-vehicle comms-lost tracking for edge-detect logging
+        self._comms_lost_flags: dict[int, bool] = {v.id: False for v in self.vehicles}
+        # Per-vehicle fuel-low tracking
+        self._fuel_low_logged: set[int] = set()
+        # Near-miss cooldown: {(vid_a, vid_b): last_logged_time}
+        # Only count a near miss once per pair per cooldown window (1s)
+        self._near_miss_cooldown: dict[tuple[int, int], float] = {}
+        self._near_miss_cooldown_s: float = 1.0
+        # Per-pair collision cooldown: one overlap = one event, not one per timestep
+        self._collision_cooldown: dict[tuple[int, int], float] = {}
+        self._collision_cooldown_s: float = 0.5
+        # Stuck detection: track how long each vehicle has been near-zero speed
+        self._stuck_timers: dict[int, float] = {v.id: 0.0 for v in self.vehicles}
+        self._stuck_threshold: float = 5.0  # seconds at near-zero before waypoint skip
+        # Collision-triggered replanning: track recent collisions per vehicle
+        self._collision_window: dict[int, list[float]] = {v.id: [] for v in self.vehicles}
+        self._collision_replan_threshold: int = 4  # collisions in window triggers replan
+        self._collision_window_duration: float = 3.0  # seconds
+        self._last_replan_time: dict[int, float] = {v.id: -999.0 for v in self.vehicles}
+        self._replan_cooldown: float = 8.0  # min seconds between replans per vehicle
+        # Track collision partners: {vid: {partner_vid: count_in_window}}
+        self._collision_partners: dict[int, dict[int, int]] = {v.id: {} for v in self.vehicles}
+        # Vehicles ordered to reverse away from collision partner
+        self._hold_position_until: dict[int, float] = {}
+        self._hold_reverse_target: dict[int, tuple[float, float]] = {}  # target to reverse toward
+
+        # Comms blackout scenario: add blackout region to the comms network
+        if config.scenario == "comms_blackout":
+            mid_x = config.world.width * 0.5
+            mid_y = config.world.height * 0.5
+            self.comms.add_blackout_region(mid_x, mid_y, radius=120.0, loss_mult=20.0)
+            self.event_log.log(
+                0.0, EventKind.SCENARIO_EVENT, Severity.INFO,
+                message=f"SCENARIO: Comms blackout zone at ({mid_x:.0f}, {mid_y:.0f}) radius=120m",
+                x=mid_x, y=mid_y, radius=120.0,
+            )
+
+        # Spatial hash grids for O(N) neighbor queries (Phase 6)
+        self._collision_grid = SpatialHash(config.coordination.min_separation)
+        self._comms_grid = SpatialHash(max(config.comms.max_range / 3.0, 10.0))
+
+        # CBBA-based formation slot assignments  {vehicle_id: slot_index}
+        self._cbba_slots: dict[int, int] = {}
+        self._cbba_realloc_timer: float = 0.0
+        _CBBA_REALLOC_INTERVAL = 10.0  # re-auction every 10s
+        self._cbba_interval = _CBBA_REALLOC_INTERVAL
+        if config.use_cbba:
+            self._run_cbba_allocation()
+
+        # Weather effects (Phase 10)
+        self._weather_effects: WeatherEffects | None = None
+        self._weather_state: WeatherState | None = None
+        self._weather_log_timer: float = 0.0
+        if config.weather.enabled:
+            self._weather_effects = WeatherEffects(config.weather)
+            if config.weather.weather_source == "api" and config.weather.latitude is not None:
+                try:
+                    from convoy_commander.weather.api_client import fetch_weather_forecast, WeatherFetchError
+                    points = fetch_weather_forecast(
+                        config.weather.latitude,
+                        config.weather.longitude or 0.0,
+                        config.duration,
+                    )
+                    self._weather_effects.set_data_points(points)
+                    self.event_log.log(
+                        0.0, EventKind.WEATHER_UPDATED, Severity.INFO,
+                        message=f"Weather API: loaded {len(points)} hourly data points",
+                    )
+                except Exception as exc:
+                    self.event_log.log(
+                        0.0, EventKind.WEATHER_API_FALLBACK, Severity.WARNING,
+                        message=f"Weather API unavailable ({exc}), using static fallback",
+                    )
+            else:
+                self.event_log.log(
+                    0.0, EventKind.WEATHER_UPDATED, Severity.INFO,
+                    message="Weather: static mode enabled",
+                )
+
+        # Electronic warfare (Phase 11)
+        self._ew_enabled = config.ew.enabled
+        self._jammers: list[RFJammer] = []
+        self._ecm_states: dict[int, ECMState] = {}
+        self._ew_triangulated = False
+        self._ew_detection_logged: set[int] = set()  # vehicles that already logged detection
+        if self._ew_enabled:
+            for v in self.vehicles:
+                ecm = ECMState(freq_hop_loss_reduction=config.ew.freq_hop_loss_reduction)
+                self._ecm_states[v.id] = ecm
+                v.ecm = ecm
+                v.threat_detector = ThreatDetector(
+                    rng=np.random.default_rng(config.seed + v.id + 1000),
+                    detection_threshold=config.ew.jammer_detection_threshold,
+                    bearing_noise_std=config.ew.bearing_noise_std,
+                )
+            self.comms.ecm_states = self._ecm_states
+
+        # Centralised supervisor (optional)
+        self._supervisor = None
+        if config.use_supervisor:
+            from convoy_commander.supervisor.supervisor import CentralSupervisor
+            self._supervisor = CentralSupervisor(config)
+
+    def _run_cbba_allocation(self) -> None:
+        """Run CBBA-lite auction to assign formation slot indices."""
+        leader = self._get_leader()
+        operational = [v for v in self.vehicles if v.is_operational]
+        if not operational or leader is None:
+            return
+
+        slot_positions = compute_formation_slots(
+            leader.estimator.state.x,
+            leader.estimator.state.y,
+            leader.estimator.state.heading,
+            len(operational),
+            self.config.coordination.formation_spacing,
+        )
+
+        self._cbba_slots = cbba_allocate(operational, slot_positions)
+
+    def _plan_all_routes(self) -> None:
+        """Plan global routes for all vehicles using the configured planning objective."""
+        objective = self.config.planning
+        for v in self.vehicles:
+            if v.assigned_destination is not None and v.is_operational:
+                route = plan_route(
+                    self.world,
+                    v.estimator.state.x,
+                    v.estimator.state.y,
+                    v.assigned_destination[0],
+                    v.assigned_destination[1],
+                    objective=objective,
+                )
+                v.waypoints = route
+                v.current_waypoint_idx = 0
+
+    def run(self, progress_callback: callable | None = None) -> SimResult:
+        """Run the full simulation."""
+        dt = self.config.dt
+        total_steps = int(self.config.duration / dt)
+        broadcast_timer = 0.0
+
+        for step in range(total_steps):
+            current_time = step * dt
+
+            # Progress reporting
+            if progress_callback and step % 100 == 0:
+                progress_callback(step, total_steps)
+
+            # === Scenario events ===
+            self._handle_scenario_events(current_time)
+
+            # === Electronic warfare tick ===
+            if self._ew_enabled:
+                self._ew_tick(current_time, dt)
+
+            # === Weather effects ===
+            if self._weather_effects is not None:
+                self._apply_weather_effects(current_time, dt)
+
+            # === Rebuild spatial grids ===
+            self._rebuild_spatial_grids()
+
+            # === Position fixes (GPS / landmarks) ===
+            self._apply_position_fixes(current_time)
+
+            # === Comms: deliver pending messages ===
+            self.comms.tick(current_time)
+
+            # === Process received messages ===
+            self._process_messages(current_time)
+
+            # === Leader election ===
+            self._run_elections(current_time)
+
+            # === Broadcast state periodically ===
+            broadcast_timer += dt
+            if broadcast_timer >= self.config.comms.broadcast_interval:
+                broadcast_timer = 0.0
+                self._broadcast_states(current_time)
+
+            # === Check safe mode conditions ===
+            self._check_safe_mode(current_time)
+
+            # === Centralised supervisor tick ===
+            if self._supervisor is not None:
+                self._run_supervisor(current_time)
+
+            # === CBBA re-allocation (periodic) ===
+            if self.config.use_cbba:
+                self._cbba_realloc_timer += dt
+                if self._cbba_realloc_timer >= self._cbba_interval:
+                    self._cbba_realloc_timer = 0.0
+                    self._run_cbba_allocation()
+
+            # === Planning and control ===
+            leader = self._get_leader()
+            operational_ids = [v.id for v in self.vehicles if v.is_operational]
+
+            # Log formation degraded if no leader
+            if leader is None and len(operational_ids) > 0:
+                if step % 100 == 0:  # Throttle: log every 10s
+                    self.event_log.log(
+                        current_time, EventKind.FORMATION_DEGRADED, Severity.WARNING,
+                        message="No operational leader; convoy formation degraded",
+                    )
+
+            for v in self.vehicles:
+                if not v.is_operational:
+                    continue
+
+                # Hold/reverse: vehicle ordered to move away from collision partner
+                if current_time < self._hold_position_until.get(v.id, 0.0):
+                    rev_target = self._hold_reverse_target.get(v.id)
+                    if rev_target is not None:
+                        neighbors = [vv for vv in self.vehicles if vv.id != v.id and vv.is_operational]
+                        cmd = compute_command(v, rev_target, self.world, neighbors, dt,
+                                              stuck_time=self._stuck_timers[v.id])
+                    else:
+                        cmd = VehicleCommand(accel=-v.vcfg.max_decel * 0.5, turn_rate=0.0)
+                    v.step(cmd, dt)
+                    self._enforce_safety_envelope(v, current_time)
+                    self._advance_waypoint(v)
+                    if v.has_reached_destination() and v.status != VehicleStatus.ARRIVED:
+                        v.status = VehicleStatus.ARRIVED
+                        v.state.speed = 0.0
+                        self.collector.record_arrival(v.id, current_time)
+                    continue
+
+                # Get current waypoint target
+                target = self._get_current_target(v)
+                if target is None:
+                    continue
+
+                # Formation correction — use CBBA slot if available
+                # Suppress formation correction when accumulating collisions
+                recent_collisions = len(self._collision_window.get(v.id, []))
+                in_scatter_mode = recent_collisions >= 4
+
+                if self.config.use_cbba and v.id in self._cbba_slots:
+                    formation_idx = self._cbba_slots[v.id]
+                else:
+                    formation_idx = get_formation_index(v.id, leader.id if leader else None, operational_ids)
+                if leader and not v.is_leader and not in_scatter_mode:
+                    correction = compute_formation_correction(
+                        v, leader,
+                        [vv for vv in self.vehicles if vv.id != v.id and vv.is_operational],
+                        formation_idx,
+                        v.effective_spacing,
+                    )
+                    # Scale formation correction down when near other vehicles
+                    corr_scale = 1.5
+                    for vv in self.vehicles:
+                        if vv.id != v.id and vv.is_operational:
+                            d = v.state.distance_to(vv.state)
+                            if d < self.config.coordination.min_separation * 1.5:
+                                corr_scale = min(corr_scale, 0.3)
+                                break
+                    target = (target[0] + correction[0] * corr_scale, target[1] + correction[1] * corr_scale)
+
+                # Compute and apply command — pre-filter operational neighbors
+                neighbors = [vv for vv in self.vehicles if vv.id != v.id and vv.is_operational]
+                cmd = compute_command(v, target, self.world, neighbors, dt,
+                                      stuck_time=self._stuck_timers[v.id])
+
+                # Wind perturbation on steering
+                if self._weather_effects is not None and self._weather_state is not None:
+                    h_perturb, _ = self._weather_effects.wind_effects(
+                        self._weather_state, v.state.heading, v.state.speed,
+                    )
+                    cmd.turn_rate += h_perturb
+
+                # Platooning: force leader to brake during perturbation window
+                if (self._platooning_brake_active and v.is_leader
+                        and v.state.speed > 6.0):
+                    cmd.accel = -v.vcfg.max_decel * 0.5
+
+                # Clamp speed in safe mode
+                if v.status == VehicleStatus.SAFE_MODE:
+                    max_safe = v.effective_max_speed
+                    if v.state.speed > max_safe and cmd.accel > 0:
+                        cmd.accel = -v.vcfg.max_decel * 0.3
+
+                # Emergency braking: only when actually converging toward another vehicle.
+                # Uses closing speed (negative = diverging) to avoid deadlocking
+                # stationary vehicles that happen to be within min_separation.
+                collision_r = self.config.coordination.collision_radius
+                for vv in self.vehicles:
+                    if vv.id != v.id and vv.is_operational:
+                        d = v.state.distance_to(vv.state)
+                        # Compute closing speed (positive = converging)
+                        dx = vv.state.x - v.state.x
+                        dy = vv.state.y - v.state.y
+                        if d > 0.1:
+                            # Project velocity difference onto line between vehicles
+                            nx, ny = dx / d, dy / d
+                            v_rel = (
+                                (v.state.speed * math.cos(v.state.heading)
+                                 - vv.state.speed * math.cos(vv.state.heading)) * nx
+                                + (v.state.speed * math.sin(v.state.heading)
+                                   - vv.state.speed * math.sin(vv.state.heading)) * ny
+                            )
+                        else:
+                            v_rel = v.state.speed  # very close: treat as converging
+
+                        if d < collision_r * 1.3:
+                            cmd.accel = -v.vcfg.max_decel * 0.8
+                            away_angle = math.atan2(-dy, -dx)
+                            steer_err = away_angle - v.state.heading
+                            steer_err = math.atan2(math.sin(steer_err), math.cos(steer_err))
+                            cmd.turn_rate = max(-v.vcfg.max_turn_rate,
+                                                min(v.vcfg.max_turn_rate, steer_err * 3.0))
+                            break
+                        elif d < collision_r * 2.0 and v_rel > 0.5:
+                            # Close and converging: moderate brake
+                            cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.4)
+                        elif d < self.config.coordination.min_separation and v_rel > 1.0:
+                            # Within min sep and closing fast: gentle brake
+                            cmd.accel = min(cmd.accel, -v.vcfg.max_decel * 0.15)
+
+                v.step(cmd, dt)
+
+                # === Safety envelope enforcement (post-step) ===
+                self._enforce_safety_envelope(v, current_time)
+
+                # === Phase 7: record corridor distance ===
+                corridor_dist = v.route_corridor_distance(v.state.x, v.state.y)
+                self.collector.record_corridor_distance(current_time, v.id, corridor_dist)
+
+                # === Phase 7: record headway gap for followers ===
+                if leader and not v.is_leader:
+                    pred = self._find_predecessor(v, leader, operational_ids)
+                    if pred is not None:
+                        actual_gap = v.state.distance_to(pred.state)
+                        coord = self.config.coordination
+                        desired_gap = coord.standoff_distance + coord.time_headway * v.state.speed
+                        self.collector.record_headway(current_time, v.id, actual_gap, desired_gap)
+
+                # Check waypoint advance
+                self._advance_waypoint(v)
+
+                # Stuck detection: skip waypoint if vehicle near-zero speed too long
+                if v.state.speed < 0.5 and v.status == VehicleStatus.ACTIVE:
+                    self._stuck_timers[v.id] += dt
+                    if self._stuck_timers[v.id] >= self._stuck_threshold:
+                        if v.waypoints and v.current_waypoint_idx < len(v.waypoints) - 1:
+                            # Skip multiple waypoints if stuck repeatedly
+                            skip_count = min(3, len(v.waypoints) - 1 - v.current_waypoint_idx)
+                            v.current_waypoint_idx += skip_count
+                            self._stuck_timers[v.id] = 0.0
+                            self.event_log.log(
+                                current_time, EventKind.SCENARIO_EVENT, Severity.INFO,
+                                vehicle_id=v.id,
+                                message=f"Vehicle {v.id} stuck — skipping {skip_count} "
+                                        f"waypoint(s) to idx {v.current_waypoint_idx}",
+                            )
+                        else:
+                            # No more waypoints to skip; keep timer running so
+                            # DWA relaxes clearance constraints
+                            pass
+                else:
+                    self._stuck_timers[v.id] = 0.0
+
+                # Check arrival
+                if v.has_reached_destination():
+                    if v.status != VehicleStatus.ARRIVED:
+                        v.status = VehicleStatus.ARRIVED
+                        v.state.speed = 0.0
+                        self.collector.record_arrival(v.id, current_time)
+                        self.event_log.log(
+                            current_time, EventKind.VEHICLE_ARRIVED, Severity.INFO,
+                            vehicle_id=v.id,
+                            message=f"Vehicle {v.id} arrived at destination",
+                            x=v.state.x, y=v.state.y,
+                        )
+
+            # === Fuel monitoring ===
+            self._check_fuel(current_time)
+
+            # === Collision and near-miss detection ===
+            self._detect_collisions(current_time)
+
+            # === String stability tracking (Phase 6) ===
+            self._track_spacing_errors(current_time)
+
+            # === Record metrics ===
+            self.collector.record_step(current_time, self.vehicles)
+
+            # Record comms adjacency and network stats periodically
+            if step % 50 == 0:
+                positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles}
+                adj = self.comms.get_adjacency(positions, self._comms_grid)
+                self.collector.record_comms_adjacency(current_time, adj)
+                # Phase 8: network topology stats
+                net_stats = self.comms.get_network_stats(positions)
+                self.collector.record_network_stats(current_time, net_stats)
+
+            # Phase 8: record covariance ellipses periodically (every 100 steps)
+            if step % 100 == 0:
+                for v in self.vehicles:
+                    if v.is_operational:
+                        cov = v.estimator.state.cov
+                        eigs, vecs = np.linalg.eigh(cov)
+                        major = float(max(eigs))
+                        minor = float(min(eigs))
+                        # Angle of major axis
+                        idx = 1 if eigs[1] >= eigs[0] else 0
+                        angle = float(np.arctan2(vecs[1, idx], vecs[0, idx]))
+                        self.collector.record_cov_ellipse(
+                            current_time, v.id,
+                            v.estimator.state.x, v.estimator.state.y,
+                            major, minor, angle,
+                        )
+
+            # Check if all arrived
+            if all(
+                v.has_reached_destination() or not v.is_operational
+                for v in self.vehicles
+            ):
+                break
+
+        # --- Log simulation end ---
+        final_time = min(total_steps * dt, self.config.duration)
+        arrived = sum(1 for v in self.vehicles if v.has_reached_destination())
+        self.event_log.log(
+            final_time, EventKind.SIM_END, Severity.INFO,
+            message=f"Simulation ended: {arrived}/{len(self.vehicles)} arrived",
+            arrived=arrived, total=len(self.vehicles),
+        )
+
+        # Compute string stability metrics (Phase 6)
+        self._compute_string_stability()
+
+        stamp = collect_stamp(self.config)
+
+        return SimResult(
+            config=self.config,
+            vehicles=self.vehicles,
+            world=self.world,
+            collector=self.collector,
+            comms=self.comms,
+            event_log=self.event_log,
+            stamp=stamp,
+        )
+
+    # ------------------------------------------------------------------
+    # Safety envelope enforcement
+    # ------------------------------------------------------------------
+
+    def _enforce_safety_envelope(self, v: Vehicle, t: float) -> None:
+        """Post-step invariant checks and corrective actions."""
+        # Boundary clamping
+        clamped = False
+        if v.state.x < 0:
+            v.state.x = 0.0
+            clamped = True
+        elif v.state.x > self.world.width:
+            v.state.x = self.world.width
+            clamped = True
+        if v.state.y < 0:
+            v.state.y = 0.0
+            clamped = True
+        elif v.state.y > self.world.height:
+            v.state.y = self.world.height
+            clamped = True
+        if clamped:
+            v.state.speed = 0.0  # Emergency stop on boundary
+            self.event_log.log(
+                t, EventKind.BOUNDARY_VIOLATION, Severity.WARNING, vehicle_id=v.id,
+                message=f"Vehicle {v.id} clamped to world boundary, emergency stop",
+                x=v.state.x, y=v.state.y,
+            )
+
+        # Speed limit enforcement (belt-and-braces)
+        hard_max = v.vcfg.max_speed * 1.01  # 1% tolerance for float rounding
+        if v.state.speed > hard_max:
+            self.event_log.log(
+                t, EventKind.SPEED_LIMIT_EXCEEDED, Severity.WARNING, vehicle_id=v.id,
+                message=f"Vehicle {v.id} speed {v.state.speed:.2f} exceeds max {v.vcfg.max_speed:.2f}",
+                speed=v.state.speed, max_speed=v.vcfg.max_speed,
+            )
+            v.state.speed = v.vcfg.max_speed
+
+        # Obstacle collision check (vehicle inside obstacle -> emergency stop)
+        if self.world.is_blocked(v.state.x, v.state.y):
+            v.state.speed = 0.0
+            self.event_log.log(
+                t, EventKind.INVARIANT_VIOLATION, Severity.CRITICAL, vehicle_id=v.id,
+                message=f"Vehicle {v.id} inside obstacle at ({v.state.x:.1f}, {v.state.y:.1f}), "
+                        "emergency stop",
+                x=v.state.x, y=v.state.y,
+            )
+
+    def _check_fuel(self, t: float) -> None:
+        """Monitor fuel levels and log warnings."""
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+            if v.fuel.is_empty:
+                v.status = VehicleStatus.BREAKDOWN
+                v.state.speed = 0.0
+                self.event_log.log(
+                    t, EventKind.VEHICLE_FUEL_EMPTY, Severity.CRITICAL, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} fuel exhausted — forced breakdown",
+                )
+            elif v.fuel.is_low and v.id not in self._fuel_low_logged:
+                self._fuel_low_logged.add(v.id)
+                self.event_log.log(
+                    t, EventKind.VEHICLE_FUEL_LOW, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} fuel below 20% ({v.fuel.fraction:.0%})",
+                    fuel_fraction=v.fuel.fraction,
+                )
+
+    # ------------------------------------------------------------------
+    # Scenario events
+    # ------------------------------------------------------------------
+
+    def _handle_scenario_events(self, t: float) -> None:
+        """Trigger scenario-specific events."""
+        scenario = self.config.scenario
+
+        if scenario == "leader_failure" and not self._leader_failed and t >= 120.0:
+            self._leader_failed = True
+            leader = self._get_leader()
+            if leader:
+                self.event_log.log(
+                    t, EventKind.SCENARIO_EVENT, Severity.WARNING, vehicle_id=leader.id,
+                    message=f"SCENARIO: Leader vehicle {leader.id} forced breakdown at t={t:.1f}s",
+                )
+                leader.set_breakdown()
+                self.event_log.log(
+                    t, EventKind.LEADER_LOST, Severity.WARNING,
+                    message=f"Leader {leader.id} lost — triggering re-election",
+                )
+                # Force election restart on all
+                for v in self.vehicles:
+                    if v.is_operational:
+                        self.elections[v.id].reset()
+                self.collector.leader_elections += 1
+
+        if scenario == "sensor_drift_spike" and not self._drift_spike_applied and t >= 60.0:
+            self._drift_spike_applied = True
+            spike_magnitude = 8.0
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message=f"SCENARIO: IMU drift spike injected (magnitude={spike_magnitude}m) "
+                        f"to all {sum(1 for v in self.vehicles if v.is_operational)} operational vehicles",
+                magnitude=spike_magnitude,
+            )
+            for v in self.vehicles:
+                if v.is_operational:
+                    v.estimator.apply_drift_spike(spike_magnitude)
+                    self.event_log.log(
+                        t, EventKind.DRIFT_SPIKE, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} drift spike: bias jump ≈ {spike_magnitude}m, "
+                                f"uncertainty now ≈ {v.estimator.state.uncertainty:.1f}m",
+                        magnitude=spike_magnitude,
+                        uncertainty_after=v.estimator.state.uncertainty,
+                    )
+
+        if scenario == "obstacle_pop" and not self._obstacle_popped and t >= 90.0:
+            self._obstacle_popped = True
+            mid_x = self.world.width * 0.5
+            mid_y = self.world.height * 0.5
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message=f"SCENARIO: New obstacle at ({mid_x:.0f}, {mid_y:.0f}) radius 35m",
+                x=mid_x, y=mid_y, radius=35.0,
+            )
+            self.world.add_obstacle(mid_x, mid_y, 35.0)
+            self._plan_all_routes()
+            self.event_log.log(
+                t, EventKind.ROUTE_REPLAN, Severity.INFO,
+                message="All routes replanned after obstacle insertion",
+            )
+
+        # Platooning: leader speed perturbation at t=40s (brake to 6 m/s for 5s)
+        if scenario == "platooning":
+            if not self._platooning_brake_active and not self._platooning_brake_done and t >= 40.0:
+                self._platooning_brake_active = True
+                self.event_log.log(
+                    t, EventKind.SCENARIO_EVENT, Severity.INFO,
+                    message="SCENARIO: Leader braking to 6 m/s for string stability test",
+                )
+            if self._platooning_brake_active and t >= 45.0:
+                self._platooning_brake_active = False
+                self._platooning_brake_done = True
+                self.event_log.log(
+                    t, EventKind.SCENARIO_EVENT, Severity.INFO,
+                    message="SCENARIO: Leader brake released, returning to cruise speed",
+                )
+
+        # EW scenarios: place jammers
+        if scenario == "jammed_corridor" and not self._jammers and t < 0.2:
+            w, h = self.config.world.width, self.config.world.height
+            jammers = [
+                RFJammer(x=150.0, y=150.0, radius=200.0, power_dbm=40.0),
+                RFJammer(x=w * 0.5, y=h * 0.5, radius=120.0, power_dbm=30.0),
+                RFJammer(x=w * 0.5, y=h * 0.5, radius=100.0, power_dbm=25.0, jam_gps=True),
+            ]
+            self._place_jammers(jammers)
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message=f"SCENARIO: {len(jammers)} jammers placed along corridor",
+            )
+
+        if scenario == "mobile_jammer" and not self._jammers and t >= 30.0:
+            w, h = self.config.world.width, self.config.world.height
+            jammers = [
+                RFJammer(
+                    x=w * 0.3, y=h * 0.5, radius=150.0, power_dbm=28.0,
+                    mobile=True, velocity_x=2.0, velocity_y=1.0,
+                ),
+            ]
+            self._place_jammers(jammers)
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message="SCENARIO: Mobile jammer deployed at t=30s",
+            )
+
+        if scenario == "multi_threat" and not self._jammers and t < 0.2:
+            w, h = self.config.world.width, self.config.world.height
+            jammers = [
+                RFJammer(x=150.0, y=150.0, radius=200.0, power_dbm=40.0, jam_gps=True),
+                RFJammer(x=w * 0.5, y=h * 0.5, radius=150.0, power_dbm=30.0),
+            ]
+            self._place_jammers(jammers)
+            # Also add a blackout zone
+            self.comms.add_blackout_region(w * 0.5, h * 0.5, radius=80.0, loss_mult=10.0)
+            self.event_log.log(
+                t, EventKind.SCENARIO_EVENT, Severity.WARNING,
+                message="SCENARIO: Multi-threat environment: 2 jammers + blackout zone",
+            )
+
+    # ------------------------------------------------------------------
+    # Position fixes
+    # ------------------------------------------------------------------
+
+    def _apply_position_fixes(self, t: float) -> None:
+        """Apply GPS or landmark fixes to vehicles.
+
+        GPS fixes are potentially spoofed if the vehicle is inside a SpoofRegion.
+        The innovation gate in the estimator may reject anomalous fixes.
+        """
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+
+            # Check GPS jamming (Phase 11)
+            gps_jammed = self._ew_enabled and self.world.is_gps_jammed(v.state.x, v.state.y)
+            if gps_jammed:
+                self.event_log.log(
+                    t, EventKind.GPS_JAMMED, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} GPS jammed at ({v.state.x:.0f}, {v.state.y:.0f})",
+                )
+                # Skip all GPS fixes for this vehicle this tick
+                # Still allow landmark fixes below
+                nearby = self.world.landmarks_in_range(v.state.x, v.state.y)
+                for lm in nearby:
+                    v.estimator.apply_landmark_fix(v.state.x, v.state.y)
+                continue
+
+            # Check for GPS spoofing at vehicle's true position
+            spoof_offset = self.world.get_spoof_offset(v.state.x, v.state.y)
+            if spoof_offset is not None:
+                self.event_log.log(
+                    t, EventKind.GPS_SPOOFED, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} in GPS spoof zone; offset=({spoof_offset[0]:.1f},"
+                            f"{spoof_offset[1]:.1f})m",
+                    offset_x=spoof_offset[0], offset_y=spoof_offset[1],
+                )
+
+            # GPS fix
+            if self.config.gps_available:
+                meas_x = v.state.x + (spoof_offset[0] if spoof_offset else 0.0)
+                meas_y = v.state.y + (spoof_offset[1] if spoof_offset else 0.0)
+                innovation, accepted = v.estimator.apply_gps_fix(meas_x, meas_y)
+                if not accepted:
+                    self.event_log.log(
+                        t, EventKind.ESTIMATOR_FIX_REJECTED, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} GPS fix rejected by innovation gate "
+                                f"(innovation={innovation:.1f}m)",
+                        innovation_m=innovation,
+                    )
+            elif self.config.gps_intermittent_prob > 0:
+                if self.rng.random() < self.config.gps_intermittent_prob * self.config.dt:
+                    meas_x = v.state.x + (spoof_offset[0] if spoof_offset else 0.0)
+                    meas_y = v.state.y + (spoof_offset[1] if spoof_offset else 0.0)
+                    innovation, accepted = v.estimator.apply_gps_fix(meas_x, meas_y)
+                    if not accepted:
+                        self.event_log.log(
+                            t, EventKind.ESTIMATOR_FIX_REJECTED, Severity.WARNING, vehicle_id=v.id,
+                            message=f"Vehicle {v.id} intermittent GPS fix rejected "
+                                    f"(innovation={innovation:.1f}m)",
+                            innovation_m=innovation,
+                        )
+
+            # Landmark fixes
+            nearby = self.world.landmarks_in_range(v.state.x, v.state.y)
+            for lm in nearby:
+                innovation, accepted = v.estimator.apply_landmark_fix(v.state.x, v.state.y)
+                if not accepted:
+                    self.event_log.log(
+                        t, EventKind.ESTIMATOR_FIX_REJECTED, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} landmark fix rejected by innovation gate "
+                                f"(innovation={innovation:.1f}m)",
+                        innovation_m=innovation,
+                    )
+
+    # ------------------------------------------------------------------
+    # Comms processing
+    # ------------------------------------------------------------------
+
+    def _process_messages(self, t: float) -> None:
+        """Process incoming messages for all vehicles."""
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+            inbox = self.comms.get_inbox(v.id)
+            for msg in inbox:
+                v.last_comms_time = t
+
+                # Edge-detect comms restored
+                if self._comms_lost_flags.get(v.id, False):
+                    self._comms_lost_flags[v.id] = False
+                    self.event_log.log(
+                        t, EventKind.COMMS_RESTORED, Severity.INFO, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} comms restored",
+                    )
+
+                if msg.msg_type == MessageType.LEADER_HEARTBEAT:
+                    self.elections[v.id].on_heartbeat(msg, t)
+                elif msg.msg_type == MessageType.LEADER_ELECTION:
+                    self.elections[v.id].on_election_message(msg, t)
+                elif msg.msg_type == MessageType.HAZARD:
+                    pass
+                elif msg.msg_type == MessageType.BEARING_REPORT:
+                    # Phase 11: collect bearing estimates for triangulation
+                    if v.threat_detector is not None:
+                        est = BearingEstimate(
+                            vehicle_id=msg.sender_id,
+                            vehicle_x=float(msg.payload.get("vehicle_x", 0.0)),
+                            vehicle_y=float(msg.payload.get("vehicle_y", 0.0)),
+                            bearing_rad=float(msg.payload.get("bearing_rad", 0.0)),
+                            rssi_anomaly=float(msg.payload.get("rssi_anomaly", 0.0)),
+                            timestamp=msg.timestamp,
+                        )
+                        v.threat_detector.add_estimate(est)
+                elif msg.msg_type == MessageType.STATE_BROADCAST:
+                    # Phase 8: cache neighbor state
+                    v.update_neighbor(msg.sender_id, msg.payload, msg.timestamp)
+
+    def _run_elections(self, t: float) -> None:
+        """Run leader election logic for all vehicles."""
+        positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles if v.is_operational}
+        prev_leaders = {v.id for v in self.vehicles if v.is_leader}
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+            msgs = self.elections[v.id].check_and_elect(t)
+            sender_pos = (v.state.x, v.state.y)
+            for msg in msgs:
+                self.comms.send_broadcast(msg, sender_pos, positions, t, self._comms_grid)
+
+        # Detect new leader
+        for v in self.vehicles:
+            if v.is_leader and v.id not in prev_leaders:
+                self.event_log.log(
+                    t, EventKind.LEADER_ELECTED, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} elected as new leader",
+                )
+                self.collector.leader_elections += 1
+
+    def _broadcast_states(self, t: float) -> None:
+        """Broadcast vehicle states, respecting each vehicle's CommsMode."""
+        positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles if v.is_operational}
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+            # SILENT mode: suppress all state broadcasts (stealth / emissions control)
+            if v.comms_mode == CommsMode.SILENT:
+                continue
+            msg = make_state_broadcast(
+                sender_id=v.id,
+                timestamp=t,
+                x=v.estimator.state.x,
+                y=v.estimator.state.y,
+                heading=v.estimator.state.heading,
+                speed=v.state.speed,
+                uncertainty=v.estimator.state.uncertainty,
+                status=v.status.name,
+                fuel=v.fuel.fuel,
+            )
+            sender_pos = (v.state.x, v.state.y)
+            self.comms.send_broadcast(msg, sender_pos, positions, t, self._comms_grid)
+
+        # Phase 8: multi-hop relay — each vehicle relays messages it received
+        if self.config.comms.max_relay_hops > 0:
+            self._relay_messages(t, positions)
+
+    # ------------------------------------------------------------------
+    # Safe mode logic
+    # ------------------------------------------------------------------
+
+    def _relay_messages(self, t: float, positions: dict[int, tuple[float, float]]) -> None:
+        """Relay recently received STATE_BROADCAST messages via multi-hop."""
+        for v in self.vehicles:
+            if not v.is_operational or v.comms_mode == CommsMode.SILENT:
+                continue
+            # Relay the latest state broadcast each neighbor sent us
+            for nid, nstate in v.neighbor_states.items():
+                ts = float(nstate.get("timestamp", 0.0))
+                # Only relay recent messages (within 2 broadcast intervals)
+                if t - ts > self.config.comms.broadcast_interval * 2:
+                    continue
+                relay_msg = make_state_broadcast(
+                    sender_id=nid,
+                    timestamp=ts,
+                    x=float(nstate.get("x", 0.0)),
+                    y=float(nstate.get("y", 0.0)),
+                    heading=float(nstate.get("heading", 0.0)),
+                    speed=float(nstate.get("speed", 0.0)),
+                    uncertainty=float(nstate.get("uncertainty", 0.0)),
+                    status=str(nstate.get("status", "ACTIVE")),
+                    fuel=float(nstate.get("fuel", 0.0)),
+                )
+                # Track which vehicles already have this info
+                already_received = {v.id, nid}
+                # Add vehicles that are direct neighbors of the original sender
+                for vv in self.vehicles:
+                    if vv.id != v.id and nid in vv.neighbor_states:
+                        already_received.add(vv.id)
+                relayer_pos = (v.state.x, v.state.y)
+                self.comms.relay_broadcast(
+                    relay_msg, v.id, relayer_pos, positions, t,
+                    already_received, self._comms_grid,
+                )
+
+        # Prune stale neighbor entries (older than 3× broadcast interval)
+        max_age = self.config.comms.broadcast_interval * 3
+        for v in self.vehicles:
+            v.prune_stale_neighbors(t, max_age)
+
+    def _check_safe_mode(self, t: float) -> None:
+        """Enter/exit safe mode based on safety conditions.
+
+        Conservative policy: enter on *any* trigger, exit only when
+        *all* conditions clear.
+        """
+        comms_timeout = self.config.coordination.comms_lost_timeout
+
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+
+            reasons: list[str] = []
+
+            # High position uncertainty
+            if v.estimator.is_uncertain:
+                reasons.append(
+                    f"uncertainty={v.estimator.state.uncertainty:.1f}m > "
+                    f"threshold={self.config.estimator.uncertainty_safe_threshold:.1f}m"
+                )
+
+            # Weather: extremely low visibility
+            if self._weather_effects is not None and self._weather_state is not None:
+                _, _, force_safe = self._weather_effects.visibility_effects(self._weather_state)
+                if force_safe:
+                    reasons.append(f"weather_visibility={self._weather_state.visibility_m:.0f}m < 100m")
+
+            # Comms lost for too long
+            comms_gap = t - v.last_comms_time
+            if comms_gap > comms_timeout and t > 5.0:
+                reasons.append(f"comms_lost={comms_gap:.1f}s > timeout={comms_timeout:.1f}s")
+                # Edge-detect comms lost
+                if not self._comms_lost_flags.get(v.id, False):
+                    self._comms_lost_flags[v.id] = True
+                    self.event_log.log(
+                        t, EventKind.COMMS_LOST, Severity.WARNING, vehicle_id=v.id,
+                        message=f"Vehicle {v.id} comms lost for {comms_gap:.1f}s",
+                    )
+
+            if reasons and v.status == VehicleStatus.ACTIVE:
+                v.enter_safe_mode()
+                self.collector.safe_mode_activations += 1
+                self.event_log.log(
+                    t, EventKind.SAFE_MODE_ENTER, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} entering safe mode: {'; '.join(reasons)}",
+                )
+            elif not reasons and v.status == VehicleStatus.SAFE_MODE:
+                v.exit_safe_mode()
+                self.event_log.log(
+                    t, EventKind.SAFE_MODE_EXIT, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} exiting safe mode — all conditions clear",
+                )
+
+    # ------------------------------------------------------------------
+    # Electronic warfare (Phase 11)
+    # ------------------------------------------------------------------
+
+    def _place_jammers(self, jammers: list[RFJammer]) -> None:
+        """Register jammers in world and comms network."""
+        for j in jammers:
+            self.world.add_jammer(j)
+            self._jammers.append(j)
+        self.comms.jammers = self._jammers
+        # Pre-annotate edges with threat cost for route planning
+        self.world.annotate_edge_threat()
+
+    def _ew_tick(self, t: float, dt: float) -> None:
+        """Per-step EW processing: mobile jammer movement, detection, ECM, triangulation."""
+        if not self._jammers:
+            return
+
+        # Step mobile jammers
+        for j in self._jammers:
+            j.step(dt)
+
+        positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles if v.is_operational}
+
+        for v in self.vehicles:
+            if not v.is_operational or v.threat_detector is None:
+                continue
+
+            detector: ThreatDetector = v.threat_detector
+            ecm: ECMState = self._ecm_states[v.id]
+
+            # Measure RSSI anomaly
+            anomaly = detector.measure_rssi_anomaly(v.state.x, v.state.y, self._jammers)
+            if anomaly is None:
+                continue
+
+            # Jammer detected — log once per vehicle
+            if v.id not in self._ew_detection_logged:
+                self._ew_detection_logged.add(v.id)
+                self.event_log.log(
+                    t, EventKind.JAMMER_DETECTED, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} detected RF jammer (anomaly={anomaly:.2f})",
+                    anomaly=anomaly,
+                )
+
+            # Activate ECM if not already active
+            if not ecm.freq_hopping_active:
+                ecm.freq_hopping_active = True
+                ecm.adaptive_power_boost = 1.5
+                self.event_log.log(
+                    t, EventKind.ECM_ACTIVATED, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} activated frequency hopping + power boost",
+                )
+
+            # Estimate bearing and broadcast report
+            bearing = detector.estimate_bearing(v.state.x, v.state.y, self._jammers)
+            if bearing is not None:
+                est = BearingEstimate(
+                    vehicle_id=v.id,
+                    vehicle_x=v.state.x,
+                    vehicle_y=v.state.y,
+                    bearing_rad=bearing,
+                    rssi_anomaly=anomaly,
+                    timestamp=t,
+                )
+                detector.add_estimate(est)
+
+                # Broadcast bearing report to peers
+                msg = make_bearing_report(
+                    v.id, t, bearing, anomaly, v.state.x, v.state.y,
+                )
+                self.comms.send_broadcast(
+                    msg, (v.state.x, v.state.y), positions, t, self._comms_grid,
+                )
+
+            # Attempt triangulation
+            result = detector.try_triangulate(t)
+            if result is not None and not self._ew_triangulated:
+                self._ew_triangulated = True
+                jx, jy = result
+                self.event_log.log(
+                    t, EventKind.JAMMER_TRIANGULATED, Severity.INFO, vehicle_id=v.id,
+                    message=f"Jammer triangulated at ({jx:.0f}, {jy:.0f})",
+                    est_x=jx, est_y=jy,
+                )
+                # Re-annotate edges with updated threat map and replan
+                self.world.annotate_edge_threat()
+                if self.config.planning.w_threat > 0:
+                    self._plan_all_routes()
+                    self.event_log.log(
+                        t, EventKind.THREAT_AVOIDANCE_REPLAN, Severity.INFO,
+                        message="Routes replanned to avoid triangulated jammer",
+                    )
+
+    def _run_supervisor(self, t: float) -> None:
+        """Run the centralised supervisor and act on its advisories."""
+        if self._supervisor is None:
+            return
+        actions = self._supervisor.observe(self.vehicles, self.world, t)
+        for action in actions:
+            self.event_log.log(
+                t, EventKind.SUPERVISOR_ACTION, Severity.INFO,
+                vehicle_id=action.target_vehicle_id if action.target_vehicle_id >= 0 else None,
+                message=f"Supervisor {action.action_type}: {action.reason}",
+                action_type=action.action_type,
+                **action.details,
+            )
+            if action.action_type == "replan":
+                vid = action.target_vehicle_id
+                v_list = [v for v in self.vehicles if v.id == vid]
+                if v_list and v_list[0].is_operational:
+                    v = v_list[0]
+                    if v.assigned_destination:
+                        from convoy_commander.planning.global_planner import plan_route
+                        route = plan_route(
+                            self.world,
+                            v.state.x, v.state.y,
+                            v.assigned_destination[0], v.assigned_destination[1],
+                            objective=self.config.planning,
+                        )
+                        v.waypoints = route
+                        v.current_waypoint_idx = 0
+                        self.event_log.log(
+                            t, EventKind.ROUTE_REPLAN, Severity.INFO, vehicle_id=vid,
+                            message=f"Supervisor-triggered replan for V{vid}",
+                        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_leader(self) -> Vehicle | None:
+        """Get current leader vehicle."""
+        for v in self.vehicles:
+            if v.is_leader and v.is_operational:
+                return v
+        return None
+
+    def _find_predecessor(self, v: Vehicle, leader: Vehicle, operational_ids: list[int]) -> Vehicle | None:
+        """Find the vehicle directly ahead of *v* in formation order."""
+        if self.config.use_cbba and v.id in self._cbba_slots:
+            my_idx = self._cbba_slots[v.id]
+        else:
+            my_idx = get_formation_index(v.id, leader.id, operational_ids)
+        if my_idx <= 0:
+            return None
+        # Find vehicle with formation index == my_idx - 1
+        target_idx = my_idx - 1
+        for vv in self.vehicles:
+            if not vv.is_operational or vv.id == v.id:
+                continue
+            if target_idx == 0 and vv.is_leader:
+                return vv
+            if self.config.use_cbba and vv.id in self._cbba_slots:
+                vv_idx = self._cbba_slots[vv.id]
+            else:
+                vv_idx = get_formation_index(vv.id, leader.id, operational_ids)
+            if vv_idx == target_idx:
+                return vv
+        return leader  # fallback to leader if predecessor not found
+
+    def _get_current_target(self, v: Vehicle) -> tuple[float, float] | None:
+        """Get current waypoint target for vehicle."""
+        if not v.waypoints:
+            if v.assigned_destination:
+                return v.assigned_destination
+            return None
+        if v.current_waypoint_idx < len(v.waypoints):
+            return v.waypoints[v.current_waypoint_idx]
+        return v.assigned_destination
+
+    def _advance_waypoint(self, v: Vehicle) -> None:
+        """Advance to next waypoint if close enough.
+
+        Uses a speed-adaptive radius: faster vehicles can advance earlier
+        to avoid overshooting and circling back.
+        """
+        if not v.waypoints or v.current_waypoint_idx >= len(v.waypoints):
+            return
+        wp = v.waypoints[v.current_waypoint_idx]
+        dist = math.hypot(v.state.x - wp[0], v.state.y - wp[1])
+        # Base 15m + speed-proportional bonus (at 12m/s → 21m threshold)
+        threshold = 15.0 + v.state.speed * 0.5
+        if dist < threshold:
+            v.current_waypoint_idx += 1
+
+    def _rebuild_spatial_grids(self) -> None:
+        """Rebuild spatial hash grids from current vehicle positions."""
+        self._collision_grid.clear()
+        self._comms_grid.clear()
+        for v in self.vehicles:
+            if v.is_operational:
+                self._collision_grid.insert(v.id, v.state.x, v.state.y)
+                self._comms_grid.insert(v.id, v.state.x, v.state.y)
+
+    def _detect_collisions(self, t: float) -> None:
+        """Detect collisions and near misses using spatial hash."""
+        collision_r = self.config.coordination.collision_radius
+        min_sep = self.config.coordination.min_separation
+        # Include all vehicles for position lookup — the grid was built at step
+        # start and vehicles may have changed status mid-step
+        positions = {v.id: (v.state.x, v.state.y) for v in self.vehicles}
+        checked: set[tuple[int, int]] = set()
+        for v in self.vehicles:
+            if not v.is_operational:
+                continue
+            nearby = self._collision_grid.query_radius(
+                v.state.x, v.state.y, min_sep, positions,
+            )
+            for nid in nearby:
+                if nid == v.id:
+                    continue
+                pair = (min(v.id, nid), max(v.id, nid))
+                if pair in checked:
+                    continue
+                checked.add(pair)
+                other = self.vehicles[nid]
+                dist = v.state.distance_to(other.state)
+                if dist < collision_r:
+                    last_col = self._collision_cooldown.get(pair, -999.0)
+                    if t - last_col >= self._collision_cooldown_s:
+                        v.collision_count += 1
+                        other.collision_count += 1
+                        self._collision_window[v.id].append(t)
+                        self._collision_window[other.id].append(t)
+                        vp = self._collision_partners.setdefault(v.id, {})
+                        vp[other.id] = vp.get(other.id, 0) + 1
+                        op = self._collision_partners.setdefault(other.id, {})
+                        op[v.id] = op.get(v.id, 0) + 1
+                        self._collision_cooldown[pair] = t
+                        self.event_log.log(
+                            t, EventKind.COLLISION, Severity.CRITICAL,
+                            message=f"COLLISION between V{v.id} and V{other.id} "
+                                    f"(dist={dist:.2f}m < {collision_r:.1f}m)",
+                            vehicle_a=v.id, vehicle_b=other.id, distance=dist,
+                        )
+                elif dist < min_sep:
+                    # Cooldown: only count once per pair per cooldown window
+                    last_logged = self._near_miss_cooldown.get(pair, -999.0)
+                    if t - last_logged >= self._near_miss_cooldown_s:
+                        v.near_miss_count += 1
+                        other.near_miss_count += 1
+                        self._near_miss_cooldown[pair] = t
+                        self.event_log.log(
+                            t, EventKind.NEAR_MISS, Severity.WARNING,
+                            message=f"Near miss V{v.id}–V{other.id} "
+                                    f"(dist={dist:.2f}m < min_sep={min_sep:.1f}m)",
+                            vehicle_a=v.id, vehicle_b=other.id, distance=dist,
+                        )
+
+        # Check for collision-triggered replanning
+        self._check_collision_replan(t)
+
+    def _check_collision_replan(self, t: float) -> None:
+        """Replan route for vehicles with excessive recent collisions.
+
+        When two vehicles repeatedly collide with each other, the higher-ID
+        vehicle holds position while the lower-ID one replans with a large
+        lateral offset to create separation.
+        """
+        # First pass: identify vehicles needing replan and their actions
+        actions: list[tuple[Vehicle, str, int | None]] = []  # (vehicle, action_type, partner_id)
+
+        for v in self.vehicles:
+            if not v.is_operational or v.assigned_destination is None:
+                continue
+            if t < self._hold_position_until.get(v.id, 0.0):
+                continue
+
+            window = self._collision_window[v.id]
+            cutoff = t - self._collision_window_duration
+            self._collision_window[v.id] = [ts for ts in window if ts > cutoff]
+            window = self._collision_window[v.id]
+
+            if (len(window) >= self._collision_replan_threshold
+                    and t - self._last_replan_time[v.id] > self._replan_cooldown):
+
+                partners = self._collision_partners.get(v.id, {})
+                top_partner_id = max(partners, key=partners.get) if partners else None
+                top_partner_count = partners.get(top_partner_id, 0) if top_partner_id is not None else 0
+
+                # Distance to goal — drives near-goal yield behaviour
+                d_goal = float("inf")
+                if v.assigned_destination is not None:
+                    d_goal = math.hypot(
+                        v.state.x - v.assigned_destination[0],
+                        v.state.y - v.assigned_destination[1],
+                    )
+
+                if top_partner_count >= 3 and top_partner_id is not None:
+                    if v.id > top_partner_id:
+                        # Near goal: brief brake-only freeze (no 60m reverse).
+                        if d_goal < 80.0:
+                            actions.append((v, "brake_hold", top_partner_id))
+                        else:
+                            actions.append((v, "hold", top_partner_id))
+                    else:
+                        actions.append((v, "pair_replan", top_partner_id))
+                else:
+                    actions.append((v, "normal_replan", None))
+
+        # Second pass: execute actions (partner dicts are stable during iteration)
+        for v, action, partner_id in actions:
+            self._last_replan_time[v.id] = t
+            window = self._collision_window[v.id]
+
+            if action == "brake_hold":
+                # Near goal: short freeze, no reverse.  Existing hold loop
+                # uses brake when no reverse target is set.
+                self._hold_position_until[v.id] = t + 3.0
+                self._hold_reverse_target.pop(v.id, None)
+                self._collision_window[v.id] = []
+                self._collision_partners[v.id] = {}
+                # Allow partner to lateral-replan immediately on next tick.
+                if partner_id is not None:
+                    self._last_replan_time[partner_id] = -999.0
+                self.event_log.log(
+                    t, EventKind.ROUTE_REPLAN, Severity.INFO, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} brake-holding near goal "
+                            f"(partner V{partner_id} will lateral-replan)",
+                )
+                continue
+
+            if action == "hold":
+                self._hold_position_until[v.id] = t + 8.0
+                # Set reverse target: move away from partner
+                partner_v = next((vv for vv in self.vehicles if vv.id == partner_id), None)
+                if partner_v is not None:
+                    dx = v.state.x - partner_v.state.x
+                    dy = v.state.y - partner_v.state.y
+                    d = math.hypot(dx, dy)
+                    if d > 0.1:
+                        # Move 60m away from partner, perpendicular to goal direction
+                        rev_x = v.state.x + (dx / d) * 60.0
+                        rev_y = v.state.y + (dy / d) * 60.0
+                    else:
+                        rev_x = v.state.x + 60.0
+                        rev_y = v.state.y
+                    # Clamp to world bounds
+                    rev_x = max(20.0, min(self.world.width - 20.0, rev_x))
+                    rev_y = max(20.0, min(self.world.height - 20.0, rev_y))
+                    self._hold_reverse_target[v.id] = (rev_x, rev_y)
+                    # Also replan route for after the reverse
+                    route = plan_route(
+                        self.world, rev_x, rev_y,
+                        v.assigned_destination[0], v.assigned_destination[1],
+                        objective=self.config.planning,
+                    )
+                    v.waypoints = [(rev_x, rev_y)] + route
+                    v.current_waypoint_idx = 0
+                self._collision_window[v.id] = []
+                self._collision_partners[v.id] = {}
+                self.event_log.log(
+                    t, EventKind.ROUTE_REPLAN, Severity.WARNING, vehicle_id=v.id,
+                    message=f"Vehicle {v.id} reversing away from V{partner_id} for 8s",
+                )
+                continue
+
+            if action == "pair_replan":
+                dx = v.assigned_destination[0] - v.state.x
+                dy = v.assigned_destination[1] - v.state.y
+                d = math.hypot(dx, dy)
+                if d > 1.0:
+                    lateral_sign = 1.0 if v.id % 2 == 0 else -1.0
+                    offset_x = v.state.x + (-dy / d) * lateral_sign * 40.0
+                    offset_y = v.state.y + (dx / d) * lateral_sign * 40.0
+                else:
+                    offset_x = v.state.x + 40.0
+                    offset_y = v.state.y
+                self._collision_partners[v.id] = {}
+            else:
+                dx = v.assigned_destination[0] - v.state.x
+                dy = v.assigned_destination[1] - v.state.y
+                d = math.hypot(dx, dy)
+                if d > 1.0:
+                    lateral_sign = 1.0 if v.id % 2 == 0 else -1.0
+                    offset_x = v.state.x + (dx / d) * 5.0 + (-dy / d) * lateral_sign * 15.0
+                    offset_y = v.state.y + (dy / d) * 5.0 + (dx / d) * lateral_sign * 15.0
+                else:
+                    offset_x, offset_y = v.state.x, v.state.y
+
+            route = plan_route(
+                self.world,
+                offset_x, offset_y,
+                v.assigned_destination[0], v.assigned_destination[1],
+                objective=self.config.planning,
+            )
+            v.waypoints = route
+            v.current_waypoint_idx = 0
+            self._collision_window[v.id] = []
+            self.event_log.log(
+                t, EventKind.ROUTE_REPLAN, Severity.WARNING, vehicle_id=v.id,
+                message=f"Vehicle {v.id} {'pair' if action == 'pair_replan' else 'collision'}-triggered replan "
+                        f"({len(window)} collisions in {self._collision_window_duration}s)",
+            )
+
+    def _track_spacing_errors(self, t: float) -> None:
+        """Track per-vehicle spacing errors for string stability computation."""
+        t_lo, t_hi = self._string_stability_window
+        if t < t_lo or t > t_hi:
+            return
+        leader = self._get_leader()
+        if leader is None:
+            return
+        coord = self.config.coordination
+        operational = sorted(
+            [v for v in self.vehicles if v.is_operational and not v.is_leader],
+            key=lambda v: v.id,
+        )
+        for v in operational:
+            if self.config.use_cbba and v.id in self._cbba_slots:
+                idx = self._cbba_slots[v.id]
+            else:
+                idx = get_formation_index(
+                    v.id, leader.id,
+                    [vv.id for vv in self.vehicles if vv.is_operational],
+                )
+            if idx <= 0:
+                continue
+            # Desired gap based on follower speed
+            desired_gap = coord.standoff_distance + coord.time_headway * v.state.speed
+            desired_dist = min(desired_gap * idx, coord.formation_spacing * idx)
+            actual_dist = v.state.distance_to(leader.state)
+            error = actual_dist - desired_dist
+            if v.id not in self._spacing_errors:
+                self._spacing_errors[v.id] = []
+            self._spacing_errors[v.id].append(error)
+            self.collector.record_spacing_error(t, v.id, error)
+
+    def _apply_weather_effects(self, t: float, dt: float) -> None:
+        """Update vehicle modifiers based on current weather conditions."""
+        assert self._weather_effects is not None
+        state = self._weather_effects.get_state(t)
+        self._weather_state = state
+
+        friction = self._weather_effects.friction_factor(state)
+        stopping = self._weather_effects.stopping_distance_factor(state)
+        fuel = self._weather_effects.fuel_factor(state)
+
+        for v in self.vehicles:
+            if v.is_operational:
+                v.weather_speed_factor = friction
+                v.weather_accel_factor = friction
+                v.weather_fuel_factor = fuel
+                v.weather_spacing_factor = stopping
+
+        # Periodic weather logging (every 10s)
+        self._weather_log_timer += dt
+        if self._weather_log_timer >= 10.0:
+            self._weather_log_timer = 0.0
+            self.event_log.log(
+                t, EventKind.WEATHER_UPDATED, Severity.INFO,
+                message=f"Weather: {state.temperature_c:.1f}°C, "
+                        f"precip={state.precipitation_mm_h:.1f}mm/h, "
+                        f"wind={state.wind_speed_ms:.1f}m/s, "
+                        f"vis={state.visibility_m:.0f}m, "
+                        f"friction={friction:.2f}",
+                temperature_c=state.temperature_c,
+                precipitation_mm_h=state.precipitation_mm_h,
+                wind_speed_ms=state.wind_speed_ms,
+                visibility_m=state.visibility_m,
+                friction_factor=friction,
+            )
+            if friction < 0.6:
+                self.event_log.log(
+                    t, EventKind.WEATHER_FRICTION_LOW, Severity.WARNING,
+                    message=f"Low surface friction: {friction:.2f}",
+                    friction_factor=friction,
+                )
+            if state.visibility_m < 200.0:
+                self.event_log.log(
+                    t, EventKind.WEATHER_VISIBILITY_LOW, Severity.WARNING,
+                    message=f"Low visibility: {state.visibility_m:.0f}m",
+                    visibility_m=state.visibility_m,
+                )
+
+        # Record weather metrics
+        self.collector.record_weather(t, state, friction)
+
+    def _compute_string_stability(self) -> None:
+        """Compute RMS-based string stability ratio and store in collector."""
+        if not self._spacing_errors:
+            return
+        eps = 1e-6
+        sorted_ids = sorted(self._spacing_errors.keys())
+        rms_by_id: dict[int, float] = {}
+        for vid in sorted_ids:
+            errors = self._spacing_errors[vid]
+            if errors:
+                rms_by_id[vid] = math.sqrt(sum(e * e for e in errors) / len(errors))
+            else:
+                rms_by_id[vid] = 0.0
+
+        ratios: list[float] = []
+        for i in range(len(sorted_ids) - 1):
+            rms_front = rms_by_id[sorted_ids[i]]
+            rms_rear = rms_by_id[sorted_ids[i + 1]]
+            ratios.append(rms_rear / max(eps, rms_front))
+
+        if ratios:
+            self.collector.string_stability_max = max(ratios)
+            self.collector.string_stability_median = float(
+                sorted(ratios)[len(ratios) // 2]
+            )

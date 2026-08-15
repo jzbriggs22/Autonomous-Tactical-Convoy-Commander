@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+runs/
+eval_results/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.venv/
+*.md
+LICENSE
