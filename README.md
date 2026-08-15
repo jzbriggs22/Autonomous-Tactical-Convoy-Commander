@@ -444,6 +444,70 @@ tests/            278 tests: physics, estimator, comms, planning, election,
 runs/             Output directory for simulation results
 ```
 
+## AI Governance Stack
+
+The repository also ships `ai_governance/` — a standalone observability and
+governance service for AI agents. The premise: an agent can look healthy on
+aggregate metrics while silently drifting on the high-risk minority of cases.
+The stack detects that drift before it causes damage, and answers the PM
+question "is this agent safe to keep running?"
+
+It shares nothing with the convoy simulator beyond the repository — no imports
+in either direction — and installs via its own extra:
+
+```bash
+pip install -e ".[dev,governance]"
+```
+
+### Capabilities
+
+- **Drift detection** — baseline-vs-recent-window comparison across 10
+  behavioral metrics per case category, with configurable thresholds,
+  direction awareness, and severity levels.
+- **High-risk case identification** — weighted regex pattern matching over
+  case category and metadata; every decision gets a risk score and matched
+  patterns, explorable via `/events/{id}/explain`.
+- **Alerts and rollback** — threshold alerts escalate to automatic rollback
+  records; rollback conditions are safe AST-evaluated expressions (no `eval`).
+  The `/status` endpoint is the safety gate.
+- **Predictive forecasting** — OLS trend slopes extrapolate when each metric
+  will breach its threshold (`/forecast`, and webhook alerts from the scheduler).
+- **Ground-truth feedback loop** — bulk label import (`/feedback/labels`),
+  accuracy reporting (`/feedback/accuracy`), and an accuracy guard
+  (`/feedback/guard`) that fires alerts and rollbacks when labeled accuracy
+  drops below governance floors.
+- **Constrained decoding** — a `GovernanceDecision` pydantic schema with an
+  outlines-validated decode path for structured agent output ingestion.
+- **Operations** — PM web dashboard at `/ui` (Chart.js trends + forecasts),
+  Prometheus `/metrics`, OpenTelemetry tracing, HMAC-signed webhooks,
+  tamper-evident hash-chain audit log, policy version store with rollback,
+  data retention, schema migrations, API-key auth with rate limiting.
+
+### Quickstart
+
+```bash
+# Start the API + dashboard (SQLite-backed; GOVERNANCE_DB=path or :memory:)
+GOVERNANCE_DB=governance.db python -m ai_governance.cli serve
+# open http://localhost:8080/ui
+
+# CLI equivalents
+python -m ai_governance.cli status      # safety gate
+python -m ai_governance.cli drift       # run drift detection
+python -m ai_governance.cli forecast    # predicted threshold breaches
+python -m ai_governance.cli accuracy --guard   # ground-truth accuracy + guard
+python -m ai_governance.cli report      # compliance report
+```
+
+### Governance tests
+
+```bash
+python -m pytest tests/governance/ -q --timeout=60          # full suite
+python -m ai_governance.cli test                            # behavioral regression suite
+```
+
+The behavioral suite replays a fixed 50-decision dataset and asserts the
+drift/rollback pipeline end-to-end; it is CI-gated separately from unit tests.
+
 ## Limitations and Next Steps
 
 **Phase 2 — Implemented:**
