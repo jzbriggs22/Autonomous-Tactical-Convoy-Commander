@@ -1,0 +1,408 @@
+"""Generate markdown report from simulation results.
+
+The report includes a safety audit section that surfaces all CRITICAL and
+WARNING events from the structured event log, plus a summary of model
+assumptions and their implications.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+from convoy_commander.core.event_log import EventLog, Severity
+from convoy_commander.metrics.collector import MetricsCollector, SimMetrics
+from convoy_commander.sim.runner import SimResult
+from convoy_commander.viz.plots import (
+    plot_comms_graph,
+    plot_corridor_adherence,
+    plot_error_ellipses,
+    plot_headway_gaps,
+    plot_metrics_summary,
+    plot_network_topology,
+    plot_position_errors,
+    plot_string_stability,
+    plot_trajectories,
+)
+
+
+def generate_report(result: SimResult, output_dir: Path) -> Path:
+    """Generate full report with plots, metrics, and safety audit.
+
+    Returns path to report.md.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+
+    # Generate plots
+    plot_trajectories(result.world, result.vehicles, plots_dir / "trajectories.png")
+    plot_position_errors(result.vehicles, result.config.dt, plots_dir / "position_errors.png")
+    plot_metrics_summary(
+        result.collector, result.vehicles, result.config.dt, plots_dir / "metrics_summary.png"
+    )
+
+    # Final comms graph snapshot
+    positions = {v.id: (v.state.x, v.state.y) for v in result.vehicles}
+    adj = result.comms.get_adjacency(positions)
+    plot_comms_graph(result.vehicles, adj, result.world, plots_dir / "comms_graph.png")
+
+    # Phase 7: new visualization plots
+    plot_headway_gaps(result.collector, result.config, result.config.dt,
+                      plots_dir / "headway_gaps.png")
+    plot_string_stability(result.collector, plots_dir / "string_stability.png")
+    plot_corridor_adherence(result.world, result.vehicles, result.collector,
+                            plots_dir / "corridor_adherence.png")
+
+    # Phase 8: error-ellipse overlay and network topology
+    plot_error_ellipses(result.world, result.vehicles, result.collector,
+                        result.config.dt, plots_dir / "error_ellipses.png")
+    plot_network_topology(result.collector, plots_dir / "network_topology.png")
+
+    # Compute metrics
+    metrics = result.collector.compute_final(
+        result.vehicles,
+        result.comms.total_sent,
+        result.comms.total_delivered,
+        result.comms.total_dropped,
+        result.config.duration,
+        comms_by_type=result.comms.get_stats_by_type(),
+    )
+
+    # Populate EW metrics from event log (Phase 11)
+    result.collector.populate_ew_metrics(metrics, result.event_log)
+
+    # Save artifacts
+    result.collector.save_metrics(metrics, output_dir / "metrics.json")
+    result.collector.save_time_series(output_dir / "time_series.jsonl")
+    result.event_log.save(output_dir / "event_log.jsonl")
+
+    # Save reproducibility stamp
+    if result.stamp is not None:
+        config_path = output_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(result.stamp.to_dict(), f, indent=2, default=str)
+
+    # Generate markdown
+    report_path = output_dir / "report.md"
+    md = _build_markdown(metrics, result, plots_dir)
+    report_path.write_text(md)
+
+    return report_path
+
+
+def _build_markdown(metrics: SimMetrics, result: SimResult, plots_dir: Path) -> str:
+    """Build markdown report content."""
+    cfg = result.config
+    m = metrics
+    elog = result.event_log
+
+    lines = [
+        "# Convoy Commander Simulation Report",
+        "",
+        "## Configuration",
+        f"- **Scenario:** {cfg.scenario}",
+        f"- **Seed:** {cfg.seed}",
+        f"- **Vehicles:** {cfg.num_vehicles}",
+        f"- **Duration:** {cfg.duration}s",
+        f"- **GPS Available:** {cfg.gps_available}",
+        f"- **Packet Loss:** {cfg.comms.packet_loss:.0%}",
+        f"- **Latency:** {cfg.comms.latency_mean_ms:.0f}ms",
+        "",
+        "",
+    ]
+
+    # Reproducibility stamp
+    if result.stamp is not None:
+        s = result.stamp
+        lines += [
+            "## Reproducibility",
+            f"- **Git commit:** `{s.git_commit}`{'  (dirty)' if s.git_dirty else ''}",
+            f"- **Python:** {s.python_version}",
+            f"- **Platform:** {s.platform_info}",
+            f"- **Package:** convoy_commander {s.package_version}",
+            f"- **Full config:** see `config.json`",
+        ]
+
+    lines += [
+        "",
+        "## Mission Summary",
+        f"- **Mission Success:** {'YES' if m.mission_success else 'NO'}",
+        f"- **Vehicles Arrived:** {m.vehicles_arrived}/{m.vehicles_total}",
+        f"- **Average Time to Destination:** {m.avg_time_to_destination:.1f}s",
+        "",
+        "## Metrics",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Total Fuel Used | {m.total_fuel_used:.1f} |",
+        f"| Avg Fuel Used | {m.avg_fuel_used:.1f} |",
+        f"| Convoy Cohesion (avg dist) | {m.convoy_cohesion_score:.1f}m |",
+        f"| Near Misses | {m.near_miss_count} |",
+        f"| Collisions | {m.collision_count} |",
+        f"| Comms Sent | {m.comms_total_sent} |",
+        f"| Comms Delivered | {m.comms_total_delivered} |",
+        f"| Comms Dropped | {m.comms_total_dropped} |",
+        f"| Delivery Ratio | {m.comms_delivery_ratio:.1%} |",
+        f"| Avg Position Error | {m.avg_position_error:.2f}m |",
+        f"| Max Position Error | {m.max_position_error:.2f}m |",
+        f"| Total Distance | {m.total_distance_traveled:.0f}m |",
+        f"| Leader Elections | {m.num_leader_elections} |",
+        f"| Safe Mode Activations | {m.num_safe_mode_activations} |",
+        f"| String Stability (max ratio) | {m.string_stability_max:.3f} |",
+        f"| String Stability (median ratio) | {m.string_stability_median:.3f} |",
+        "",
+    ]
+
+    # Weather conditions (Phase 10)
+    if cfg.weather.enabled:
+        lines += [
+            "### Weather Conditions",
+            "",
+            f"- **Source:** {m.weather_source}",
+            f"- **Avg Friction Factor:** {m.avg_friction_factor:.2f}",
+            f"- **Min Visibility:** {m.min_visibility_m:.0f}m",
+            f"- **Max Precipitation:** {m.max_precipitation_mm_h:.1f} mm/h",
+            "",
+        ]
+
+    # EW metrics (Phase 11)
+    if cfg.ew.enabled:
+        lines += [
+            "### Electronic Warfare",
+            "",
+            f"- **Jammers Detected:** {m.jammers_detected}",
+            f"- **Jammers Triangulated:** {m.jammers_triangulated}",
+            f"- **ECM Activations:** {m.ecm_activations}",
+            f"- **GPS Jammed Events:** {m.gps_jammed_ticks}",
+            f"- **Threat Avoidance Replans:** {m.threat_replans}",
+            "",
+        ]
+
+    # Realism metrics (Phase 6)
+    lines += [
+        "### Realism Metrics (Phase 6)",
+        "",
+        f"- **Time headway:** {cfg.coordination.time_headway:.1f}s "
+        f"(standoff={cfg.coordination.standoff_distance:.1f}m)",
+        f"- **Actuator lag:** {cfg.vehicle.actuator_lag:.2f}s",
+        f"- **Road corridor width:** {cfg.road_corridor_width:.1f}m",
+        f"- **IMU bias instability:** {cfg.estimator.bias_instability:.3f} m/s "
+        f"(τ={cfg.estimator.bias_correlation_time:.0f}s)",
+        f"- **Angle random walk:** {cfg.estimator.angle_random_walk:.4f} rad/√s",
+        f"- **Rate random walk:** {cfg.estimator.rate_random_walk:.4f} rad/s/√s",
+        "",
+    ]
+
+    # Per-message-type bandwidth table
+    if m.comms_by_type:
+        lines += [
+            "### Communications Bandwidth by Message Type",
+            "",
+            "| Message Type | Sent | Delivered | Dropped | Delivery % |",
+            "|--------------|------|-----------|---------|------------|",
+        ]
+        for mtype, stats in sorted(m.comms_by_type.items()):
+            s = stats.get("sent", 0)
+            d = stats.get("delivered", 0)
+            dr = stats.get("dropped", 0)
+            ratio = f"{d / s:.0%}" if s > 0 else "N/A"
+            lines.append(f"| {mtype} | {s} | {d} | {dr} | {ratio} |")
+        lines.append("")
+
+    # --- Safety Audit ---
+    lines += _build_safety_audit(elog, cfg)
+
+    # --- Performance notes ---
+    lines += _build_performance_notes(result)
+
+    # --- Assumptions ---
+    lines += _build_assumptions_section()
+
+    # --- Plots ---
+    lines += [
+        "## Plots",
+        "",
+        "### Trajectories (True vs Estimated)",
+        "![Trajectories](plots/trajectories.png)",
+        "",
+        "### Position Estimation Error",
+        "![Position Errors](plots/position_errors.png)",
+        "",
+        "### Speed, Fuel & Uncertainty",
+        "![Metrics Summary](plots/metrics_summary.png)",
+        "",
+        "### Communications Graph (Final State)",
+        "![Comms Graph](plots/comms_graph.png)",
+        "",
+        "### Headway Gap (Actual vs Desired)",
+        "![Headway Gaps](plots/headway_gaps.png)",
+        "",
+        "### String Stability",
+        "![String Stability](plots/string_stability.png)",
+        "",
+        "### Corridor Adherence",
+        "![Corridor Adherence](plots/corridor_adherence.png)",
+        "",
+        "### Position Uncertainty Ellipses",
+        "![Error Ellipses](plots/error_ellipses.png)",
+        "",
+        "### Network Topology",
+        "![Network Topology](plots/network_topology.png)",
+        "",
+    ]
+
+    return "\n".join(lines)
+
+
+def _build_performance_notes(result: SimResult) -> list[str]:
+    """Document performance characteristics and complexity."""
+    cfg = result.config
+    n = cfg.num_vehicles
+    steps = int(cfg.duration / cfg.dt)
+
+    return [
+        "## Performance Notes",
+        "",
+        f"- **Sim duration:** {cfg.duration}s at dt={cfg.dt}s = {steps:,} steps",
+        f"- **Vehicles:** {n}",
+        f"- **Per-step complexity:** O(N*k) for collision detection (spatial hash), O(N) for planning/control",
+        f"- **Total step-vehicle evaluations:** {steps * n:,}",
+        "",
+        "### Complexity Drivers",
+        "- Collision/near-miss detection: O(N*k) via spatial hash (was O(N^2))",
+        "- Comms broadcast: O(k) per sender via spatial hash (was O(N))",
+        "- A* route planning: O(E log V) on road graph; called once per vehicle + on replan",
+        "- CBBA auction: O(N * S) per re-allocation (every 10s), S = number of slots",
+        "- Corridor adherence: O(1) per vehicle (windowed route polyline check)",
+        "",
+    ]
+
+
+def _build_safety_audit(elog: EventLog, cfg: object) -> list[str]:
+    """Build the safety audit section from the event log."""
+    lines = [
+        "## Safety Audit",
+        "",
+    ]
+
+    # Event count summary
+    by_severity = elog.count_by_severity()
+    lines.append("### Event Summary by Severity")
+    lines.append("")
+    lines.append("| Severity | Count |")
+    lines.append("|----------|-------|")
+    for sev in ["CRITICAL", "WARNING", "INFO", "DEBUG"]:
+        count = by_severity.get(sev, 0)
+        lines.append(f"| {sev} | {count} |")
+    lines.append("")
+
+    # Event count by kind
+    by_kind = elog.count_by_kind()
+    if by_kind:
+        lines.append("### Event Summary by Kind")
+        lines.append("")
+        lines.append("| Event | Count |")
+        lines.append("|-------|-------|")
+        for kind, count in sorted(by_kind.items()):
+            lines.append(f"| {kind} | {count} |")
+        lines.append("")
+
+    # CRITICAL events (full detail)
+    critical = elog.filter(severity_min=Severity.CRITICAL)
+    if critical:
+        lines.append("### CRITICAL Events (require investigation)")
+        lines.append("")
+        lines.append("| Time (s) | Event | Vehicle | Message |")
+        lines.append("|----------|-------|---------|---------|")
+        for e in critical:
+            vid = str(e.vehicle_id) if e.vehicle_id is not None else "-"
+            lines.append(f"| {e.time:.1f} | {e.kind} | {vid} | {e.message} |")
+        lines.append("")
+    else:
+        lines.append("### CRITICAL Events")
+        lines.append("")
+        lines.append("None. No critical safety events were recorded.")
+        lines.append("")
+
+    # WARNING events (first 50)
+    warnings = elog.filter(severity_min=Severity.WARNING)
+    # Exclude the ones already shown as CRITICAL
+    warnings = [w for w in warnings if w.severity != "CRITICAL"]
+    if warnings:
+        shown = warnings[:50]
+        lines.append(f"### WARNING Events (showing {len(shown)} of {len(warnings)})")
+        lines.append("")
+        lines.append("| Time (s) | Event | Vehicle | Message |")
+        lines.append("|----------|-------|---------|---------|")
+        for e in shown:
+            vid = str(e.vehicle_id) if e.vehicle_id is not None else "-"
+            msg = e.message[:100] + "..." if len(e.message) > 100 else e.message
+            lines.append(f"| {e.time:.1f} | {e.kind} | {vid} | {msg} |")
+        if len(warnings) > 50:
+            lines.append(f"| ... | ... | ... | ({len(warnings) - 50} more warnings in event_log.jsonl) |")
+        lines.append("")
+    else:
+        lines.append("### WARNING Events")
+        lines.append("")
+        lines.append("None.")
+        lines.append("")
+
+    return lines
+
+
+def _build_assumptions_section() -> list[str]:
+    """Document explicit model assumptions in the report."""
+    return [
+        "## Model Assumptions & Limitations",
+        "",
+        "This simulation makes the following explicit assumptions.  Results "
+        "should be interpreted within these bounds.",
+        "",
+        "### Physics",
+        "- 2-D kinematics only (no roll, pitch, terrain elevation).",
+        "- First-order Euler integration at fixed dt.  Acceptable for "
+        "  dt <= 0.1s and speeds <= 15 m/s.",
+        "- Speed is non-negative; no reverse motion.",
+        "- Fuel consumption is linear in speed; transient effects not modelled.",
+        "",
+        "### Position Estimation",
+        "- Gauss-Markov bias model and ARW/RRW IMU noise added in Phase 6.",
+        "- 2×2 covariance EKF tracks full error ellipse; scalar `uncertainty` "
+        "  retained as sqrt(trace(P)/2) for safe-mode logic.",
+        "- Real IMU errors are non-Gaussian and correlated; this model "
+        "  *underestimates* worst-case drift.",
+        "- Landmark/GPS fixes use ground-truth position + noise.  Real "
+        "  landmark detection can fail or be spoofed; not modelled.",
+        "",
+        "### Communications",
+        "- Line-of-sight with distance-squared degradation; no multipath or fading.",
+        "- Per-packet independent loss; no burst-error model.",
+        "- No frequency, bandwidth, or queuing model.",
+        "- Multi-hop relay (Phase 8): vehicles forward messages to out-of-range peers; "
+        "  configurable max hops (0=disabled) with per-hop loss penalty.",
+        "- Neighbor state table caches latest broadcast per peer; stale entries pruned.",
+        "",
+        "### Coordination",
+        "- Formation uses constant time headway (CTH) gap model with "
+        "  standoff distance and first-order actuator lag (Phase 6).",
+        "- Collision radius is centre-to-centre distance; swept-volume "
+        "  overlap is not modelled.",
+        "- Road corridor adherence uses simple polyline distance penalty.",
+        "- Leader election benefits from multi-hop relay when enabled, "
+        "  but does not implement full multi-hop routing protocol.",
+        "",
+        "### Realism Limitations (Phase 6)",
+        "- Actuator lag is first-order dead-time only (no higher-order dynamics).",
+        "- Road corridor adherence penalty is based on planned route polyline; "
+        "  no lane-level or road-width modeling.",
+        "- Gauss-Markov IMU model is a scalar approximation per axis.",
+        "",
+        "### Safe Mode Policy",
+        "- Conservative: enters on ANY single trigger (high uncertainty OR "
+        "  comms timeout), exits only when ALL conditions clear.",
+        "- Speed reduced to 30% of max; spacing increased by 2.5x.",
+        "- A vehicle in safe mode still navigates locally; it does not stop.",
+        "",
+    ]

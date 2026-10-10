@@ -1,0 +1,85 @@
+agent_id: cs-agent-v1
+version: 1.0.0
+
+high_risk_patterns:
+  - name: billing_dispute
+    field: case_category
+    pattern: billing_dispute
+    weight: 2.0
+  - name: fraud_claim
+    field: case_category
+    pattern: fraud
+    weight: 3.0
+  - name: policy_sensitive
+    field: case_category
+    pattern: policy|legal|compliance
+    weight: 2.5
+  - name: high_value_account
+    field: account_tier
+    pattern: enterprise|premium
+    weight: 1.5
+
+drift_thresholds:
+  - name: billing_resolution_drop
+    category: billing_dispute
+    metric: resolution_rate
+    max_delta: 0.10
+    direction: decrease
+    min_baseline_samples: 30
+    recent_window: 50
+    severity: warn
+
+  - name: billing_escalation_spike
+    category: billing_dispute
+    metric: escalation_rate
+    max_delta: 0.15
+    direction: increase
+    min_baseline_samples: 30
+    recent_window: 50
+    severity: critical
+
+  - name: fraud_escalation_drop
+    category: fraud_claim
+    metric: escalation_rate
+    max_delta: 0.20
+    direction: decrease
+    min_baseline_samples: 20
+    recent_window: 30
+    severity: critical
+
+  - name: global_resolution_drift
+    category: "*"
+    metric: resolution_rate
+    max_delta: 0.12
+    direction: either
+    min_baseline_samples: 30
+    recent_window: 50
+    severity: warn
+
+  - name: high_risk_accuracy_floor
+    category: "*"
+    metric: high_risk_accuracy
+    max_delta: 0.10
+    direction: decrease
+    min_baseline_samples: 20
+    recent_window: 30
+    severity: rollback
+
+rollback_conditions:
+  - name: fraud_underescalation
+    description: >-
+      Agent is resolving fraud cases without escalation —
+      financial risk threshold breached
+    expression: "fraud_claim_escalation_rate < 0.60 and fraud_claim_count >= 10"
+    action: rollback
+    cooldown_seconds: 1800
+
+  - name: accuracy_collapse
+    description: High-risk decision accuracy dropped below acceptable floor
+    expression: "high_risk_accuracy < 0.70 and high_risk_count >= 20"
+    action: rollback
+    cooldown_seconds: 3600
+
+baseline_window_days: 30
+min_baseline_events: 30
+recent_window_size: 100

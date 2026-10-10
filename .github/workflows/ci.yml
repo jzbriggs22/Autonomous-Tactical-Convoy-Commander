@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,governance]"
+
+      # Default per-test timeout is 120s: coverage instrumentation roughly
+      # doubles sim runtimes, and CI runners are slower than dev machines.
+      # The heaviest integration sims carry their own @pytest.mark.timeout(600).
+      - name: Run convoy commander tests
+        run: python -m pytest tests/ -q --tb=short --timeout=120 --ignore=tests/governance --cov=convoy_commander --cov-report=term-missing --cov-report=xml
+
+      - name: Run governance unit tests
+        run: python -m pytest tests/governance/ -q --tb=short --timeout=60 --ignore=tests/governance/test_behavioral.py --cov=ai_governance --cov-report=term-missing --cov-append
+
+      - name: Run governance behavioral regression suite
+        run: python -m pytest tests/governance/test_behavioral.py -v --tb=short --timeout=60
+
+      - name: Type check
+        run: python -m mypy convoy_commander/ --ignore-missing-imports
+        continue-on-error: true
